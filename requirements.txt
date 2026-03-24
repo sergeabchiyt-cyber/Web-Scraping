@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+scrapling[all]
+groq
+pydantic
+python-telegram-bot
+httpx
