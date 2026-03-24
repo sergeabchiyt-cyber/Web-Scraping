@@ -183,6 +183,29 @@ async def _handle_scrape(update, context):
             parse_mode='Markdown'
         )
 
+        # Token usage report
+        try:
+            from command_center import get_token_status
+            ts = get_token_status()
+            active = ts['active_key']
+            limit  = ts['limit_per_key']
+            lines  = [f"🔑 *Groq Token Usage*"]
+            for k in ts['keys']:
+                used      = k['tokens_used']
+                remaining = k['tokens_remaining']
+                bar_filled = int((used / limit) * 10)
+                bar = '█' * bar_filled + '░' * (10 - bar_filled)
+                tag = ' ← active' if k['active'] else ''
+                lines.append(
+                    f"Key {k['key_index']}{tag}\n"
+                    f"  `[{bar}]`\n"
+                    f"  Used: `{used:,}` / `{limit:,}`\n"
+                    f"  Left: `{remaining:,}`"
+                )
+            await update.message.reply_text('\n\n'.join(lines), parse_mode='Markdown')
+        except Exception as te:
+            print(f"[TELEGRAM] Token status error: {te}")
+
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[TELEGRAM] /scrape error:\n{tb}")
