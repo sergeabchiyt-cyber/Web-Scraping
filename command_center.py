@@ -178,7 +178,7 @@ def _page_to_text(response) -> str:
         if t and 2 < len(t) < 400 and t not in seen:
             seen.add(t)
             parts.append(t)
-    return '\n'.join(parts)[:14000]
+    return '\n'.join(parts)[:10000]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -257,30 +257,31 @@ async def _extract_with_kimi(page_text: str, url: str) -> list:
     try:
         items = json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"[AUDITOR] JSON truncated or malformed: {e} — attempting partial recovery")
-        # Response was cut off mid-object. Recover all complete objects:
-        # Find the last complete }, before the truncation point
-        last_close = raw.rfind('},')
-        if last_close == -1:
-            last_close = raw.rfind('}')
-        if last_close > 0:
-            partial = raw[:last_close + 1].strip()
-            if not partial.startswith('['):
-                partial = '[' + partial
-            if not partial.endswith(']'):
-                partial = partial + ']'
+        print(f"[AUDITOR] JSON parse failed: {e} — attempting recovery")
+        items = None
+
+        # Strategy 1: find every position of '}' from the end and try wrapping
+        # Walk backwards through all } positions until we get valid JSON
+        raw_stripped = raw.strip()
+        if not raw_stripped.startswith('['):
+            raw_stripped = '[' + raw_stripped
+
+        # Collect all } positions in reverse order
+        positions = [i for i, ch in enumerate(raw_stripped) if ch == '}']
+
+        for pos in reversed(positions):
+            candidate = raw_stripped[:pos + 1].rstrip().rstrip(',') + ']'
             try:
-                items = json.loads(partial)
-                print(f"[AUDITOR] Partial recovery succeeded: {len(items)} events")
+                items = json.loads(candidate)
+                print(f"[AUDITOR] Recovery succeeded: {len(items)} events (truncated at char {pos})")
+                break
             except json.JSONDecodeError:
-                print(f"[AUDITOR] Partial recovery also failed")
-                print(f"[AUDITOR] Raw (first 600):\n{raw[:600]}")
-                raise HTTPException(status_code=500,
-                                    detail=f"Kimi K2 returned truncated JSON: {e}")
-        else:
-            print(f"[AUDITOR] Raw (first 600):\n{raw[:600]}")
+                continue
+
+        if items is None:
+            print(f"[AUDITOR] All recovery attempts failed. Raw first 400:\n{raw[:400]}")
             raise HTTPException(status_code=500,
-                                detail=f"Kimi K2 returned invalid JSON: {e}")
+                                detail=f"Kimi K2 returned unparseable JSON: {e}")
 
     events = [ev for ev in items if isinstance(ev, dict)]
     print(f"[AUDITOR] Kimi K2 → {len(events)} events from {url}")
