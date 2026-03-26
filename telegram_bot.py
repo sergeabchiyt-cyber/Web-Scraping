@@ -11,11 +11,18 @@ Install: pip install python-telegram-bot
 
 import asyncio
 import logging
+import os
 import threading
 import traceback
 from datetime import datetime, timezone
 
-TELEGRAM_TOKEN = "8637706429:AAGLoWYTakzM9dImrqZPjipudHkw7DxnSTs"
+# ── Token — loaded from environment, never hardcoded ─────────────────────────
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError(
+        "[TELEGRAM] TELEGRAM_TOKEN environment variable is not set.\n"
+        "Set it in your Render service environment variables."
+    )
 
 # Telegram hard limit per message (chars)
 MAX_CHARS  = 4096
@@ -227,11 +234,24 @@ async def _handle_unknown(update, context):
 
 # ── Bot startup ───────────────────────────────────────────────────────────────
 
+# Singleton guard — prevents duplicate polling threads on uvicorn reload/redeploy
+_bot_started = False
+_bot_lock = threading.Lock()
+
+
 def start_bot():
     """
     Start the Telegram bot in a dedicated thread with its own event loop.
     Uses long polling — no webhook, no public URL needed.
+    Protected by a singleton lock so redeploys/reloads don't spawn duplicates.
     """
+    global _bot_started
+    with _bot_lock:
+        if _bot_started:
+            print("[TELEGRAM] Bot already running — skipping duplicate start.")
+            return
+        _bot_started = True
+
     try:
         from telegram.ext import (
             ApplicationBuilder, CommandHandler, MessageHandler, filters
@@ -276,7 +296,6 @@ def start_bot():
             await app.stop()
             await app.shutdown()
 
-    # Run in its own thread + event loop so it doesn't block uvicorn
     def _thread():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
