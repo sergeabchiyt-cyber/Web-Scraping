@@ -159,7 +159,7 @@ def _do_fetch(url: str, adaptive: bool, js: bool):
     if js:
         StealthyFetcher.adaptive = adaptive
         return StealthyFetcher.fetch(
-            url, headless=True, network_idle=True, google_search=True)
+            url, headless=True, network_idle=True, google_search=True, wait=15)
     else:
         return Fetcher(auto_match=adaptive).get(url)
 
