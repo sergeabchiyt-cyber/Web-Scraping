@@ -32,74 +32,19 @@ except ImportError:
     except ImportError:
         raise
 
-# ── Groq / Kimi K2 — Dual Key Rotation ──────────────────────────────────────
-# Key 1 is used until TOKEN_LIMIT is reached, then Key 2 takes over.
-# Token counts reset at midnight UTC (Groq's daily limit window).
-
-TOKEN_LIMIT = 295_000   # switch keys at this threshold
-
-_GROQ_KEYS = [
-    os.environ.get('GROQ_API_KEY',   ''),
-    os.environ.get('GROQ_API_KEY_2', ''),
-]
-
-# Per-key daily token counters { key_index: {"date": "YYYY-MM-DD", "tokens": int} }
-_token_counters = {0: {"date": "", "tokens": 0}, 1: {"date": "", "tokens": 0}}
-_active_key_idx = 0   # which key we're currently using
-
-
-def _get_active_key() -> str:
-    """Return the API key string for the currently active slot."""
-    return _GROQ_KEYS[_active_key_idx]
-
-
-def _record_tokens(used: int) -> None:
-    """
-    Add used tokens to the active key's daily counter.
-    Resets the counter at midnight UTC.
-    If the counter hits TOKEN_LIMIT, rotate to the next key.
-    """
-    global _active_key_idx
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    c = _token_counters[_active_key_idx]
-
-    # Reset if it's a new day
-    if c["date"] != today:
-        c["date"]   = today
-        c["tokens"] = 0
-
-    c["tokens"] += used
-    total = c["tokens"]
-    print(f"[GROQ] Key {_active_key_idx + 1} daily usage: {total:,} / {TOKEN_LIMIT:,} tokens")
-
-    # Rotate if limit reached
-    if total >= TOKEN_LIMIT:
-        next_idx = (_active_key_idx + 1) % len(_GROQ_KEYS)
-        print(f"[GROQ] Key {_active_key_idx + 1} hit {TOKEN_LIMIT:,} token limit "
-              f"— rotating to Key {next_idx + 1}")
-        _active_key_idx = next_idx
+# ── Puter AI — OpenAI-compatible endpoint ────────────────────────────────────
+PUTER_MODEL    = 'moonshotai/kimi-k2.5'
+PUTER_BASE_URL = 'https://api.puter.com/puterai/openai/v1/'
 
 
 def get_token_status() -> dict:
-    """Return current token usage for both keys (exposed via /api/token-status)."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    """Stub — token tracking not applicable for Puter (no limits)."""
     return {
-        "active_key": _active_key_idx + 1,
-        "limit_per_key": TOKEN_LIMIT,
-        "keys": [
-            {
-                "key_index": i + 1,
-                "date": _token_counters[i]["date"] or today,
-                "tokens_used": _token_counters[i]["tokens"],
-                "tokens_remaining": max(0, TOKEN_LIMIT - _token_counters[i]["tokens"]),
-                "active": i == _active_key_idx,
-            }
-            for i in range(len(_GROQ_KEYS))
-        ]
+        "provider": "Puter",
+        "model": PUTER_MODEL,
+        "note": "No token limits — Puter has no TPM restrictions.",
     }
 
-
-GROQ_MODEL = 'moonshotai/kimi-k2-instruct-0905'
 
 # ═══════════════════════════════════════════════════════════
 # APP + AUTH
@@ -159,35 +104,45 @@ def _do_fetch(url: str, adaptive: bool, js: bool):
     if js:
         StealthyFetcher.adaptive = adaptive
         return StealthyFetcher.fetch(
-            url, headless=True, network_idle=True, google_search=True, wait=15)
+            url, headless=True, network_idle=True,
+            wait=15,              # wait 15s after network idle for secondary JS calls
+            google_search=True)
     else:
-        return Fetcher(auto_match=adaptive).get(url)
+        fetcher = Fetcher()
+        fetcher.configure(auto_match=adaptive)
+        return fetcher.get(url)
 
 
 def _page_to_text(response) -> str:
     """
     Extract all visible text from the page, deduplicated and ordered.
+    Also grabs value= attributes to catch JS-injected prices in input elements.
     We send raw text to Kimi rather than trying to parse structure ourselves —
     Kimi is better at inferring layout than our heuristics.
     """
     seen  = set()
     parts = []
     for node in (response.css('*') or []):
+        # Text node
         t = (node.text or '').strip()
-        # Keep meaningful text, skip very short or very long strings
         if t and 2 < len(t) < 400 and t not in seen:
             seen.add(t)
             parts.append(t)
+        # value= attributes (input fields, JS-injected prices)
+        v = (node.attrib.get('value') or '').strip()
+        if v and 2 < len(v) < 400 and v not in seen:
+            seen.add(v)
+            parts.append(v)
     return '\n'.join(parts)[:10000]
 
 
 # ═══════════════════════════════════════════════════════════
-# KIMI K2 EXTRACTION — SOLE STRATEGY
+# KIMI K2 EXTRACTION — PUTER PROVIDER
 # ═══════════════════════════════════════════════════════════
 
 async def _extract_with_kimi(page_text: str, url: str) -> list:
     """
-    Send page content to Kimi K2 via Groq.
+    Send page content to Kimi K2 via Puter's OpenAI-compatible endpoint.
     Kimi reads the raw text, understands the layout, and returns clean JSON.
     Current UTC time is included so Kimi knows which events are past/upcoming.
     """
@@ -229,29 +184,24 @@ async def _extract_with_kimi(page_text: str, url: str) -> list:
         f"RAW PAGE TEXT:\n{page_text}"
     )
 
-    def _call_groq():
-        from groq import Groq
-        client = Groq(api_key=_get_active_key())
+    def _call_puter():
+        from openai import OpenAI
+        client = OpenAI(
+            base_url=PUTER_BASE_URL,
+            api_key="puter-free",  # no auth needed — Puter is free and open
+        )
         completion = client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=PUTER_MODEL,
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user",   "content": user_msg},
             ],
             temperature=0.3,
-            max_completion_tokens=16384,
-            top_p=1,
-            stream=False,
-            stop=None,
         )
-        # Track tokens and rotate key if daily limit reached
-        usage = getattr(completion, 'usage', None)
-        if usage:
-            _record_tokens(getattr(usage, 'total_tokens', 0))
         return completion.choices[0].message.content
 
     loop = asyncio.get_event_loop()
-    raw  = await loop.run_in_executor(None, _call_groq)
+    raw  = await loop.run_in_executor(None, _call_puter)
     raw  = raw.strip()
     raw  = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.M)
     raw  = re.sub(r'\s*```\s*$',       '', raw, flags=re.M)
@@ -263,13 +213,10 @@ async def _extract_with_kimi(page_text: str, url: str) -> list:
         print(f"[AUDITOR] JSON parse failed: {e} — attempting recovery")
         items = None
 
-        # Strategy 1: find every position of '}' from the end and try wrapping
-        # Walk backwards through all } positions until we get valid JSON
         raw_stripped = raw.strip()
         if not raw_stripped.startswith('['):
             raw_stripped = '[' + raw_stripped
 
-        # Collect all } positions in reverse order
         positions = [i for i, ch in enumerate(raw_stripped) if ch == '}']
 
         for pos in reversed(positions):
@@ -381,7 +328,7 @@ async def get_api_key():
 
 @app.get("/api/token-status", tags=["Internal"])
 async def token_status():
-    """Current Groq token usage across both keys."""
+    """Provider info — Puter has no token limits."""
     return get_token_status()
 
 
