@@ -230,7 +230,7 @@ async def _extract_with_kimi(page_text: str, url: str) -> list:
             temperature=0.1,
             max_completion_tokens=40960,
             top_p=0.95,
-            reasoning_effort="high",
+            reasoning_effort="default",
             stream=False,
             stop=None,
         )
