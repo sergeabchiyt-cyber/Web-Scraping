@@ -1,441 +1,138 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AUDITOR | Strategic Extraction Terminal</title>
-<style>
-  :root {
-    --bg-base: #0a0a0b;
-    --bg-panel: #121214;
-    --bg-input: #1a1a1c;
-    --border-subtle: #27272a;
-    --border-focus: #52525b;
-    --text-primary: #f4f4f5;
-    --text-secondary: #a1a1aa;
-    --text-muted: #52525b;
-    --accent-blue: #3b82f6;
-    --accent-green: #10b981;
-    --accent-red: #ef4444;
-    --accent-orange: #f59e0b;
-    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    --font-mono: "JetBrains Mono", "SF Mono", Consolas, Menlo, monospace;
-  }
-
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  
-  body {
-    background-color: var(--bg-base);
-    color: var(--text-primary);
-    font-family: var(--font-sans);
-    height: 100vh;
-    display: flex;
-    overflow: hidden;
-    font-size: 13px;
-    -webkit-font-smoothing: antialiased;
-  }
-
-  .sidebar {
-    width: 320px;
-    background-color: var(--bg-panel);
-    border-right: 1px solid var(--border-subtle);
-    display: flex;
-    flex-direction: column;
-    z-index: 10;
-  }
-
-  .main-content {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  .brand {
-    padding: 20px;
-    border-bottom: 1px solid var(--border-subtle);
-    font-family: var(--font-mono);
-    font-weight: 600;
-    letter-spacing: 0.05em;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-  .brand-version { color: var(--text-muted); font-size: 11px; }
-
-  .control-panel { padding: 20px; display: flex; flex-direction: column; gap: 16px; }
-
-  .input-group { display: flex; flex-direction: column; gap: 6px; }
-  .input-label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
-  
-  input[type="text"] {
-    background: var(--bg-input); border: 1px solid var(--border-subtle);
-    color: var(--text-primary); padding: 8px 12px; font-family: var(--font-mono);
-    font-size: 12px; border-radius: 4px; transition: border-color 0.15s; outline: none;
-    width: 100%;
-  }
-  input[type="text"]:focus { border-color: var(--accent-blue); }
-
-  .toggle-container { display: flex; align-items: center; justify-content: space-between; cursor: pointer; padding: 8px 0; }
-  .toggle-label { font-size: 12px; color: var(--text-primary); }
-  .toggle-switch {
-    width: 32px; height: 18px; background: var(--bg-input); border: 1px solid var(--border-subtle);
-    border-radius: 9px; position: relative; transition: background 0.2s;
-  }
-  .toggle-switch::after {
-    content: ''; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px;
-    background: var(--text-secondary); border-radius: 50%; transition: transform 0.2s, background 0.2s;
-  }
-  .toggle-container.active .toggle-switch { background: rgba(59, 130, 246, 0.2); border-color: var(--accent-blue); }
-  .toggle-container.active .toggle-switch::after { transform: translateX(14px); background: var(--accent-blue); }
-
-  .btn {
-    padding: 10px; border: 1px solid var(--border-subtle); background: var(--bg-input);
-    color: var(--text-primary); font-family: var(--font-sans); font-weight: 600; font-size: 12px;
-    border-radius: 4px; cursor: pointer; transition: all 0.15s; text-align: center;
-    text-transform: uppercase; letter-spacing: 0.05em;
-  }
-  .btn-primary { background: var(--accent-blue); color: #fff; border-color: var(--accent-blue); }
-  .btn-primary:hover { opacity: 0.9; }
-  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-  .btn-secondary { color: var(--text-secondary); }
-  .btn-secondary:not(:disabled):hover { border-color: var(--text-primary); color: var(--text-primary); }
-  .btn-secondary:disabled { opacity: 0.3; cursor: not-allowed; }
-
-  .log-container {
-    flex: 1; border-top: 1px solid var(--border-subtle); background: var(--bg-base);
-    padding: 12px; font-family: var(--font-mono); font-size: 11px; overflow-y: auto; color: var(--text-secondary);
-  }
-  .log-entry { margin-bottom: 4px; line-height: 1.4; word-break: break-all; }
-  .log-entry.info { color: var(--accent-blue); }
-  .log-entry.success { color: var(--accent-green); }
-  .log-entry.error { color: var(--accent-red); }
-
-  .header {
-    height: 57px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-panel);
-    display: flex; align-items: center; justify-content: space-between; padding: 0 20px;
-  }
-  .tabs { display: flex; height: 100%; gap: 24px; }
-  .tab {
-    display: flex; align-items: center; color: var(--text-secondary); font-weight: 500;
-    cursor: pointer; border-bottom: 2px solid transparent; transition: color 0.15s;
-  }
-  .tab:hover { color: var(--text-primary); }
-  .tab.active { color: var(--text-primary); border-bottom-color: var(--accent-blue); }
-
-  .metrics { display: flex; gap: 16px; font-family: var(--font-mono); font-size: 11px; }
-  .metric-label { color: var(--text-muted); }
-  .metric-value { color: var(--text-primary); font-weight: 600; }
-
-  .toolbar {
-    padding: 12px 20px; border-bottom: 1px solid var(--border-subtle);
-    display: flex; background: var(--bg-base);
-  }
-  .search-input { width: 100%; max-width: 400px; border: none; background: transparent; padding: 0; font-size: 13px; color: var(--text-primary); outline: none; }
-  .search-input::placeholder { color: var(--text-muted); }
-
-  .view-container { flex: 1; overflow: auto; position: relative; background: var(--bg-base); }
-
-  .data-table { width: 100%; border-collapse: collapse; text-align: left; }
-  .data-table th {
-    position: sticky; top: 0; background: var(--bg-panel); padding: 8px 16px;
-    font-size: 11px; text-transform: uppercase; color: var(--text-secondary); letter-spacing: 0.05em;
-    border-bottom: 1px solid var(--border-subtle); z-index: 2; font-weight: 600;
-  }
-  .data-table td {
-    padding: 10px 16px; border-bottom: 1px solid var(--border-subtle);
-    font-family: var(--font-mono); font-size: 12px; white-space: nowrap;
-  }
-  .data-table tbody tr:hover { background: var(--bg-panel); }
-
-  .status-badge { padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: bold; }
-  .status-past { background: rgba(82,82,91,0.2); color: var(--text-secondary); }
-  .status-upcoming { background: rgba(16,185,129,0.15); color: var(--accent-green); }
-
-  .empty-state {
-    position: absolute; inset: 0; display: flex; flex-direction: column;
-    align-items: center; justify-content: center; color: var(--text-muted);
-    font-family: var(--font-mono); gap: 12px;
-  }
-  .loader {
-    border: 2px solid var(--border-subtle); border-top-color: var(--accent-blue);
-    border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-
-  .api-docs { padding: 32px 40px; max-width: 900px; margin: 0 auto; display: none; }
-  .api-docs.visible { display: block; }
-  .api-section { margin-bottom: 40px; }
-  .api-title { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: var(--text-primary); border-bottom: 1px solid var(--border-subtle); padding-bottom: 8px; }
-  .api-text { color: var(--text-secondary); line-height: 1.6; margin-bottom: 16px; }
-
-  .code-block {
-    background: var(--bg-panel); border: 1px solid var(--border-subtle); border-radius: 4px;
-    padding: 16px; margin-bottom: 16px; position: relative; font-family: var(--font-mono); font-size: 12px; color: var(--text-primary);
-  }
-  .code-block pre { white-space: pre-wrap; word-break: break-all; margin: 0; color: #a1a1aa; }
-
-  .copy-btn {
-    position: absolute; top: 8px; right: 8px; background: transparent; border: 1px solid var(--border-subtle);
-    color: var(--text-secondary); font-size: 10px; padding: 4px 8px; border-radius: 3px; cursor: pointer; transition: all 0.2s;
-  }
-  .copy-btn:hover { border-color: var(--text-primary); color: var(--text-primary); }
-
-  .endpoint-grid { display: grid; grid-template-columns: 100px 1fr; gap: 8px; margin-bottom: 16px; align-items: center; font-family: var(--font-mono); font-size: 12px; }
-  .method { padding: 2px 6px; border-radius: 3px; text-align: center; font-weight: bold; font-size: 11px; }
-  .method.get { background: rgba(16,185,129,0.15); color: var(--accent-green); }
-  .method.post { background: rgba(59,130,246,0.15); color: var(--accent-blue); }
-
-  .schema-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 16px; }
-  .schema-table th, .schema-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border-subtle); }
-  .schema-table th { color: var(--text-secondary); font-weight: 500; }
-  .schema-table td:first-child { font-family: var(--font-mono); color: var(--accent-blue); }
-  .schema-req { color: var(--accent-red); font-size: 10px; margin-left: 6px; }
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AUDITOR | Strategic Extraction Terminal</title>
+    <style>
+        :root {
+            --bg-base: #0a0a0b; --bg-panel: #121214; --bg-input: #1a1a1c;
+            --border-subtle: #27272a; --border-focus: #52525b;
+            --text-primary: #f4f4f5; --text-secondary: #a1a1aa; --text-muted: #52525b;
+            --accent-blue: #3b82f6; --accent-green: #10b981; --accent-red: #ef4444;
+            --accent-orange: #f59e0b; --font-mono: "JetBrains Mono", "SF Mono", monospace;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { background-color: var(--bg-base); color: var(--text-primary); font-family: sans-serif; height: 100vh; display: flex; overflow: hidden; font-size: 13px; }
+        .sidebar { width: 320px; background-color: var(--bg-panel); border-right: 1px solid var(--border-subtle); display: flex; flex-direction: column; }
+        .main-content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        .brand { padding: 20px; border-bottom: 1px solid var(--border-subtle); font-family: var(--font-mono); font-weight: 600; display: flex; justify-content: space-between; }
+        .control-panel { padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+        .input-group { display: flex; flex-direction: column; gap: 6px; }
+        input[type="text"] { background: var(--bg-input); border: 1px solid var(--border-subtle); color: var(--text-primary); padding: 8px 12px; font-family: var(--font-mono); border-radius: 4px; outline: none; }
+        .btn { padding: 10px; border: 1px solid var(--border-subtle); background: var(--bg-input); color: var(--text-primary); font-weight: 600; border-radius: 4px; cursor: pointer; text-transform: uppercase; }
+        .btn-primary { background: var(--accent-blue); border-color: var(--accent-blue); }
+        .log-container { flex: 1; border-top: 1px solid var(--border-subtle); background: var(--bg-base); padding: 12px; font-family: var(--font-mono); font-size: 11px; overflow-y: auto; color: var(--text-secondary); }
+        .header { height: 57px; border-bottom: 1px solid var(--border-subtle); background: var(--bg-panel); display: flex; align-items: center; justify-content: space-between; padding: 0 20px; }
+        .metrics { display: flex; gap: 16px; font-family: var(--font-mono); font-size: 11px; }
+        .view-container { flex: 1; overflow: auto; background: var(--bg-base); padding: 20px; }
+        .data-table { width: 100%; border-collapse: collapse; }
+        .data-table th { background: var(--bg-panel); padding: 10px; text-align: left; border-bottom: 1px solid var(--border-subtle); color: var(--text-secondary); }
+        .data-table td { padding: 10px; border-bottom: 1px solid var(--border-subtle); font-family: var(--font-mono); }
+        .active-js { color: var(--accent-blue); font-weight: bold; }
+    </style>
 </head>
 <body>
-
 <aside class="sidebar">
-  <div class="brand">
-    <span>AUDITOR</span>
-    <span class="brand-version">v4.0.0</span>
-  </div>
-
-  <div class="control-panel">
-    <div class="input-group">
-      <label class="input-label">Target URI</label>
-      <input type="text" id="url" value="https://tradingeconomics.com/calendar" autocomplete="off" spellcheck="false">
+    <div class="brand"><span>AUDITOR</span><span style="color:var(--text-muted)">v7.8.0</span></div>
+    <div class="control-panel">
+        <div class="input-group">
+            <label style="font-size:11px; color:var(--text-secondary)">TARGET URI</label>
+            <input type="text" id="url-input" value="https://tradingeconomics.com/calendar">
+        </div>
+        <div class="input-group">
+            <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                <input type="checkbox" id="js-check"> <span style="font-size:12px">JS Execution Context</span>
+            </label>
+        </div>
+        <button class="btn btn-primary" id="run-btn">Execute Extraction</button>
+        <button class="btn" id="dl-btn" style="color:var(--text-secondary)" disabled>Export JSON</button>
     </div>
-
-    <div class="toggle-container" id="js-toggle" onclick="toggleJS()">
-      <span class="toggle-label">JS Execution Context</span>
-      <div class="toggle-switch"></div>
+    <div class="log-container" id="log-box">
+        <div>[SYSTEM] Initialized. Awaiting objective.</div>
     </div>
-
-    <button class="btn btn-primary" id="run-btn">Execute Extraction</button>
-    <button class="btn btn-secondary" id="dl-btn" disabled>Export Payload (JSON)</button>
-  </div>
-
-  <div class="log-container" id="log">
-    <div class="log-entry">[SYSTEM] Initialized. Awaiting objective.</div>
-  </div>
 </aside>
-
 <main class="main-content">
-  <header class="header">
-    <div class="tabs">
-      <div class="tab active" data-view="events">Data Output</div>
-      <div class="tab" data-view="api">API Reference</div>
+    <header class="header">
+        <div style="font-weight:bold">Data Output</div>
+        <div class="metrics">
+            <div>VOL: <span id="m-vol" style="color:var(--accent-blue)">0</span></div>
+            <div>TIME: <span id="m-time" style="color:var(--accent-green)">0.00s</span></div>
+        </div>
+    </header>
+    <div class="view-container" id="output-view">
+        <div style="color:var(--text-muted); font-family:var(--font-mono)">No active records in memory.</div>
     </div>
-    <div class="metrics">
-      <div><span class="metric-label">VOL:</span> <span class="metric-value" id="stat-total">0</span></div>
-      <div><span class="metric-label">PENDING:</span> <span class="metric-value" id="stat-pending">0</span></div>
-      <div><span class="metric-label">LATENCY:</span> <span class="metric-value" id="stat-time">0.00s</span></div>
-    </div>
-  </header>
-
-  <div class="toolbar" id="toolbar">
-    <input type="text" class="search-input" id="search" placeholder="Filter by indicator, country, or specific values..." oninput="applyFilter()">
-  </div>
-
-  <div class="view-container">
-    <div id="data-view">
-      <div class="empty-state">
-        <div>Awaiting execution command.</div>
-      </div>
-    </div>
-    <div id="api-view" class="api-docs"></div>
-  </div>
 </main>
 
 <script>
-  // Auto-detect API base URL — works locally and on Railway/any deployment
-  const BASE_URL = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
-    ? BASE_URL
-    : window.location.origin;
+    const el = id => document.getElementById(id);
+    let sessionData = [];
 
-  const state = { events: [], view: 'events', apiKey: '', jsEnabled: false };
-  const el = id => document.getElementById(id);
-  const esc = s => String(s || '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+    function log(msg, color = 'var(--text-secondary)') {
+        const div = document.createElement('div');
+        div.style.color = color;
+        div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        el('log-box').prepend(div);
+    }
 
-  function log(msg, type = '') {
-    const cont = el('log');
-    const d = document.createElement('div');
-    d.className = `log-entry ${type}`;
-    const ts = new Date().toISOString().split('T')[1].slice(0, 8);
-    d.textContent = `[${ts}] ${msg}`;
-    cont.prepend(d);
-    while (cont.children.length > 50) cont.removeChild(cont.lastChild);
-  }
+    el('run-btn').addEventListener('click', async () => {
+        const url = el('url-input').value;
+        const js = el('js-check').checked;
+        const start = performance.now();
 
-  function copyText(text, btn) {
-    navigator.clipboard.writeText(text).then(() => {
-      const orig = btn.textContent;
-      btn.textContent = 'COPIED';
-      setTimeout(() => btn.textContent = orig, 2000);
+        el('run-btn').disabled = true;
+        el('run-btn').textContent = "EXTRACTING...";
+        log(`Initiating request to ${url}...`, 'var(--accent-blue)');
+
+        try {
+            const response = await fetch('/execute_extraction', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ target_url: url, js_rendering: js })
+            });
+
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.detail || 'Extraction failed');
+
+            sessionData = result.data || result.events || [];
+            renderTable(sessionData);
+            
+            el('m-vol').textContent = sessionData.length;
+            el('m-time').textContent = ((performance.now() - start) / 1000).toFixed(2) + 's';
+            el('dl-btn').disabled = false;
+            log(`Success: ${sessionData.length} records retrieved.`, 'var(--accent-green)');
+        } catch (err) {
+            log(`ERROR: ${err.message}`, 'var(--accent-red)');
+        } finally {
+            el('run-btn').disabled = false;
+            el('run-btn').textContent = "Execute Extraction";
+        }
     });
-  }
-  window.copyBlock = (id, btn) => { const node = el(id); if (node) copyText(node.textContent, btn); };
 
-  function toggleJS() {
-    state.jsEnabled = !state.jsEnabled;
-    el('js-toggle').classList.toggle('active', state.jsEnabled);
-    log(`JS Execution Context: ${state.jsEnabled ? 'ENABLED' : 'DISABLED'}`, state.jsEnabled ? 'info' : '');
-  }
+    function renderTable(data) {
+        if (!data.length) return;
+        const keys = Object.keys(data[0]);
+        let html = `<table class="data-table"><thead><tr>`;
+        keys.forEach(k => html += `<th>${k.toUpperCase()}</th>`);
+        html += `</tr></thead><tbody>`;
+        data.forEach(row => {
+            html += `<tr>`;
+            keys.forEach(k => html += `<td>${row[k] || '-'}</td>`);
+            html += `</tr>`;
+        });
+        html += `</tbody></table>`;
+        el('output-view').innerHTML = html;
+    }
 
-  document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
-    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
-    t.classList.add('active');
-    state.view = t.dataset.view;
-    const isApi = state.view === 'api';
-    el('toolbar').style.display = isApi ? 'none' : 'flex';
-    el('data-view').style.display = isApi ? 'none' : 'block';
-    el('api-view').classList.toggle('visible', isApi);
-    if (isApi) renderApiDocs();
-  }));
-
-  function applyFilter() {
-    const q = (el('search').value || '').toLowerCase().trim();
-    const filtered = state.events.filter(ev => {
-      if (!q) return true;
-      const fields = Object.values(ev).filter(Boolean).join(' ').toLowerCase();
-      return fields.includes(q);
+    el('dl-btn').addEventListener('click', () => {
+        const blob = new Blob([JSON.stringify(sessionData, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `audit_export_${Date.now()}.json`;
+        a.click();
     });
-    renderEvents(filtered);
-  }
-
-  function getName(ev) {
-    for (const f of ['indicator','title','name','event','headline','product','label']) {
-      if (ev[f]) return String(ev[f]);
-    }
-    return '—';
-  }
-
-  function getActual(ev) {
-    for (const f of ['actual','value','price','result']) {
-      if (ev[f] != null && ev[f] !== '') return String(ev[f]);
-    }
-    return null;
-  }
-
-  function renderEvents(events) {
-    const container = el('data-view');
-    if (!events.length) {
-      container.innerHTML = '<div class="empty-state"><div>No data matches criteria.</div></div>';
-      return;
-    }
-
-    // Detect columns dynamically from all events
-    const knownFirst = ['indicator','title','name','event','headline'];
-    const knownSkip  = new Set([...knownFirst]);
-    const extraCols  = new Set();
-    for (const ev of events) {
-      for (const k of Object.keys(ev)) {
-        if (!knownSkip.has(k)) extraCols.add(k);
-      }
-    }
-    // Fixed display columns for economic/calendar data
-    const fixedCols = ['country','date','event_date','time','event_time','event_datetime_utc','period','actual','value','forecast','consensus','previous','is_past'];
-    const usedFixed = fixedCols.filter(c => events.some(e => e[c] != null && e[c] !== ''));
-    // Any extra columns not in fixed list
-    const otherCols = [...extraCols].filter(c => !new Set(fixedCols).has(c) && !knownSkip.has(c) && events.some(e => e[c] != null && e[c] !== '')).slice(0, 4);
-
-    const allCols = [...usedFixed, ...otherCols];
-
-    function fmtCell(ev, col) {
-      const v = ev[col];
-      if (col === 'is_past') {
-        return v === true
-          ? '<span class="status-badge status-past">PAST</span>'
-          : '<span class="status-badge status-upcoming">PENDING</span>';
-      }
-      if (v == null || v === '') return '<span style="color:var(--text-muted)">—</span>';
-      const s = esc(String(v));
-      if (col === 'actual' || col === 'value') return `<span style="color:var(--accent-green);font-weight:600">${s}</span>`;
-      if (col === 'forecast' || col === 'consensus') return `<span style="color:var(--accent-orange)">${s}</span>`;
-      return s;
-    }
-
-    const thLabel = c => c.replace(/_/g,' ').replace(/\b\w/g, x => x.toUpperCase());
-
-    const rows = events.map(ev => {
-      const name = getName(ev);
-      const actual = getActual(ev);
-      const nameCell = `<td style="color:var(--text-primary);font-family:var(--font-sans);font-weight:500;white-space:normal;max-width:280px">${esc(name)}</td>`;
-      const dataCells = allCols.map(c => `<td>${fmtCell(ev, c)}</td>`).join('');
-      return `<tr>${nameCell}${dataCells}</tr>`;
-    }).join('');
-
-    const headers = ['Indicator/Name', ...allCols.map(thLabel)].map(h => `<th>${h}</th>`).join('');
-
-    container.innerHTML = `
-      <table class="data-table">
-        <thead><tr>${headers}</tr></thead>
-        <tbody>${rows}</tbody>
-      </table>`;
-  }
-
-  function renderApiDocs() {
-    const key = state.apiKey || '<AWAITING_KEY>';
-    const base = BASE_URL;
-    el('api-view').innerHTML = `
-      <div class="api-section">
-        <div class="api-title">Authentication</div>
-        <div class="api-text">Supply the API key via the <code style="color:var(--accent-blue)">X-Api-Key</code> HTTP header. Persistence is managed via the <code style="color:var(--accent-blue)">AUDITOR_API_KEY</code> environment variable on the host.</div>
-        <div class="code-block">
-          <button class="copy-btn" onclick="copyBlock('api-key-val',this)">Copy</button>
-          <pre id="api-key-val">X-Api-Key: ${esc(key)}</pre>
-        </div>
-      </div>
-      <div class="api-section">
-        <div class="api-title">Extraction Endpoint</div>
-        <div class="api-text">Executes a deterministic scrape utilizing Groq Kimi K2 for DOM abstraction and classification. Schema is inferred dynamically — works on any page type.</div>
-        <div class="endpoint-grid">
-          <div class="method post">POST</div>
-          <div><code style="color:var(--accent-blue)">/api/scrape</code></div>
-        </div>
-        <table class="schema-table">
-          <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
-          <tbody>
-            <tr><td>url <span class="schema-req">req</span></td><td>string</td><td>Target URI for extraction.</td></tr>
-            <tr><td>adaptive</td><td>boolean</td><td>Enable Scrapling adaptive match (default: true).</td></tr>
-            <tr><td>js</td><td>boolean</td><td>Execute headless browser for client-side rendered DOMs (default: false).</td></tr>
-          </tbody>
-        </table>
-        <div class="code-block">
-          <button class="copy-btn" onclick="copyBlock('curl-scrape',this)">Copy</button>
-          <pre id="curl-scrape">curl -X POST ${base}/api/scrape \\
-  -H "X-Api-Key: ${esc(key)}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"url":"https://tradingeconomics.com/calendar","js":false}'</pre>
-        </div>
-        <div class="code-block">
-          <button class="copy-btn" onclick="copyBlock('curl-js',this)">Copy</button>
-          <pre id="curl-js">curl -X POST ${base}/api/scrape \\
-  -H "X-Api-Key: ${esc(key)}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"url":"https://www.coinglass.com/open-interest/BTC","js":true}'</pre>
-        </div>
-      </div>
-      <div class="api-section">
-        <div class="api-title">JS Rendering Setup</div>
-        <div class="api-text">Required for JavaScript-rendered pages (React, Vue, Angular). Run once:</div>
-        <div class="code-block">
-          <button class="copy-btn" onclick="copyBlock('cb-install',this)">Copy</button>
-          <pre id="cb-install">pip install scrapling[all] --break-system-packages
-scrapling install</pre>
-        </div>
-        <div class="api-text">Compatibility: tradingeconomics.com (js:false) | investing.com (js:true) | coinglass.com (js:true) | MarketWatch ✗ Cloudflare blocked</div>
-      </div>`;
-  }
-  async function loadApiKey() {
-    try {
-      const res = await fetch(BASE_URL + '/api/key');
-      if (res.ok) { const d = await res.json(); state.apiKey = d.api_key || ''; }
-    } catch (e) { log('Failed to retrieve API key — is the server running?', 'error'); }
-  }
-
-  loadApiKey();
 </script>
 </body>
 </html>
