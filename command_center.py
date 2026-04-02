@@ -6,13 +6,12 @@ import socket
 import concurrent.futures
 from urllib.parse import urlparse
 from typing import Optional, List, Dict, Any, Union
-from collections import Counter
 from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from pydantic import BaseModel, HttpUrl
 from bs4 import BeautifulSoup
 
@@ -23,24 +22,28 @@ try:
 except ImportError:
     _STEALTH_AVAILABLE = False
 
+# ── Telegram Hook (Assumes telegram_bot.py exists) ───────────────────────────
+_TELEGRAM_AVAILABLE = False
 try:
-    from telegram import Bot
-    from telegram.ext import ApplicationBuilder, CommandHandler
+    # Attempt to import your specific bot module
+    from telegram_bot import start_bot_thread
     _TELEGRAM_AVAILABLE = True
 except ImportError:
-    _TELEGRAM_AVAILABLE = False
+    print("[AUDITOR] telegram_bot.py not found. Telegram interface disabled.")
 
 # ═══════════════════════════════════════════════════════════
-# GLOBAL EXECUTOR & LIMITS
+# GLOBAL EXECUTORS
 # ═══════════════════════════════════════════════════════════
-cpu_executor = concurrent.futures.ProcessPoolExecutor(max_workers=min(32, (os.cpu_count() or 1) + 4))
+# Offload CPU-bound BeautifulSoup parsing to separate processes
+cpu_executor = concurrent.futures.ProcessPoolExecutor(max_workers=4)
 MAX_PAYLOAD_SIZE = 10_485_760 
 
 # ═══════════════════════════════════════════════════════════
-# SECURITY & PARSER UTILITIES (Isolated)
+# HARDENED LOGIC ENGINE (PROCESS-ISOLATED)
 # ═══════════════════════════════════════════════════════════
 
 def _is_safe_url(url: str) -> bool:
+    """SSRF Protection: Block internal/private network access."""
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ('http', 'https'): return False
@@ -48,6 +51,7 @@ def _is_safe_url(url: str) -> bool:
         if not hostname: return False
         ip = socket.gethostbyname(hostname)
         ip_int = int.from_bytes(socket.inet_aton(ip), 'big')
+        # Private IP Ranges
         private_blocks = [
             (0x0A000000, 0xFF000000), (0xAC100000, 0xFFF00000),
             (0xC0A80000, 0xFFFF0000), (0x7F000000, 0xFF000000),
@@ -61,8 +65,10 @@ def _sanitize_key(text: str) -> str:
     return re.sub(r'_+', '_', clean).strip('_').lower()[:64]
 
 def _clean_value(text: str) -> Union[str, Dict[str, Any]]:
+    """Context-aware data cleaning."""
     if not text: return None
     t = text.strip()
+    # Financial Regex
     fin = re.match(r'^([\+\-]?)([\$€£¥])\s?([\d,]+\.?\d*)\s?([KMBT]?)$', t)
     if fin:
         sign, curr, val, suffix = fin.groups()
@@ -74,10 +80,12 @@ def _clean_value(text: str) -> Union[str, Dict[str, Any]]:
     return t[:1000]
 
 def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
+    """CPU-bound parsing executed in ProcessPoolExecutor."""
     soup = BeautifulSoup(content, 'html.parser')
-    for tag in soup(['script', 'style', 'nav', 'footer', 'aside', 'svg']): tag.decompose()
-    results = []
+    for tag in soup(['script', 'style', 'nav', 'footer', 'aside']): tag.decompose()
     
+    results = []
+    # Table extraction
     for table in soup.find_all('table'):
         rows = table.find_all('tr')
         if not rows: continue
@@ -89,92 +97,94 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
     return results
 
 # ═══════════════════════════════════════════════════════════
-# TELEGRAM INTEGRATION (Asynchronous)
-# ═══════════════════════════════════════════════════════════
-
-async def start_telegram_bot():
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token or not _TELEGRAM_AVAILABLE:
-        print("[AUDITOR] Telegram disabled: Missing token or library.")
-        return
-    
-    app = ApplicationBuilder().token(token).build()
-    app.add_handler(CommandHandler("status", lambda u, c: u.message.reply_text("AUDITOR System Online.")))
-    
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    print("[AUDITOR] Telegram Bot active.")
-    return app
-
-# ═══════════════════════════════════════════════════════════
-# API ORCHESTRATION
+# LIFECYCLE & API
 # ═══════════════════════════════════════════════════════════
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Initialize Telegram Bot
-    tg_app = await start_telegram_bot()
+    # Startup
+    if _TELEGRAM_AVAILABLE:
+        try:
+            start_bot_thread()
+            print("[AUDITOR] Telegram thread spawned.")
+        except Exception as e:
+            print(f"[AUDITOR] Telegram Bot fail: {e}")
     yield
-    # Shutdown: Clean up Process Pool and Telegram
+    # Shutdown
     cpu_executor.shutdown(wait=True)
-    if tg_app:
-        await tg_app.updater.stop()
-        await tg_app.stop()
-        await tg_app.shutdown()
 
-app = FastAPI(title="AUDITOR CORE", version="7.1.0", lifespan=lifespan)
+app = FastAPI(title="AUDITOR CORE", version="7.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=False,
-    allow_methods=["POST"], allow_headers=["X-Api-Key", "Content-Type"],
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
+# Auth Config
 _ENV_KEY = os.environ.get("AUDITOR_API_KEY", "").strip()
 API_KEY = _ENV_KEY if _ENV_KEY else secrets.token_hex(32)
-if not _ENV_KEY: print(f"[BOOT] API KEY: {API_KEY}")
+if not _ENV_KEY: print(f"[BOOT] AUTH KEY: {API_KEY}")
 
-def validate_auth(x_api_key: str = Header(..., alias="X-Api-Key")):
-    if not secrets.compare_digest(x_api_key, API_KEY):
-        raise HTTPException(status_code=401, detail="UNAUTHORIZED")
+def require_api_key(x_api_key: Optional[str] = Header(default=None)):
+    if not x_api_key or not secrets.compare_digest(x_api_key, API_KEY):
+        raise HTTPException(status_code=401, detail="INVALID_API_KEY")
 
-class ScrapeRequest(BaseModel):
+class ScrapePayload(BaseModel):
     url: HttpUrl
     js: bool = False
 
-@app.post("/api/v1/extract", dependencies=[Depends(validate_auth)])
-async def extract(payload: ScrapeRequest):
+# ═══════════════════════════════════════════════════════════
+# ROUTES
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/", tags=["Frontend"])
+async def serve_frontend():
+    """Corrected frontend resolution logic."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    html_path = os.path.join(base_dir, "index.html")
+    
+    if os.path.exists(html_path):
+        return FileResponse(html_path)
+    
+    return HTMLResponse(
+        content=f"<h2>404: Frontend Missing</h2><p>Expected index.html at: {html_path}</p>", 
+        status_code=404
+    )
+
+@app.post("/api/scrape", dependencies=[Depends(require_api_key)])
+async def api_scrape(payload: ScrapePayload):
     target = str(payload.url)
     if not _is_safe_url(target):
-        raise HTTPException(status_code=403, detail="RESTRICTED_URL")
+        raise HTTPException(status_code=403, detail="FORBIDDEN_DOMAIN")
 
     loop = asyncio.get_event_loop()
     
+    # 1. Threaded Fetch (I/O Bound)
     try:
         if payload.js:
-            if not _STEALTH_AVAILABLE: raise ValueError("Stealth engine missing")
-            # Offload synchronous fetcher to thread pool
-            response = await loop.run_in_executor(None, lambda: StealthyFetcher.fetch(target, headless=True, network_idle=True, wait=10))
+            if not _STEALTH_AVAILABLE: raise ValueError("Stealth engine unavailable")
+            response = await loop.run_in_executor(None, lambda: StealthyFetcher.fetch(target, headless=True, network_idle=True))
         else:
             response = await loop.run_in_executor(None, lambda: Fetcher().get(target))
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"FETCH_FAILURE: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"FETCH_ERROR: {str(e)}")
 
     if not response or not hasattr(response, 'content'):
         raise HTTPException(status_code=502, detail="EMPTY_RESPONSE")
 
     if len(response.content) > MAX_PAYLOAD_SIZE:
-        raise HTTPException(status_code=413, detail="CONTENT_TOO_LARGE")
+        raise HTTPException(status_code=413, detail="PAYLOAD_TOO_LARGE")
 
-    # Offload CPU-bound parser to process pool
-    extracted_data = await loop.run_in_executor(cpu_executor, _extract_worker, response.content)
+    # 2. Process-Isolated Parse (CPU Bound)
+    data = await loop.run_in_executor(cpu_executor, _extract_worker, response.content)
 
     return {
-        "status": "SUCCESS",
-        "data": extracted_data,
-        "metrics": {"nodes": len(extracted_data), "size": len(response.content)}
+        "status": "COMPLETED",
+        "url": target,
+        "clean_count": len(data),
+        "data": data
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
