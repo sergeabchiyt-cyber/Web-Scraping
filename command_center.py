@@ -147,7 +147,7 @@ def _do_fetch(url: str, adaptive: bool, js: bool):
             google_search=True)
     else:
         fetcher = Fetcher()
-        fetcher.configure(auto_match=adaptive)
+        fetcher.configure(adaptive=adaptive)
         return fetcher.get(url)
 
 
