@@ -32,10 +32,18 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
 
+def _escape_md(text: str) -> str:
+    """Escape characters that break Telegram Markdown parsing."""
+    return (str(text)
+            .replace('\\', '\\\\')
+            .replace('`', "'")
+            .replace('*', '\\*')
+            .replace('_', '\\_'))
+
+
 def _fmt_item(idx: int, item: dict) -> str:
     """Format a single extracted item. Fully generic — works with any schema."""
 
-    # Find the primary name from any reasonable identifier field
     NAME_FIELDS = ('indicator','title','name','event','headline','product',
                    'label','item','description','exchange','symbol','pair',
                    'asset','coin','company','ticker','token','market')
@@ -48,7 +56,6 @@ def _fmt_item(idx: int, item: dict) -> str:
             break
 
     if not name:
-        # Last resort: first string value
         for k, v in item.items():
             if isinstance(v, str) and len(v.strip()) >= 2:
                 name = v.strip()
@@ -58,9 +65,8 @@ def _fmt_item(idx: int, item: dict) -> str:
     if not name:
         name = f"Item {idx}"
 
-    lines = [f"*{idx}. {name}*"]
+    lines = [f"*{idx}. {_escape_md(name)}*"]
 
-    # Show all remaining fields except the one used as name
     SKIP = {'is_past'}
     if name_key:
         SKIP.add(name_key)
@@ -69,7 +75,7 @@ def _fmt_item(idx: int, item: dict) -> str:
         if k in SKIP or v is None or str(v).strip() == '':
             continue
         label = k.replace('_', ' ').title()
-        lines.append(f"  {label}: {v}")
+        lines.append(f"  {label}: {_escape_md(v)}")
 
     return '\n'.join(lines)
 
@@ -78,13 +84,11 @@ def _build_batches(items: list, url: str) -> list[str]:
     """
     Split items into Telegram messages purely by character count.
     Each message stays strictly under MAX_CHARS (4096).
-    No fixed item-per-message limit — pack as many as fit.
     """
     messages   = []
     total      = len(items)
     current    = ""
     batch_num  = 1
-    first_idx  = 1   # global item index of first item in current message
 
     def make_header(start_idx: int) -> str:
         short_url = url[:55] + '…' if len(url) > 55 else url
@@ -99,15 +103,12 @@ def _build_batches(items: list, url: str) -> list[str]:
     for i, item in enumerate(items, start=1):
         block = _fmt_item(i, item) + '\n\n'
 
-        # If a single block is itself too large, truncate it
         if len(block) > MAX_CHARS - 100:
             block = block[:MAX_CHARS - 103] + '…\n\n'
 
         if len(current) + len(block) > MAX_CHARS:
-            # Current message is full — save and start a new one
             messages.append(current.rstrip())
             batch_num += 1
-            first_idx  = i
             current    = make_header(i) + block
         else:
             current += block
@@ -127,7 +128,7 @@ async def _handle_ping(update, context):
         "✅ *AUDITOR is online*\n"
         f"🕐 `{now}`\n"
         f"🔑 API Key: `{API_KEY[:8]}...`\n"
-        "🤖 Kimi K2 extraction ready"
+        "🤖 Qwen3-32B extraction ready"
     )
     await update.message.reply_text(text, parse_mode='Markdown')
 
@@ -148,14 +149,13 @@ async def _handle_scrape(update, context):
     url = args[0]
     use_js = len(args) > 1 and args[1].lower() == 'js'
 
-    # Normalise URL
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
 
     await update.message.reply_text(
         f"⏳ Scraping `{url}`...\n"
         f"{'🌐 JS rendering ON' if use_js else '⚡ Fast mode (no JS)'}\n"
-        "This may take 20–40s — Kimi K2 is reading the page.",
+        "This may take 20–40s — Qwen3 is reading the page.",
         parse_mode='Markdown'
     )
 
@@ -172,15 +172,13 @@ async def _handle_scrape(update, context):
             )
             return
 
-        total    = len(items)
-        batches  = _build_batches(items, url)
-        n_msgs   = len(batches)
+        total   = len(items)
+        batches = _build_batches(items, url)
+        n_msgs  = len(batches)
 
-        # Send all batches
         for msg in batches:
             await update.message.reply_text(msg, parse_mode='Markdown')
 
-        # Summary
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         await update.message.reply_text(
             f"✅ *Done*\n"
@@ -190,13 +188,11 @@ async def _handle_scrape(update, context):
             parse_mode='Markdown'
         )
 
-        # Token usage report
         try:
             from command_center import get_token_status
             ts = get_token_status()
-            active = ts['active_key']
             limit  = ts['limit_per_key']
-            lines  = [f"🔑 *Groq Token Usage*"]
+            lines  = ["🔑 *Groq Token Usage*"]
             for k in ts['keys']:
                 used      = k['tokens_used']
                 remaining = k['tokens_remaining']
@@ -216,11 +212,9 @@ async def _handle_scrape(update, context):
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[TELEGRAM] /scrape error:\n{tb}")
-        short = str(e)[:300] if str(e) else repr(e)[:300]
-        await update.message.reply_text(
-            f"❌ *Scrape failed*\n`{short}`",
-            parse_mode='Markdown'
-        )
+        # Strip markdown-breaking characters before sending error to Telegram
+        short = (str(e) or repr(e))[:300].replace('`', "'").replace('*', '').replace('_', '')
+        await update.message.reply_text(f"❌ Scrape failed\n{short}")
 
 
 async def _handle_unknown(update, context):
@@ -234,7 +228,6 @@ async def _handle_unknown(update, context):
 
 # ── Bot startup ───────────────────────────────────────────────────────────────
 
-# Singleton guard — prevents duplicate polling threads on uvicorn reload/redeploy
 _bot_started = False
 _bot_lock = threading.Lock()
 
@@ -270,14 +263,10 @@ def start_bot():
 
         app.add_handler(CommandHandler("ping",   _handle_ping))
         app.add_handler(CommandHandler("scrape", _handle_scrape))
-        app.add_handler(
-            MessageHandler(filters.COMMAND, _handle_unknown)
-        )
+        app.add_handler(MessageHandler(filters.COMMAND, _handle_unknown))
 
         print("[TELEGRAM] Bot starting — listening for commands...")
 
-        # Drive polling manually — avoids run_polling() which tries to
-        # close/manage the event loop and conflicts with our thread loop.
         await app.initialize()
         await app.start()
         await app.updater.start_polling(
@@ -285,7 +274,6 @@ def start_bot():
             allowed_updates=["message"],
         )
 
-        # Keep the coroutine alive indefinitely
         try:
             while True:
                 await asyncio.sleep(3600)
