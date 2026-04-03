@@ -428,9 +428,27 @@ async def token_status(_key: str = Depends(verify_key)):
 # ═══════════════════════════════════════════════════════════
 # TELEGRAM BOT LIFESPAN (replaces old @app.on_event)
 # ═══════════════════════════════════════════════════════════
-from telegram_bot import telegram_lifespan  # must be the corrected version
-app.router.lifespan_context = telegram_lifespan
+# ═══════════════════════════════════════════════════════════
+# STARTUP & SHUTDOWN (Telegram bot)
+# ═══════════════════════════════════════════════════════════
+@app.on_event("startup")
+async def startup_telegram():
+    try:
+        from telegram_bot import start_bot
+        start_bot()
+        print("[BOOT] Telegram bot started.")
+    except ImportError:
+        print("[BOOT] telegram_bot.py not found — skipping.")
+    except Exception as e:
+        print(f"[BOOT] Telegram bot failed: {e}")
 
+@app.on_event("shutdown")
+async def shutdown_telegram():
+    try:
+        from telegram_bot import stop_bot
+        stop_bot()
+    except ImportError:
+        pass
 # ═══════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════
