@@ -1,15 +1,3 @@
-"""
-AUDITOR Telegram Bot
-────────────────────
-Commands:
-  /start  — welcome message
-  /ping   — check if AUDITOR is online
-  /scrape <url> [js] — scrape a URL and return results in auto-batched messages
-  /help   — show help
-
-Run alongside command_center.py — started automatically as a background thread.
-"""
-
 import asyncio
 import logging
 import os
@@ -20,27 +8,21 @@ import time
 import traceback
 from datetime import datetime, timezone
 
-# ── Token sanitisation (fixes leading spaces, quotes, =) ─────────────────────
+# ── Token sanitisation ───────────────────────────────────
 _raw_token = os.environ.get("TELEGRAM_TOKEN", "").strip()
 _clean_token = _raw_token.lstrip("=").strip().strip("'\"")
 TELEGRAM_TOKEN = None
-
 if re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{30,}", _clean_token):
     TELEGRAM_TOKEN = _clean_token
     print("[TELEGRAM] Valid token loaded ✓")
 else:
-    if _raw_token:
-        print(f"[TELEGRAM] Invalid token after cleaning: '{_clean_token[:20]}...'")
-    else:
-        print("[TELEGRAM] TELEGRAM_TOKEN environment variable not set.")
     raise RuntimeError("Invalid or missing TELEGRAM_TOKEN")
 
 MAX_CHARS = 4096
-
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
-# ── Formatting helpers ───────────────────────────────────────────────────────
+# ── Formatting helpers ──────────────────────────────────
 def _fmt_item(idx: int, item: dict) -> str:
     NAME_FIELDS = ('indicator','title','name','event','headline','product',
                    'label','item','description','exchange','symbol','pair',
@@ -98,7 +80,7 @@ def _build_batches(items: list, url: str) -> list[str]:
         messages.append(current.rstrip())
     return messages
 
-# ── Command handlers (no API keys, no Groq token report) ────────────────────
+# ── Command handlers ─────────────────────────────────────
 async def _handle_start(update, context):
     await update.message.reply_text(
         "👋 *Welcome to AUDITOR Bot*\n\n"
@@ -128,7 +110,6 @@ async def _handle_help(update, context):
     )
 
 async def _handle_ping(update, context):
-    # No API key displayed
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     text = ("✅ *AUDITOR is online*\n"
             f"🕐 `{now}`\n"
@@ -136,7 +117,9 @@ async def _handle_ping(update, context):
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def _handle_scrape(update, context):
-    from command_center import scrape_url, _normalise_url
+    # Import the correct scraping function from command_center
+    from command_center import _scrape_url
+
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -146,31 +129,39 @@ async def _handle_scrape(update, context):
             parse_mode='Markdown'
         )
         return
+
     url = args[0]
     use_js = len(args) > 1 and args[1].lower() == 'js'
+
+    # Normalise URL – add https if missing
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
+
     await update.message.reply_text(
         f"⏳ Scraping `{url}`...\n"
         f"{'🌐 JS rendering ON' if use_js else '⚡ Fast mode (no JS)'}\n"
         "This may take 20–40s — the scraping engine is reading the page.",
         parse_mode='Markdown'
     )
+
     try:
-        result, raw_count = await scrape_url(url, adaptive=True, js=use_js)
-        items = result.get('events') or result.get('flat_data') or []
+        # _scrape_url returns (rows, raw_bytes)
+        items, raw_bytes = await _scrape_url(url, js=use_js)
+
         if not items:
             await update.message.reply_text(
                 f"⚠️ No items extracted from `{url}`\n"
-                f"Raw nodes processed: {raw_count}\n"
+                f"Raw bytes received: {raw_bytes}\n"
                 "Try adding `js` if the page is JavaScript-rendered.",
                 parse_mode='Markdown'
             )
             return
+
         batches = _build_batches(items, url)
         n_msgs = len(batches)
         for msg in batches:
             await update.message.reply_text(msg, parse_mode='Markdown')
+
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         await update.message.reply_text(
             f"✅ *Done*\n"
@@ -179,15 +170,18 @@ async def _handle_scrape(update, context):
             f"🕐 `{now}`",
             parse_mode='Markdown'
         )
-        # No token usage report – removed as requested
+
     except Exception as e:
+        # _scrape_url may raise HTTPException or other errors
         tb = traceback.format_exc()
         print(f"[TELEGRAM] /scrape error:\n{tb}")
         short = str(e)[:300] if str(e) else repr(e)[:300]
-        await update.message.reply_text(f"❌ *Scrape failed*\n`{short}`", parse_mode='Markdown')
+        await update.message.reply_text(
+            f"❌ *Scrape failed*\n`{short}`",
+            parse_mode='Markdown'
+        )
 
 async def _handle_message(update, context):
-    """Reply to any non‑command text message."""
     await update.message.reply_text(
         "💬 I'm an AUDITOR bot. Use `/help` for available commands.",
         parse_mode='Markdown'
@@ -204,7 +198,7 @@ async def _handle_unknown_command(update, context):
         parse_mode='Markdown'
     )
 
-# ── Bot startup with graceful shutdown ───────────────────────────────────────
+# ── Bot startup with graceful shutdown ──────────────────
 _bot_started = False
 _bot_lock = threading.Lock()
 _shutdown_event = threading.Event()
@@ -271,16 +265,3 @@ def start_bot():
 def stop_bot():
     _shutdown_event.set()
     print("[TELEGRAM] Stop signal sent – waiting for bot to exit...")
-
-if __name__ == "__main__":
-    def _handle_signal(sig, frame):
-        print(f"[TELEGRAM] Received signal {sig}, stopping bot...")
-        stop_bot()
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
-    start_bot()
-    try:
-        while not _shutdown_event.is_set():
-            time.sleep(1)
-    except KeyboardInterrupt:
-        stop_bot()
