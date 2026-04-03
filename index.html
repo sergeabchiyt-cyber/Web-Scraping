@@ -332,9 +332,43 @@ function switchTab(tab) {
 }
 
 /* ── TABLE RENDER ────────────────────────────────────────────────────────── */
-function getName(ev) {
-  for (const f of ['indicator','title','name','event','headline','product','label'])
-    if (ev[f]) return String(ev[f]);
+/* ── NAME COLUMN DETECTION ───────────────────────────────────────────────────
+   Universal: works on any extracted dataset without hardcoding site names.
+   Pass 1 — exact known-key match.
+   Pass 2 — score every column by "name-likeness":
+            high uniqueness × longer average text × high non-numeric fraction.
+   This correctly identifies "Release", "Currency", "Exchange", or any unnamed
+   event column on any site whose header doesn't match known keys.
+──────────────────────────────────────────────────────────────────────────── */
+const KNOWN_NAME_KEYS = new Set([
+  'indicator','title','name','event','headline','product','label',
+  'description','event_name','currency','release','report','item',
+  'category','market','instrument','asset','exchange'
+]);
+
+function _detectNameCol(events) {
+  if (!events.length) return null;
+  const allKeys = [...new Set(events.flatMap(e => Object.keys(e)))];
+  // Pass 1: exact known key
+  for (const k of allKeys)
+    if (KNOWN_NAME_KEYS.has(k)) return k;
+  // Pass 2: score columns
+  let best = null, bestScore = 0;
+  for (const k of allKeys) {
+    const vals    = events.map(e => String(e[k] ?? '')).filter(v => v.trim());
+    if (!vals.length) continue;
+    const unique  = new Set(vals).size / vals.length;
+    const avgLen  = vals.reduce((s,v) => s + v.length, 0) / vals.length;
+    const txtFrac = vals.filter(v => isNaN(Number(v)) && v.length > 1).length / vals.length;
+    const score   = unique * Math.min(avgLen, 40) * txtFrac;
+    if (score > bestScore) { bestScore = score; best = k; }
+  }
+  return best;
+}
+
+function getName(ev, nameCol) {
+  if (nameCol && ev[nameCol] != null && ev[nameCol] !== '') return String(ev[nameCol]);
+  for (const f of KNOWN_NAME_KEYS) if (ev[f]) return String(ev[f]);
   return '—';
 }
 
@@ -349,42 +383,54 @@ function renderTable(events) {
     return;
   }
 
-  const nameKeys  = new Set(['indicator','title','name','event','headline','product','label']);
-  const fixedCols = ['country','date','event_date','time','event_time','event_datetime_utc',
-                     'period','actual','value','forecast','consensus','previous','is_past'];
-  const fixedSet  = new Set(fixedCols);
-  const extra     = new Set();
+  const nameCol  = _detectNameCol(events);
+  const nameKeys = new Set([...KNOWN_NAME_KEYS, ...(nameCol ? [nameCol] : [])]);
+
+  // Fixed columns shown in priority order
+  const fixedCols = [
+    'time','event_time','event_datetime_utc',
+    'country',
+    'date','event_date','period',
+    'actual','value',
+    'forecast','consensus','previous',
+    'is_past'
+  ];
+  const fixedSet = new Set(fixedCols);
+
+  const extra = new Set();
   for (const ev of events)
     for (const k of Object.keys(ev))
       if (!nameKeys.has(k)) extra.add(k);
 
-  const used  = fixedCols.filter(c => events.some(e => e[c]!=null && e[c]!==''));
+  const used  = fixedCols.filter(c => events.some(e => e[c] != null && e[c] !== ''));
   const other = [...extra]
-    .filter(c => !fixedSet.has(c) && !nameKeys.has(c) && events.some(e => e[c]!=null && e[c]!==''))
-    .slice(0,4);
-  const cols = [...used,...other];
-  const lbl  = c => c.replace(/_/g,' ').replace(/\b\w/g,x=>x.toUpperCase());
+    .filter(c => !fixedSet.has(c) && events.some(e => e[c] != null && e[c] !== ''))
+    .slice(0, 5);
+  const cols = [...used, ...other];
+  const lbl  = c => c.replace(/_/g,' ').replace(/\b\w/g, x => x.toUpperCase());
 
   function fmtCell(ev, c) {
     const v = ev[c];
-    if (c==='is_past') return v===true
+    if (c === 'is_past') return v === true
       ? `<span class="badge b-past">Past</span>`
       : `<span class="badge b-pend">Pending</span>`;
-    if (v==null||v==='') return `<span class="c-m">—</span>`;
+    if (v == null || v === '') return `<span class="c-m">—</span>`;
     const s = esc(String(v));
     if (c==='actual'||c==='value')       return `<span class="c-g">${s}</span>`;
     if (c==='forecast'||c==='consensus') return `<span class="c-o">${s}</span>`;
     return s;
   }
 
+  const nameHeader = nameCol ? lbl(nameCol) : 'Indicator / Name';
+
   area.innerHTML = `
     <table class="dtable">
       <thead><tr>
-        <th>Indicator / Name</th>
+        <th>${nameHeader}</th>
         ${cols.map(c=>`<th>${lbl(c)}</th>`).join('')}
       </tr></thead>
       <tbody>${events.map(ev=>`<tr>
-        <td class="c-name">${esc(getName(ev))}</td>
+        <td class="c-name">${esc(getName(ev, nameCol))}</td>
         ${cols.map(c=>`<td>${fmtCell(ev,c)}</td>`).join('')}
       </tr>`).join('')}</tbody>
     </table>`;
