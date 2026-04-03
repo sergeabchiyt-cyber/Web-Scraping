@@ -45,7 +45,7 @@ def verify_key(x_api_key: str = Header(..., alias="X-Api-Key")) -> str:
 class ScrapeRequest(BaseModel):
     url: str
     adaptive: bool = True
-    js: bool = False   # Note: StealthyFetcher always used; js flag reserved for future
+    js: bool = False
 
 class ScrapeResponse(BaseModel):
     events: List[Dict[str, Any]]
@@ -66,12 +66,12 @@ def _is_safe_url(url: str) -> bool:
         ip = socket.gethostbyname(hostname)
         ip_int = int.from_bytes(socket.inet_aton(ip), 'big')
         private_blocks = [
-            (0x0A000000, 0xFF000000),  # 10.0.0.0/8
-            (0xAC100000, 0xFFF00000),  # 172.16.0.0/12
-            (0xC0A80000, 0xFFFF0000),  # 192.168.0.0/16
-            (0x7F000000, 0xFF000000),  # 127.0.0.0/8
-            (0xA9FE0000, 0xFFFF0000),  # 169.254.0.0/16
-            (0x00000000, 0xFF000000),  # 0.0.0.0/8
+            (0x0A000000, 0xFF000000),
+            (0xAC100000, 0xFFF00000),
+            (0xC0A80000, 0xFFFF0000),
+            (0x7F000000, 0xFF000000),
+            (0xA9FE0000, 0xFFFF0000),
+            (0x00000000, 0xFF000000),
         ]
         return not any((ip_int & mask) == (net & mask) for net, mask in private_blocks)
     except Exception:
@@ -81,41 +81,31 @@ def _is_safe_url(url: str) -> bool:
 # CLEANING & NORMALIZATION (UTF‑8 safe, preserves currency)
 # ─────────────────────────────────────────────────────────────
 def _normalize_text(text: str) -> str:
-    """NFKC normalization + remove zero‑width chars, keep $€£¥ etc."""
     if not text:
         return ""
-    # Normalize to NFKC (compatible decomposition)
     text = unicodedata.normalize('NFKC', text)
-    # Remove zero‑width characters and other non‑printable control chars
     text = re.sub(r'[\u200b\u200c\u200d\u2060\uFEFF]', '', text)
-    # Remove other control characters except tab/newline
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
     return text.strip()
 
 # ─────────────────────────────────────────────────────────────
 # CSS PSEUDO‑ELEMENT RESOLVER (tinycss2)
 # ─────────────────────────────────────────────────────────────
-def _extract_css_rules(style_text: str) -> Dict[str, Dict[str, str]]:
-    """Parse CSS and return a dict mapping (selector, pseudo) -> content."""
+def _extract_css_rules(style_text: str) -> Dict[str, str]:
     rules = {}
     stylesheet = tinycss2.parse_stylesheet(style_text)
     for rule in stylesheet:
         if rule.type != 'qualified-rule':
             continue
-        # Extract selector list
         prelude = tinycss2.serialize(rule.prelude).strip()
-        # Find pseudo‑elements
         pseudo_match = re.search(r'::?(before|after)$', prelude)
         if not pseudo_match:
             continue
         pseudo = pseudo_match.group(1)
-        # Clean selector (remove pseudo part)
         selector = re.sub(r'::?(before|after)$', '', prelude).strip()
-        # Extract content property
         content_value = None
         for token in rule.content:
             if token.type == 'literal' and token.value == 'content':
-                # find next string token
                 for i, t in enumerate(rule.content):
                     if t.type == 'string' and i > rule.content.index(token):
                         content_value = t.value
@@ -126,7 +116,6 @@ def _extract_css_rules(style_text: str) -> Dict[str, Dict[str, str]]:
     return rules
 
 def _apply_pseudo_elements(soup: BeautifulSoup) -> None:
-    """Inject ::before/::after content into DOM using tinycss2."""
     style_text = ''
     for style_tag in soup.find_all('style'):
         if style_tag.string:
@@ -146,14 +135,12 @@ def _apply_pseudo_elements(soup: BeautifulSoup) -> None:
                 el.append(new_node)
 
 # ─────────────────────────────────────────────────────────────
-# TEXT EXTRACTION (handles inline, SVG, hidden classes)
+# TEXT EXTRACTION
 # ─────────────────────────────────────────────────────────────
 def _get_element_text(element) -> str:
-    """Extract visible text with full Unicode support."""
     if not isinstance(element, Tag):
         return _normalize_text(str(element))
 
-    # Skip hidden elements
     hidden_classes = {'visually-hidden', 'tw-sr-only', 'sr-only', 'hidden', 'hide'}
     class_attr = element.get('class', [])
     if isinstance(class_attr, list):
@@ -166,16 +153,12 @@ def _get_element_text(element) -> str:
     if element.name in ('script', 'style', 'noscript', 'template'):
         return ''
 
-    # SVG handling
     if element.name == 'svg':
-        # Extract from <text>, <tspan>, <title>
         text_nodes = element.find_all(['text', 'tspan', 'title'])
         if text_nodes:
-            parts = [_get_element_text(t) for t in text_nodes]
-            return ' '.join(parts).strip()
+            return ' '.join(_get_element_text(t) for t in text_nodes).strip()
         return ''
 
-    # Recursive collection
     text_parts = []
     for child in element.children:
         if isinstance(child, NavigableString):
@@ -187,7 +170,6 @@ def _get_element_text(element) -> str:
             if child_text:
                 text_parts.append(child_text)
 
-    # Inline elements join without spaces (price components)
     inline_tags = {'span', 'a', 'b', 'i', 'strong', 'em', 'small', 'u',
                    'sub', 'sup', 'label', 'button', 'text', 'tspan'}
     if element.name in inline_tags:
@@ -195,7 +177,7 @@ def _get_element_text(element) -> str:
     return ' '.join(text_parts).strip()
 
 # ─────────────────────────────────────────────────────────────
-# STANDARD TABLE EXTRACTION (with lxml)
+# STANDARD TABLE EXTRACTION
 # ─────────────────────────────────────────────────────────────
 def _extract_standard_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     results = []
@@ -231,14 +213,13 @@ def _extract_standard_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     return results
 
 # ─────────────────────────────────────────────────────────────
-# ARIA GRID EXTRACTION (coordinate‑based mapping)
+# ARIA GRID EXTRACTION (coordinate‑based)
 # ─────────────────────────────────────────────────────────────
 def _extract_aria_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     results = []
     tables = soup.find_all(attrs={"role": ["table", "grid"]})
     for table in tables:
-        # Build column headers by scanning all rows for role="columnheader"
-        header_map = {}  # column index -> header text
+        header_map = {}
         rows = table.find_all(attrs={"role": "row"})
         for row in rows:
             cells = row.find_all(attrs={"role": ["columnheader", "cell"]})
@@ -247,24 +228,20 @@ def _extract_aria_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
                     text = _get_element_text(cell)
                     if text and idx not in header_map:
                         header_map[idx] = text
-        # If no columnheader found, fallback to first row's cells
         if not header_map and rows:
             first_cells = rows[0].find_all(attrs={"role": "cell"})
             for idx, cell in enumerate(first_cells):
                 text = _get_element_text(cell)
                 if text:
                     header_map[idx] = text
-        # If still nothing, generate generic Column_N
         if not header_map:
             max_cols = max((len(row.find_all(attrs={"role": "cell"})) for row in rows), default=0)
             header_map = {i: f"Column_{i+1}" for i in range(max_cols)}
 
-        # Extract data rows (skip rows that are pure headers)
         for row in rows:
             cells = row.find_all(attrs={"role": "cell"})
             if not cells:
                 continue
-            # Check if this row only contains columnheaders (skip)
             if all(c.get('role') == 'columnheader' for c in cells):
                 continue
             record = {}
@@ -278,20 +255,14 @@ def _extract_aria_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     return results
 
 # ─────────────────────────────────────────────────────────────
-# JSON‑LD HONEYPOT DETECTION
+# JSON‑LD HONEYPOT DETECTION (stub)
 # ─────────────────────────────────────────────────────────────
 def _check_json_ld(soup: BeautifulSoup, extracted_data: List[Dict]) -> List[Dict]:
-    """Flag if JSON‑LD conflicts with extracted DOM data."""
-    json_ld_scripts = soup.find_all('script', type='application/ld+json')
-    if not json_ld_scripts:
-        return extracted_data
-    # Simple heuristic: if any extracted product name matches a JSON‑LD product name,
-    # but price differs, mark as honeypot (add a flag). For brevity, we'll just add a warning.
-    # This can be extended.
-    return extracted_data  # In production, you'd cross‑reference.
+    # In production, implement cross‑reference. For now, return as is.
+    return extracted_data
 
 # ─────────────────────────────────────────────────────────────
-# HEURISTIC FALLBACK (for CSS pseudo‑element pages)
+# HEURISTIC FALLBACK
 # ─────────────────────────────────────────────────────────────
 def _extract_heuristic_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     results = []
@@ -311,37 +282,23 @@ def _extract_heuristic_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     return results
 
 # ─────────────────────────────────────────────────────────────
-# MAIN EXTRACTION DISPATCHER (lxml, pseudo‑elements, coordinate mapping)
+# MAIN EXTRACTION DISPATCHER
 # ─────────────────────────────────────────────────────────────
 def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
-    # Use lxml parser for tag‑soup repair
     soup = BeautifulSoup(content, 'lxml')
-
-    # 1. Inject CSS pseudo‑element content
     _apply_pseudo_elements(soup)
-
-    # 2. Remove noise
     for tag in soup(['script', 'style', 'noscript', 'template']):
         tag.decompose()
 
-    # 3. Extract tables
     results = _extract_standard_tables(soup)
-    # Filter out malformed rows (single very long header)
     results = [r for r in results if len(r) > 1 or (len(r) == 1 and not list(r.keys())[0].startswith("Col_"))]
-
-    aria_results = _extract_aria_tables(soup)
-    results.extend(aria_results)
-
-    heuristic_results = _extract_heuristic_tables(soup)
-    results.extend(heuristic_results)
-
-    # 4. JSON‑LD honeypot check
+    results.extend(_extract_aria_tables(soup))
+    results.extend(_extract_heuristic_tables(soup))
     results = _check_json_ld(soup, results)
-
     return results
 
 # ─────────────────────────────────────────────────────────────
-# FETCHER (ALWAYS STEALTHY – fingerprint rotation)
+# FETCHER (ALWAYS STEALTHY – FIXED)
 # ─────────────────────────────────────────────────────────────
 _stealth_session = None
 
@@ -362,13 +319,10 @@ def _get_stealth_session():
     return _stealth_session
 
 def _fetch_url(url: str, js: bool = False):
-    """Always use StealthyFetcher; js flag controls headless."""
+    """Always use StealthyFetcher.fetch(); js flag controls headless."""
     fetcher = _get_stealth_session()
     try:
-        if js:
-            response = fetcher.fetch(url, headless=True)
-        else:
-            response = fetcher.get(url, headless=False)
+        response = fetcher.fetch(url, headless=js)
     except Exception as e:
         raise RuntimeError(f"StealthyFetcher failed: {e}")
     if response is None or (hasattr(response, 'status_code') and response.status_code >= 400):
@@ -376,23 +330,22 @@ def _fetch_url(url: str, js: bool = False):
     return response
 
 # ─────────────────────────────────────────────────────────────
-# CORE SCRAPE LOGIC (exposed for Telegram bot)
+# CORE SCRAPE LOGIC
 # ─────────────────────────────────────────────────────────────
 async def _scrape_url(url: str, js: bool = False) -> Tuple[List[Dict[str, Any]], int]:
     if not _is_safe_url(url):
-        raise HTTPException(status_code=403, detail="FORBIDDEN_DOMAIN — private IP blocked.")
+        raise HTTPException(status_code=403, detail="FORBIDDEN_DOMAIN")
     loop = asyncio.get_running_loop()
     try:
         response = await loop.run_in_executor(None, _fetch_url, url, js)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    # Extract raw bytes (StealthyFetcher returns an Adaptor with .content)
     raw = getattr(response, 'content', None)
     if not raw:
         raw = getattr(response, 'html', '').encode('utf-8')
     if not raw:
-        raise HTTPException(status_code=502, detail="Empty response from fetcher")
+        raise HTTPException(status_code=502, detail="Empty response")
     raw_bytes = len(raw)
     print(f"[SCRAPE] {url} → {raw_bytes} bytes fetched (js={js})")
 
