@@ -1,239 +1,286 @@
+"""
+AUDITOR Telegram Bot
+────────────────────
+Commands:
+  /start  — welcome message
+  /ping   — check if AUDITOR is online
+  /scrape <url> [js] — scrape a URL and return results in auto-batched messages
+  /help   — show help
+
+Run alongside command_center.py — started automatically as a background thread.
+"""
+
 import asyncio
 import logging
 import os
 import re
 import signal
-from contextlib import asynccontextmanager
+import threading
+import time
+import traceback
 from datetime import datetime, timezone
 
-from telegram import Update
-from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, MessageHandler,
-    filters, CallbackContext
-)
-
-# ──────────────────────────────────────────────
-# Configuration
-# ──────────────────────────────────────────────
-logger = logging.getLogger("telegram_bot")
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-MAX_CHARS = 4096
-
-# ──────────────────────────────────────────────
-# Token sanitising
-# ──────────────────────────────────────────────
+# ── Token sanitisation (fixes leading spaces, quotes, =) ─────────────────────
 _raw_token = os.environ.get("TELEGRAM_TOKEN", "").strip()
 _clean_token = _raw_token.lstrip("=").strip().strip("'\"")
 TELEGRAM_TOKEN = None
 
 if re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{30,}", _clean_token):
     TELEGRAM_TOKEN = _clean_token
-    logger.info("[TELEGRAM] Valid token loaded ✓")
+    print("[TELEGRAM] Valid token loaded ✓")
 else:
     if _raw_token:
-        logger.error(
-            "[TELEGRAM] Invalid token after cleaning: '%s'. "
-            "Fix your TELEGRAM_TOKEN environment variable.",
-            _clean_token[:20]
-        )
+        print(f"[TELEGRAM] Invalid token after cleaning: '{_clean_token[:20]}...'")
     else:
-        logger.warning("[TELEGRAM] TELEGRAM_TOKEN not set.")
+        print("[TELEGRAM] TELEGRAM_TOKEN environment variable not set.")
+    raise RuntimeError("Invalid or missing TELEGRAM_TOKEN")
 
-# ──────────────────────────────────────────────
-# Markdown helpers (same as your original)
-# ──────────────────────────────────────────────
-def _escape_md(text: str) -> str:
-    return (str(text)
-            .replace("\\", "\\\\")
-            .replace("`", "'")
-            .replace("*", "\\*")
-            .replace("_", "\\_"))
+MAX_CHARS = 4096
 
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
+# ── Formatting helpers ───────────────────────────────────────────────────────
 def _fmt_item(idx: int, item: dict) -> str:
-    lines = [f"*{idx}. {_escape_md(item.get('name', 'Item'))}*"]
+    NAME_FIELDS = ('indicator','title','name','event','headline','product',
+                   'label','item','description','exchange','symbol','pair',
+                   'asset','coin','company','ticker','token','market')
+    name = None
+    name_key = None
+    for f in NAME_FIELDS:
+        if item.get(f):
+            name = str(item[f]).strip()
+            name_key = f
+            break
+    if not name:
+        for k, v in item.items():
+            if isinstance(v, str) and len(v.strip()) >= 2:
+                name = v.strip()
+                name_key = k
+                break
+    if not name:
+        name = f"Item {idx}"
+    lines = [f"*{idx}. {name}*"]
+    SKIP = {'is_past'}
+    if name_key:
+        SKIP.add(name_key)
     for k, v in item.items():
-        if k == "name":
+        if k in SKIP or v is None or str(v).strip() == '':
             continue
-        lines.append(f" {k.replace('_', ' ').title()}: {_escape_md(str(v))}")
-    return "\n".join(lines)
+        label = k.replace('_', ' ').title()
+        lines.append(f"  {label}: {v}")
+    return '\n'.join(lines)
 
 def _build_batches(items: list, url: str) -> list[str]:
     messages = []
+    total = len(items)
+    current = ""
     batch_num = 1
-    def header(item_idx: int) -> str:
-        return (f"📊 *AUDITOR* — `{url[:30]}...`\n"
-                f"Msg {batch_num} · #{item_idx} · {len(items)} total\n"
-                f"{'─' * 20}\n")
-    current = header(1)
+    first_idx = 1
+    def make_header(start_idx: int) -> str:
+        short_url = url[:55] + '…' if len(url) > 55 else url
+        return (f"📊 *AUDITOR* — `{short_url}`\n"
+                f"Msg {batch_num} · items from #{start_idx} · {total} total\n"
+                f"{'─' * 28}\n")
+    current = make_header(1)
     for i, item in enumerate(items, start=1):
-        block = _fmt_item(i, item) + "\n\n"
+        block = _fmt_item(i, item) + '\n\n'
+        if len(block) > MAX_CHARS - 100:
+            block = block[:MAX_CHARS - 103] + '…\n\n'
         if len(current) + len(block) > MAX_CHARS:
             messages.append(current.rstrip())
             batch_num += 1
-            current = header(i) + block
+            first_idx = i
+            current = make_header(i) + block
         else:
             current += block
     if current.strip():
         messages.append(current.rstrip())
     return messages
 
-# ──────────────────────────────────────────────
-# Command handlers (same as your original)
-# ──────────────────────────────────────────────
-async def _handle_start(update: Update, context: CallbackContext):
-    logger.info(f"/start from {update.effective_user.id}")
+# ── Command handlers (no API keys, no Groq token report) ────────────────────
+async def _handle_start(update, context):
     await update.message.reply_text(
         "👋 *Welcome to AUDITOR Bot*\n\n"
         "Available commands:\n"
+        "• `/start` — Show this welcome message\n"
+        "• `/help` — Show detailed help\n"
         "• `/ping` — Check if bot is online\n"
-        "• `/scrape <url> [js]` — Scrape a URL\n"
-        "• `/help` — Show this message",
-        parse_mode="Markdown"
+        "• `/scrape <url> [js]` — Scrape a webpage\n\n"
+        "Example: `/scrape https://example.com`\n"
+        "Add `js` at the end for JavaScript‑rendered pages.",
+        parse_mode='Markdown'
     )
 
-async def _handle_help(update: Update, context: CallbackContext):
-    logger.info(f"/help from {update.effective_user.id}")
+async def _handle_help(update, context):
     await update.message.reply_text(
         "📚 *AUDITOR Bot Help*\n\n"
         "*Commands:*\n"
-        "• `/ping` — Verify bot is responding\n"
-        "• `/scrape <url> [js]` — Scrape content\n"
-        "  - `url`: Target URL to scrape\n"
-        "  - `js` (optional): Enable JavaScript rendering\n"
         "• `/start` — Show welcome message\n"
-        "• `/help` — Show this message",
-        parse_mode="Markdown"
+        "• `/help` — Show this help\n"
+        "• `/ping` — Check if bot is online\n"
+        "• `/scrape <url> [js]` — Scrape a webpage\n\n"
+        "*Scrape usage:*\n"
+        "`/scrape https://tradingeconomics.com/calendar`\n"
+        "`/scrape https://coinglass.com/open-interest/BTC js`\n\n"
+        "The bot extracts all tables from the page and sends them in batched messages.",
+        parse_mode='Markdown'
     )
 
-async def _handle_ping(update: Update, context: CallbackContext):
-    logger.info(f"/ping from {update.effective_user.id}")
+async def _handle_ping(update, context):
+    # No API key displayed
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    await update.message.reply_text(
-        f"✅ *AUDITOR Online*\n🕐 `{now}`",
-        parse_mode="Markdown"
-    )
+    text = ("✅ *AUDITOR is online*\n"
+            f"🕐 `{now}`\n"
+            "🤖 Scraping engine ready")
+    await update.message.reply_text(text, parse_mode='Markdown')
 
-async def _handle_scrape(update: Update, context: CallbackContext):
-    """Your actual scraping logic goes here – this is a placeholder."""
+async def _handle_scrape(update, context):
+    from command_center import scrape_url, _normalise_url
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "❌ Usage: `/scrape <url> [js]`\n"
+            "Example: `/scrape https://tradingeconomics.com/united-states/calendar`\n"
+            "Add `js` at the end for JS-rendered pages.",
+            parse_mode='Markdown'
+        )
+        return
+    url = args[0]
+    use_js = len(args) > 1 and args[1].lower() == 'js'
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    await update.message.reply_text(
+        f"⏳ Scraping `{url}`...\n"
+        f"{'🌐 JS rendering ON' if use_js else '⚡ Fast mode (no JS)'}\n"
+        "This may take 20–40s — the scraping engine is reading the page.",
+        parse_mode='Markdown'
+    )
     try:
-        logger.info(f"/scrape from {update.effective_user.id} args={context.args}")
-        if not context.args:
+        result, raw_count = await scrape_url(url, adaptive=True, js=use_js)
+        items = result.get('events') or result.get('flat_data') or []
+        if not items:
             await update.message.reply_text(
-                "❌ Usage: `/scrape <url> [js]`", parse_mode="Markdown"
+                f"⚠️ No items extracted from `{url}`\n"
+                f"Raw nodes processed: {raw_count}\n"
+                "Try adding `js` if the page is JavaScript-rendered.",
+                parse_mode='Markdown'
             )
             return
-        url = context.args[0]
-        js_mode = len(context.args) > 1 and context.args[1].lower() == "js"
-
-        main_msg = await update.message.reply_text(
-            f"⏳ Scraping `{url}`... (JS={'enabled' if js_mode else 'disabled'})",
-            parse_mode="Markdown"
+        batches = _build_batches(items, url)
+        n_msgs = len(batches)
+        for msg in batches:
+            await update.message.reply_text(msg, parse_mode='Markdown')
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        await update.message.reply_text(
+            f"✅ *Done*\n"
+            f"📊 {len(items)} items extracted\n"
+            f"📨 {n_msgs} message(s) sent\n"
+            f"🕐 `{now}`",
+            parse_mode='Markdown'
         )
-
-        # --------------------------------------------------
-        # 🔁 REPLACE THIS BLOCK WITH YOUR REAL SCRAPER
-        # Example: items = await your_scraper_function(url, js=js_mode)
-        # --------------------------------------------------
-        items = []   # <-- replace with actual scraped data
-        # --------------------------------------------------
-
-        if not items:
-            await main_msg.edit_text(f"⚠️ No data found at `{url}`", parse_mode="Markdown")
-            return
-
-        batch_messages = _build_batches(items, url)
-        for batch in batch_messages:
-            await update.message.reply_text(batch, parse_mode="Markdown")
-        await main_msg.edit_text(f"✅ Sent {len(batch_messages)} message(s).", parse_mode="Markdown")
-
+        # No token usage report – removed as requested
     except Exception as e:
-        logger.exception("Scrape handler failed")
-        await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
+        tb = traceback.format_exc()
+        print(f"[TELEGRAM] /scrape error:\n{tb}")
+        short = str(e)[:300] if str(e) else repr(e)[:300]
+        await update.message.reply_text(f"❌ *Scrape failed*\n`{short}`", parse_mode='Markdown')
 
-async def _handle_message(update: Update, context: CallbackContext):
-    logger.info(f"Message from {update.effective_user.id}: {update.message.text[:50]}")
+async def _handle_message(update, context):
+    """Reply to any non‑command text message."""
     await update.message.reply_text(
         "💬 I'm an AUDITOR bot. Use `/help` for available commands.",
-        parse_mode="Markdown"
+        parse_mode='Markdown'
     )
 
-async def _handle_error(update: Update, context: CallbackContext):
-    logger.error(f"Update {update} caused error {context.error}")
-    if update and update.message:
-        await update.message.reply_text("❌ An error occurred. Please try again later.")
+async def _handle_unknown_command(update, context):
+    await update.message.reply_text(
+        "❓ Unknown command.\n"
+        "Available commands:\n"
+        "  /start — welcome\n"
+        "  /ping — check status\n"
+        "  /scrape <url> [js] — scrape a URL\n"
+        "  /help — show help",
+        parse_mode='Markdown'
+    )
 
-# ──────────────────────────────────────────────
-# Bot runner (single event loop, handles signals)
-# ──────────────────────────────────────────────
-_shutdown_event = asyncio.Event()
+# ── Bot startup with graceful shutdown ───────────────────────────────────────
+_bot_started = False
+_bot_lock = threading.Lock()
+_shutdown_event = threading.Event()
 
-async def run_bot():
-    """Main bot coroutine – starts polling and waits for shutdown signal."""
-    if not TELEGRAM_TOKEN:
-        logger.error("No valid token – bot will not start.")
+def start_bot():
+    global _bot_started
+    with _bot_lock:
+        if _bot_started:
+            print("[TELEGRAM] Bot already running — skipping duplicate start.")
+            return
+        _bot_started = True
+
+    try:
+        from telegram.ext import (
+            ApplicationBuilder, CommandHandler, MessageHandler, filters
+        )
+    except ImportError:
+        print("[TELEGRAM] python-telegram-bot not installed.")
+        print("[TELEGRAM] Run: pip install python-telegram-bot")
         return
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", _handle_start))
-    app.add_handler(CommandHandler("help", _handle_help))
-    app.add_handler(CommandHandler("ping", _handle_ping))
-    app.add_handler(CommandHandler("scrape", _handle_scrape))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
-    app.add_error_handler(_handle_error)
+    async def _run():
+        app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+        app.add_handler(CommandHandler("start",  _handle_start))
+        app.add_handler(CommandHandler("help",   _handle_help))
+        app.add_handler(CommandHandler("ping",   _handle_ping))
+        app.add_handler(CommandHandler("scrape", _handle_scrape))
+        app.add_handler(MessageHandler(filters.COMMAND, _handle_unknown_command))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_message))
 
-    # Start polling (drop pending updates to clean stale ones)
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(
-        drop_pending_updates=True,
-        allowed_updates=["message", "callback_query"]
-    )
-    logger.info("✅ Bot polling started")
+        print("[TELEGRAM] Bot starting — listening for commands...")
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=["message"],
+        )
 
-    # Wait for shutdown signal (SIGTERM / SIGINT)
-    await _shutdown_event.wait()
+        # Wait for shutdown signal
+        while not _shutdown_event.is_set():
+            await asyncio.sleep(1)
 
-    # Graceful shutdown
-    logger.info("Stopping bot...")
-    await app.updater.stop()
-    await app.stop()
-    await app.shutdown()
-    logger.info("Bot stopped.")
+        print("[TELEGRAM] Shutdown signal received – stopping bot...")
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        print("[TELEGRAM] Bot stopped.")
 
-def handle_shutdown_signal():
-    """Called when SIGTERM or SIGINT is received."""
-    logger.info("Shutdown signal received – stopping bot...")
+    def _thread():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_run())
+        except Exception as e:
+            print(f"[TELEGRAM] Bot crashed: {e}")
+            traceback.print_exc()
+        finally:
+            loop.close()
+
+    t = threading.Thread(target=_thread, daemon=False, name="telegram-bot")
+    t.start()
+    print("[TELEGRAM] Bot thread started ✓")
+
+def stop_bot():
     _shutdown_event.set()
+    print("[TELEGRAM] Stop signal sent – waiting for bot to exit...")
 
-# ──────────────────────────────────────────────
-# FastAPI lifespan integration (use this in your main app)
-# ──────────────────────────────────────────────
-@asynccontextmanager
-async def telegram_lifespan(app):
-    """Lifespan context manager for FastAPI."""
-    # Startup
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, handle_shutdown_signal)
-    asyncio.create_task(run_bot())
-    yield
-    # Shutdown (triggered by FastAPI when the app stops)
-    handle_shutdown_signal()  # ensures bot stops
-
-# ──────────────────────────────────────────────
-# Standalone execution (for testing)
-# ──────────────────────────────────────────────
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, handle_shutdown_signal)
+    def _handle_signal(sig, frame):
+        print(f"[TELEGRAM] Received signal {sig}, stopping bot...")
+        stop_bot()
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    start_bot()
     try:
-        loop.run_until_complete(run_bot())
+        while not _shutdown_event.is_set():
+            time.sleep(1)
     except KeyboardInterrupt:
-        pass
-    finally:
-        loop.close()
+        stop_bot()
