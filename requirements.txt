@@ -5,4 +5,5 @@ pydantic
 python-telegram-bot
 httpx
 beautifulsoup4
-lxml             
+lxml
+tinycss2
