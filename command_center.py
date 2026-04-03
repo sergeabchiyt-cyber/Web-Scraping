@@ -244,9 +244,11 @@ def _el_text(el) -> str:
     if el.name in ('script', 'style', 'noscript', 'template'):
         return ''
 
-    # SVG: reconstruct from text/tspan/title nodes
+    # SVG: reconstruct from <text>/<tspan> only.
+    # Skip <title> — SVG titles are icon descriptions ("sort", "info-circle")
+    # which poison header row scoring and cause data rows to be chosen as headers.
     if el.name == 'svg':
-        parts = [_el_text(n) for n in el.find_all(['text', 'tspan', 'title'])]
+        parts = [_el_text(n) for n in el.find_all(['text', 'tspan'])]
         return _normalize(' '.join(p for p in parts if p))
 
     parts = []
@@ -267,30 +269,72 @@ def _sanitize_key(text: str) -> str:
     return re.sub(r'_+', '_', clean).strip('_').lower()[:64]
 
 def _cell_label(cell, index: int) -> str:
-    # 1. Visible text
-    key = _sanitize_key(_el_text(cell))
-    if key:
-        return key
-    # 2. aria-label
+    """
+    Universal header label for a single <th>/<td> cell.
+
+    Priority order:
+      1. aria-label directly on the cell  ← CoinGlass puts label here on TH
+      2. title directly on the cell
+      3. data-* attribute directly on the cell
+      4. Visible non-SVG text (avoids icon-label pollution from SVG <title>)
+      5. aria-label / title on any descendant  ← some sites wrap in <div aria-label>
+      6. Full visible text including SVG <text>/<tspan>
+      7. Positional fallback col_N
+    """
+    # 1. aria-label on the cell itself (most reliable for icon-heavy tables)
     key = _sanitize_key(cell.get('aria-label', ''))
     if key:
         return key
-    # 3. title
+
+    # 2. title on the cell itself
     key = _sanitize_key(cell.get('title', ''))
     if key:
         return key
-    # 4. data-* attributes
+
+    # 3. data-* on the cell itself (data-column, data-key, data-field, etc.)
     for attr, val in cell.attrs.items():
         if attr.startswith('data-') and isinstance(val, str):
             key = _sanitize_key(val)
             if key:
                 return key
-    # 5. nested element text (icon + hidden-span pattern)
+
+    # 4. Visible non-SVG text — skip SVG children entirely here so icon labels
+    #    like "sort" don't appear as header names
+    text_parts = []
+    for child in cell.children:
+        if isinstance(child, NavigableString):
+            t = _normalize(str(child))
+            if t:
+                text_parts.append(t)
+        elif isinstance(child, Tag) and child.name != 'svg':
+            t = _el_text(child)
+            if t:
+                text_parts.append(t)
+    key = _sanitize_key(' '.join(text_parts))
+    if key:
+        return key
+
+    # 5. aria-label / title on any descendant element
     for child in cell.descendants:
-        if isinstance(child, Tag):
-            key = _sanitize_key(_el_text(child))
-            if key:
-                return key
+        if not isinstance(child, Tag):
+            continue
+        key = _sanitize_key(child.get('aria-label', ''))
+        if key:
+            return key
+        key = _sanitize_key(child.get('title', ''))
+        if key:
+            return key
+        for attr, val in child.attrs.items():
+            if attr.startswith('data-') and isinstance(val, str):
+                key = _sanitize_key(val)
+                if key:
+                    return key
+
+    # 6. Full text including SVG <text>/<tspan>
+    key = _sanitize_key(_el_text(cell))
+    if key:
+        return key
+
     return f"col_{index}"
 
 # ═══════════════════════════════════════════════════════════
@@ -305,11 +349,16 @@ def _find_headers(table) -> Tuple[List[str], List]:
         cells = row.find_all(['th', 'td'])
         if not cells:
             return -1, cells
-        labels = [_cell_label(c, i) for i, c in enumerate(cells)]
-        named  = sum(1 for l in labels if not l.startswith('col_'))
-        return named, cells
+        labels   = [_cell_label(c, i) for i, c in enumerate(cells)]
+        named    = sum(1 for l in labels if not l.startswith('col_'))
+        th_count = len(row.find_all('th'))
+        # Heavy bonus for structural <th> elements — prevents a data row with
+        # numeric values (e.g. CoinGlass "All" summary row) from outscoring
+        # an icon-based header row that has aria-labels but no visible text.
+        th_bonus = th_count * 5
+        return named + th_bonus, cells
 
-    # Try <thead> first
+    # Try <thead> first — always preferred over body rows
     thead = table.find('thead')
     if thead:
         thead_rows = thead.find_all('tr')
@@ -326,7 +375,7 @@ def _find_headers(table) -> Tuple[List[str], List]:
             ]
             return headers, data_rows
 
-    # No thead: score all candidate rows
+    # No thead: score all rows, strongly prefer rows with <th> elements
     th_rows    = [r for r in all_rows if r.find('th')]
     candidates = th_rows if th_rows else all_rows
     best_score, best_idx, best_cells = -1, 0, None
@@ -392,7 +441,109 @@ def _rows_to_records(headers: List[str], data_rows: List) -> List[Dict[str, Any]
     return records
 
 # ═══════════════════════════════════════════════════════════
-# ARIA GRID EXTRACTION — coordinate-based column mapping
+# DIV-ROW EXTRACTOR
+# Covers pages that use <div> lists instead of <table> tags.
+# Examples: TradingEconomics /calendar/country, many SPA dashboards.
+#
+# Strategy:
+#   1. Find containers whose direct children share a dominant tag/class
+#      (classic repeated-row pattern).
+#   2. Treat the first child as the header template if it looks like one
+#      (aria-label on children, or distinct text from rest of siblings).
+#   3. Extract remaining children as data rows using positional alignment.
+# ═══════════════════════════════════════════════════════════
+def _extract_div_rows(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+
+    # --- Pass A: explicit ARIA list/row pattern without role=table ---
+    # Some sites use role=list + role=listitem or role=row without a parent role=table
+    list_containers = soup.find_all(attrs={"role": lambda r: r in ("list", "listbox", "feed")})
+    for container in list_containers:
+        items = container.find_all(attrs={"role": lambda r: r in ("listitem", "option", "article")}, recursive=False)
+        if len(items) < 2:
+            continue
+        # Leaf-cell extraction: each item's direct children become key-value pairs
+        for item in items:
+            cells = item.find_all(recursive=False)
+            record = {}
+            for idx, cell in enumerate(cells):
+                label = (_sanitize_key(cell.get('aria-label', '')) or
+                         _sanitize_key(cell.get('data-label', '')) or
+                         _sanitize_key(cell.get('title', '')) or
+                         f"col_{idx}")
+                val = _el_text(cell)
+                if val:
+                    record[label] = val
+            if len(record) > 1:
+                results.append(record)
+
+    # --- Pass B: repeated-div-row heuristic ---
+    # Find any <div> that has ≥5 direct children all sharing the same tag.
+    # The first child whose text content differs significantly from siblings
+    # is treated as a header; remaining as data.
+    checked: set = set()
+    for container in soup.find_all('div'):
+        if id(container) in checked:
+            continue
+        children = [c for c in container.children if isinstance(c, Tag)]
+        if len(children) < 5:
+            continue
+        # All children must share the same tag name
+        tags = {c.name for c in children}
+        if len(tags) != 1:
+            continue
+        tag = tags.pop()
+        if tag in ('script', 'style', 'img', 'br', 'hr'):
+            continue
+        checked.add(id(container))
+
+        # Get leaf cell counts per child — skip if inconsistent
+        leaf_counts = [len(c.find_all(recursive=False)) for c in children]
+        if not leaf_counts or max(leaf_counts) == 0:
+            continue
+        dominant = max(set(leaf_counts), key=leaf_counts.count)
+        consistent = [c for c, lc in zip(children, leaf_counts) if lc == dominant]
+        if len(consistent) < 4:
+            continue
+
+        # Check if first row looks like a header (aria-labels or distinct content)
+        first   = consistent[0]
+        rest    = consistent[1:]
+        f_cells = first.find_all(recursive=False)
+
+        # Build header labels from first row
+        headers: List[str] = []
+        for idx, cell in enumerate(f_cells):
+            lbl = (_sanitize_key(cell.get('aria-label','')) or
+                   _sanitize_key(cell.get('data-label','')) or
+                   _sanitize_key(cell.get('title','')) or
+                   _sanitize_key(_el_text(cell)) or
+                   f"col_{idx}")
+            headers.append(lbl)
+
+        if not any(h for h in headers if not h.startswith('col_')):
+            continue  # All positional — not a table
+
+        # Determine if first row IS a header (all unique labels, none look like data)
+        first_vals = [_el_text(c) for c in f_cells]
+        # If first row looks like actual data (numbers/symbols dominate), skip header
+        numeric_frac = sum(1 for v in first_vals if v and not v.replace('.','').replace('%','').replace('+','').replace('-','').replace('$','').replace(',','').isdigit() == False) / max(len(first_vals), 1)
+        if numeric_frac < 0.4:
+            # First row is data — use positional headers, include it in data
+            headers = [f"col_{i}" for i in range(dominant)]
+            rest    = consistent
+
+        for row in rest:
+            cells  = row.find_all(recursive=False)
+            record = {}
+            for idx, cell in enumerate(cells[:len(headers)]):
+                val = _el_text(cell)
+                if val:
+                    record[headers[idx]] = val
+            if len(record) > 1:
+                results.append(record)
+
+    return results
 # Sibling proximity breaks on async-rendered grids; index mapping is robust.
 # ═══════════════════════════════════════════════════════════
 def _extract_aria_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
@@ -475,13 +626,23 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
 
     # ── ARIA grid extraction (covers React/Vue virtualised tables) ──
     aria_results = _extract_aria_tables(soup)
-    # Deduplicate against already-extracted standard table rows
     seen = {str(sorted(r.items())) for r in results}
     for r in aria_results:
         key = str(sorted(r.items()))
         if key not in seen:
             results.append(r)
             seen.add(key)
+
+    # ── Div-row fallback — fires when no <table> produced results ──
+    # TradingEconomics /calendar/country and many SPAs use div layouts.
+    if not results:
+        div_results = _extract_div_rows(soup)
+        seen = {str(sorted(r.items())) for r in results}
+        for r in div_results:
+            key = str(sorted(r.items()))
+            if key not in seen:
+                results.append(r)
+                seen.add(key)
 
     return results
 
