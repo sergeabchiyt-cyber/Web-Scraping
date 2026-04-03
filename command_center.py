@@ -92,10 +92,10 @@ def _is_safe_url(url: str) -> bool:
         return False
 
 def _clean_header(text: str) -> str:
-    """Convert raw header text to a clean, readable key."""
+    """Clean raw header text to a readable key."""
     if not text:
         return None
-    # Remove extra whitespace and special characters
+    # Remove special characters, collapse spaces
     cleaned = re.sub(r'[^\w\s]', ' ', text)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     # Capitalise each word
@@ -124,72 +124,76 @@ def _get_raw_bytes(response) -> bytes:
     raise ValueError("No usable content found in Scrapling response")
 
 # ═══════════════════════════════════════════════════════════
-# UNIVERSAL TABLE EXTRACTION (handles colspan, rowspan, any site)
+# UNIVERSAL TABLE EXTRACTION (improved)
 # ═══════════════════════════════════════════════════════════
 
 def _get_cell_text(cell: Tag) -> str:
-    """Extract visible text from a cell, ignoring scripts/styles."""
+    """Extract visible text, ignoring scripts/styles."""
     for unwanted in cell(['script', 'style']):
         unwanted.decompose()
     return cell.get_text(separator=' ', strip=True)
 
 def _extract_header_from_cell(cell: Tag, index: int) -> str:
-    """
-    Get a meaningful header name from a <th> or <td> cell.
-    Priority: aria-label > title > visible text > data-* > position.
-    """
-    # 1. aria-label
+    """Try to get a meaningful header name from any cell."""
+    # aria-label
     aria = cell.get('aria-label', '').strip()
     if aria:
         cleaned = _clean_header(aria)
         if cleaned:
             return cleaned
-    # 2. title attribute
+    # title attribute
     title = cell.get('title', '').strip()
     if title:
         cleaned = _clean_header(title)
         if cleaned:
             return cleaned
-    # 3. Visible text
+    # visible text
     text = _get_cell_text(cell)
     if text:
         cleaned = _clean_header(text)
         if cleaned:
             return cleaned
-    # 4. Any data-* attribute
+    # any data-* attribute
     for attr, val in cell.attrs.items():
         if attr.startswith('data-') and isinstance(val, str) and val.strip():
             cleaned = _clean_header(val)
             if cleaned:
                 return cleaned
-    # 5. Fallback: position
-    return f"Column_{index+1}"
+    # fallback
+    return None
 
 def _parse_table_headers(table: Tag) -> List[str]:
     """
-    Extract column headers from a table, respecting colspan/rowspan.
+    Extract column headers from a table, handling colspan/rowspan.
     Returns a list of header strings (one per visible column).
     """
-    # First, try to find all header cells in thead or first rows
+    # Find all rows that could be header rows
     header_rows = []
     thead = table.find('thead')
     if thead:
         header_rows = thead.find_all('tr')
     else:
-        # No thead: take first row that contains <th> or looks like header
+        # No thead: look for a row that contains <th> or typical header words
         for row in table.find_all('tr'):
-            if row.find('th') or (len(row.find_all('td')) > 1 and row.find('td').get('class', []) == ['header']):
+            # If any cell is <th>, treat as header
+            if row.find('th'):
                 header_rows = [row]
                 break
+            # Or if the row has many cells and they look like headers (e.g., contain "Exchange", "Date", etc.)
+            cells = row.find_all('td')
+            if cells and len(cells) >= 2:
+                text_sample = ' '.join(_get_cell_text(c) for c in cells[:3]).lower()
+                if any(word in text_sample for word in ['exchange', 'open interest', 'btc', 'usd', 'date', 'time', 'event', 'actual', 'previous', 'forecast']):
+                    header_rows = [row]
+                    break
+        # If still nothing, use first row as header
         if not header_rows and table.find_all('tr'):
-            # Fallback: first row as header
             header_rows = [table.find_all('tr')[0]]
 
     if not header_rows:
         return []
 
-    # Build a matrix of header cells with their colspan/rowspan
-    # We'll expand them into a flat list of column headers
+    # Build header matrix with colspan/rowspan expansion
     columns = []
     row_span_tracker = {}  # col_index -> (remaining_rows, header_text)
 
@@ -197,9 +201,8 @@ def _parse_table_headers(table: Tag) -> List[str]:
         cells = row.find_all(['th', 'td'])
         col_idx = 0
         for cell in cells:
-            # Skip cells that are still spanning from previous rows
+            # Skip columns still occupied by a rowspan from above
             while col_idx in row_span_tracker:
-                # If a span from above still active, use that header and advance
                 remaining, header = row_span_tracker[col_idx]
                 if remaining > 0:
                     columns.append(header)
@@ -208,20 +211,19 @@ def _parse_table_headers(table: Tag) -> List[str]:
                     del row_span_tracker[col_idx]
                 col_idx += 1
 
-            # Get header text for this cell
             header_text = _extract_header_from_cell(cell, col_idx)
+            if not header_text:
+                header_text = f"Column_{col_idx+1}"
             colspan = int(cell.get('colspan', 1))
             rowspan = int(cell.get('rowspan', 1))
 
-            # Add this header to columns (repeated for colspan)
             for _ in range(colspan):
                 columns.append(header_text)
-                # If rowspan > 1, track for future rows
                 if rowspan > 1:
                     row_span_tracker[col_idx] = (rowspan - 1, header_text)
                 col_idx += 1
 
-        # After processing row, fill any remaining spanned columns from above
+        # Fill remaining spanned columns after row
         while col_idx in row_span_tracker:
             remaining, header = row_span_tracker[col_idx]
             if remaining > 0:
@@ -231,17 +233,15 @@ def _parse_table_headers(table: Tag) -> List[str]:
                 del row_span_tracker[col_idx]
             col_idx += 1
 
-    # Clean up any duplicates or empty headers
-    cleaned = []
-    for h in columns:
-        if h and h not in cleaned:  # keep first occurrence, avoid repeats
-            cleaned.append(h)
-    # Ensure we have at least one column
-    return cleaned if cleaned else [f"Column_{i+1}" for i in range(len(columns))]
+    # Remove duplicates where same header repeats due to colspan? Not needed.
+    # But ensure we don't have empty headers at the end
+    while columns and columns[-1] is None:
+        columns.pop()
+    return columns if columns else [f"Column_{i+1}" for i in range(len(columns))]
 
 def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
     """
-    Parse HTML and extract all tables as list of dicts with clean headers.
+    Parse HTML and extract all tables as list of dicts.
     Works on any website.
     """
     soup = BeautifulSoup(content, 'html.parser')
@@ -255,29 +255,30 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
         if not headers:
             continue
 
-        # Find data rows (skip rows used as headers)
+        # Identify data rows: skip rows that were used as headers
         data_rows = []
-        # If we used thead, data rows are in tbody or after thead rows
         if table.find('thead'):
             tbody = table.find('tbody')
             if tbody:
                 data_rows = tbody.find_all('tr')
             else:
-                # No tbody: all rows after thead
+                # No tbody: all rows after thead rows
                 all_rows = table.find_all('tr')
                 thead_rows = table.find('thead').find_all('tr')
                 data_rows = [r for r in all_rows if r not in thead_rows]
         else:
-            # No thead: skip first row (used as header)
+            # No thead: skip the first row (used as header) and any rows that contain <th>
             all_rows = table.find_all('tr')
-            if len(all_rows) > 1:
+            if all_rows:
+                # Assume first row is header
                 data_rows = all_rows[1:]
+                # Also filter out any row that still has <th> (some sites mix)
+                data_rows = [r for r in data_rows if not r.find('th')]
 
         for row in data_rows:
             cells = row.find_all(['td', 'th'])
             if not cells:
                 continue
-            # Map cells to headers (truncate or pad)
             record = {}
             for i, cell in enumerate(cells):
                 if i >= len(headers):
@@ -472,4 +473,4 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000)),
-        )
+            )
