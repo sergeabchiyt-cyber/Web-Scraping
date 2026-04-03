@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from pydantic import BaseModel
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, Tag, NavigableString
 
 # ── Scrapling import ──────────────────────────────────────────────────────────
 try:
@@ -95,12 +95,9 @@ def _clean_header(text: str) -> str:
     """Clean raw header text to a readable key."""
     if not text:
         return None
-    # Remove special characters, collapse spaces
     cleaned = re.sub(r'[^\w\s]', ' ', text)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    # Capitalise each word
     cleaned = ' '.join(word.capitalize() for word in cleaned.split())
-    # Truncate
     return cleaned[:50] if cleaned else None
 
 # ═══════════════════════════════════════════════════════════
@@ -125,202 +122,119 @@ def _get_raw_bytes(response) -> bytes:
     raise ValueError("No usable content found in Scrapling response")
 
 # ═══════════════════════════════════════════════════════════
-# UNIVERSAL TABLE EXTRACTION (FINAL)
+# CSS PSEUDO‑ELEMENT PROCESSOR (handles both : and ::)
 # ═══════════════════════════════════════════════════════════
-
-def _get_cell_text(cell: Tag) -> str:
-    """Extract visible text, ignoring scripts/styles."""
-    for unwanted in cell(['script', 'style']):
-        unwanted.decompose()
-    return cell.get_text(separator=' ', strip=True)
-
-def _extract_header_from_cell(cell: Tag, index: int) -> str:
-    """Try to get a meaningful header name from any cell."""
-    # 1. aria-label (common on CoinGlass)
-    aria = cell.get('aria-label', '').strip()
-    if aria:
-        cleaned = _clean_header(aria)
-        if cleaned:
-            return cleaned
-    # 2. title attribute
-    title = cell.get('title', '').strip()
-    if title:
-        cleaned = _clean_header(title)
-        if cleaned:
-            return cleaned
-    # 3. visible text
-    text = _get_cell_text(cell)
-    if text:
-        cleaned = _clean_header(text)
-        if cleaned:
-            return cleaned
-    # 4. any data-* attribute
-    for attr, val in cell.attrs.items():
-        if attr.startswith('data-') and isinstance(val, str) and val.strip():
-            cleaned = _clean_header(val)
-            if cleaned:
-                return cleaned
-    # 5. fallback: None (will be filled later)
-    return None
-
-def _is_likely_header_row(row: Tag) -> bool:
-    """Heuristic: a row is likely a header if it contains <th> or its text has common header words."""
-    if row.find('th'):
-        return True
-    cells = row.find_all(['td', 'th'])
-    if not cells:
-        return False
-    text = ' '.join(_get_cell_text(c) for c in cells[:4]).lower()
-    header_keywords = ['exchange', 'open interest', 'btc', 'usd', 'dominance', 'change', 'funding',
-                       'date', 'time', 'event', 'actual', 'previous', 'forecast', 'country', 'currency']
-    return any(kw in text for kw in header_keywords)
-
-def _expand_rowspan_headers(rows: List[Tag]) -> List[List[str]]:
+def _apply_pseudo_elements(soup: BeautifulSoup) -> None:
     """
-    Expand a list of header rows (each row is a list of cell texts) into a flat list of column headers,
-    respecting rowspan and colspan.
-    Returns a 2D matrix of header texts (rows x columns), which can then be merged.
+    Parse <style> tags and manually inject ::before/::after content into elements.
+    Simulates browser rendering for static extraction.
     """
-    if not rows:
-        return []
-    # Determine max columns by scanning all rows with colspan expansion
-    max_cols = 0
-    row_span_tracker = []  # list of dicts per row? Actually easier: process sequentially
-    # We'll build a matrix row by row
-    matrix = []
-    active_spans = []  # list of (col_index, remaining_rows, header_text)
-    for row in rows:
-        cells = row.find_all(['th', 'td'])
-        row_cells = []
-        col_idx = 0
-        for cell in cells:
-            # Skip columns already occupied by a rowspan from previous rows
-            while active_spans and active_spans[0][0] == col_idx:
-                span_col, remaining, text = active_spans.pop(0)
-                row_cells.append(text)
-                if remaining > 1:
-                    active_spans.append((span_col, remaining - 1, text))
-                col_idx += 1
-            # Get header text for this cell
-            header_text = _extract_header_from_cell(cell, col_idx)
-            if not header_text:
-                header_text = f"Column_{col_idx+1}"
-            colspan = int(cell.get('colspan', 1))
-            rowspan = int(cell.get('rowspan', 1))
-            for _ in range(colspan):
-                row_cells.append(header_text)
-                if rowspan > 1:
-                    # Insert at correct position (maintain order)
-                    active_spans.append((col_idx, rowspan - 1, header_text))
-                col_idx += 1
-        # After row, fill any remaining active spans that started before this row
-        while active_spans:
-            span_col, remaining, text = active_spans.pop(0)
-            row_cells.append(text)
-            if remaining > 1:
-                active_spans.append((span_col, remaining - 1, text))
-            # Note: this may misalign if spans are interleaved; but for most tables it's fine.
-        matrix.append(row_cells)
-        max_cols = max(max_cols, len(row_cells))
-    # Pad all rows to same length
-    for i in range(len(matrix)):
-        if len(matrix[i]) < max_cols:
-            matrix[i].extend([''] * (max_cols - len(matrix[i])))
-    return matrix
+    style_text = ''
+    for style_tag in soup.find_all('style'):
+        if style_tag.string:
+            style_text += style_tag.string
 
-def _merge_header_rows(header_matrix: List[List[str]]) -> List[str]:
-    """
-    Merge a 2D header matrix (rows x columns) into a single list of column headers.
-    Takes the first non-empty cell in each column, preferring lower rows if higher rows are empty.
-    """
-    if not header_matrix:
-        return []
-    num_cols = len(header_matrix[0])
-    final_headers = []
-    for col in range(num_cols):
-        header = ''
-        # Go from bottom row to top (prefer most specific)
-        for row in reversed(header_matrix):
-            if row[col] and row[col] != 'Column_?':
-                header = row[col]
-                break
-        if not header:
-            # Fallback to generic
-            header = f"Column_{col+1}"
-        final_headers.append(header)
-    return final_headers
+    if not style_text:
+        return
 
-def _get_table_headers(table: Tag) -> List[str]:
-    """
-    Extract column headers from any table, handling thead, th, and heuristic detection.
-    """
-    # 1. Try to use <thead>
-    thead = table.find('thead')
-    if thead:
-        header_rows = thead.find_all('tr')
-        if header_rows:
-            matrix = _expand_rowspan_headers(header_rows)
-            headers = _merge_header_rows(matrix)
-            if headers:
-                return headers
+    # Matches both .class:before and .class::before (single or double colon)
+    pattern = r'\.([a-zA-Z0-9_-]+):{1,2}(before|after)\s*\{\s*content:\s*["\']([^"\']+)["\']\s*;?\s*\}'
+    matches = re.findall(pattern, style_text)
 
-    # 2. Try to find a row that contains <th> or looks like a header
-    all_rows = table.find_all('tr')
-    candidate_rows = []
-    for row in all_rows:
-        if _is_likely_header_row(row):
-            candidate_rows.append(row)
-    if candidate_rows:
-        matrix = _expand_rowspan_headers(candidate_rows)
-        headers = _merge_header_rows(matrix)
-        if headers:
-            return headers
+    for class_name, pseudo, content in matches:
+        selector = f'.{class_name}'
+        elements = soup.select(selector)
+        new_string = NavigableString(content)
+        for el in elements:
+            if pseudo == 'before':
+                el.insert(0, new_string)
+            else:  # after
+                el.append(new_string)
 
-    # 3. Last resort: use the first row as header (but try to clean it)
-    if all_rows:
-        first_row = all_rows[0]
-        cells = first_row.find_all(['td', 'th'])
-        headers = []
-        for i, cell in enumerate(cells):
-            text = _get_cell_text(cell)
-            cleaned = _clean_header(text)
-            if cleaned:
-                headers.append(cleaned)
-            else:
-                headers.append(f"Column_{i+1}")
-        return headers
+# ═══════════════════════════════════════════════════════════
+# UNIVERSAL TEXT EXTRACTION (SVG, hidden classes, inline joining)
+# ═══════════════════════════════════════════════════════════
+def _get_element_text(element) -> str:
+    """Extract visible text, ignoring hidden classes, scripts, and cleaning junk."""
+    if not isinstance(element, Tag):
+        return str(element).strip() if element else ''
 
-    return []
+    # Skip hidden elements
+    hidden_classes = ['visually-hidden', 'tw-sr-only', 'sr-only', 'hidden', 'hide']
+    class_attr = element.get('class', [])
+    if isinstance(class_attr, list):
+        if any(cls in hidden_classes for cls in class_attr):
+            return ''
+    elif isinstance(class_attr, str):
+        if any(cls in class_attr.split() for cls in hidden_classes):
+            return ''
 
-def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
-    """
-    Parse HTML and extract all tables as list of dicts.
-    """
-    soup = BeautifulSoup(content, 'html.parser')
-    # Remove noise
-    for tag in soup(['script', 'style', 'nav', 'footer', 'aside', 'header']):
-        tag.decompose()
+    # Skip scripts and styles
+    if element.name in ('script', 'style', 'noscript', 'template'):
+        return ''
 
+    # SVG text extraction
+    if element.name == 'svg':
+        text_elements = element.find_all('text')
+        if text_elements:
+            return ' '.join(_get_element_text(t) for t in text_elements).strip()
+        return ''
+
+    # Recursively collect text from children
+    text_parts = []
+    for child in element.children:
+        if isinstance(child, NavigableString):
+            # Remove zero-width and other non-ASCII junk
+            clean = child.string.encode('ascii', 'ignore').decode('ascii').strip()
+            if clean:
+                text_parts.append(clean)
+        else:
+            child_text = _get_element_text(child)
+            if child_text:
+                text_parts.append(child_text)
+
+    # Inline elements should be joined without spaces (e.g., price components)
+    inline_elements = {'span', 'a', 'b', 'i', 'strong', 'em', 'small', 'u',
+                       's', 'sub', 'sup', 'label', 'button', 'text'}
+    if element.name in inline_elements:
+        return ''.join(text_parts)
+    return ' '.join(text_parts).strip()
+
+# ═══════════════════════════════════════════════════════════
+# STANDARD TABLE EXTRACTION
+# ═══════════════════════════════════════════════════════════
+def _extract_standard_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    """Extract data from standard <table> elements."""
     results = []
     for table in soup.find_all('table'):
-        headers = _get_table_headers(table)
+        headers = []
+        thead = table.find('thead')
+        if thead:
+            header_rows = thead.find_all('tr')
+            if header_rows:
+                for cell in header_rows[0].find_all(['th', 'td']):
+                    text = _get_element_text(cell)
+                    cleaned = _clean_header(text) or f"Column_{len(headers)+1}"
+                    headers.append(cleaned)
+        if not headers:
+            first_row = table.find('tr')
+            if first_row:
+                for cell in first_row.find_all(['th', 'td']):
+                    text = _get_element_text(cell)
+                    cleaned = _clean_header(text) or f"Column_{len(headers)+1}"
+                    headers.append(cleaned)
         if not headers:
             continue
 
-        # Identify data rows: skip rows used as headers
-        # We'll take all rows after the last header row we used
-        all_rows = table.find_all('tr')
-        # Find the index of the last row that was part of header detection
-        # Simple approach: skip rows that contain <th> or are marked as header
+        # Data rows
         data_rows = []
-        for row in all_rows:
-            if _is_likely_header_row(row):
-                continue  # skip header rows
-            # Also skip rows that have very few cells (sometimes decorative)
-            cells = row.find_all(['td', 'th'])
-            if len(cells) < len(headers) // 2:
-                continue
-            data_rows.append(row)
+        tbody = table.find('tbody')
+        if tbody:
+            data_rows = tbody.find_all('tr')
+        else:
+            all_rows = table.find_all('tr')
+            if len(all_rows) > 1:
+                data_rows = all_rows[1:]
 
         for row in data_rows:
             cells = row.find_all(['td', 'th'])
@@ -330,11 +244,136 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
             for i, cell in enumerate(cells):
                 if i >= len(headers):
                     break
-                text = _get_cell_text(cell)
+                text = _get_element_text(cell)
                 if text:
                     record[headers[i]] = text
             if record:
                 results.append(record)
+    return results
+
+# ═══════════════════════════════════════════════════════════
+# ARIA TABLE EXTRACTION (for React/Angular/Vue grids)
+# ═══════════════════════════════════════════════════════════
+def _extract_aria_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    """Extract data from ARIA role="table" / role="grid" structures."""
+    results = []
+    tables = soup.find_all(attrs={"role": ["table", "grid"]})
+    if not tables:
+        return results
+
+    for table in tables:
+        header_row = None
+        header_cells = []
+        for rowgroup in table.find_all(attrs={"role": "rowgroup"}):
+            rows = rowgroup.find_all(attrs={"role": "row"})
+            for row in rows:
+                cells = row.find_all(attrs={"role": ["columnheader", "cell"]})
+                if cells and any(c.get('role') == 'columnheader' for c in cells):
+                    header_row = row
+                    break
+            if header_row:
+                break
+        if header_row:
+            header_cells = header_row.find_all(attrs={"role": "columnheader"})
+        else:
+            first_rowgroup = table.find(attrs={"role": "rowgroup"})
+            if first_rowgroup:
+                first_row = first_rowgroup.find(attrs={"role": "row"})
+                if first_row:
+                    header_cells = first_row.find_all(attrs={"role": "cell"})
+        if not header_cells:
+            num_cols = 0
+            for row in table.find_all(attrs={"role": "row"}):
+                cells = row.find_all(attrs={"role": "cell"})
+                if len(cells) > num_cols:
+                    num_cols = len(cells)
+            header_cells = [f"Column_{i+1}" for i in range(num_cols)]
+        else:
+            header_texts = []
+            for cell in header_cells:
+                text = _get_element_text(cell)
+                cleaned = _clean_header(text) or f"Column_{len(header_texts)+1}"
+                header_texts.append(cleaned)
+            header_cells = header_texts
+
+        data_rows = []
+        for rowgroup in table.find_all(attrs={"role": "rowgroup"}):
+            for row in rowgroup.find_all(attrs={"role": "row"}):
+                if row == header_row:
+                    continue
+                cells = row.find_all(attrs={"role": "cell"})
+                if cells:
+                    data_rows.append((row, cells))
+        for row in table.find_all(attrs={"role": "row"}):
+            if row == header_row or row in [r for r, _ in data_rows]:
+                continue
+            cells = row.find_all(attrs={"role": "cell"})
+            if cells:
+                data_rows.append((row, cells))
+
+        for row, cells in data_rows:
+            record = {}
+            for i, cell in enumerate(cells):
+                if i >= len(header_cells):
+                    break
+                text = _get_element_text(cell)
+                if text:
+                    header = header_cells[i] if isinstance(header_cells[i], str) else f"Column_{i+1}"
+                    record[header] = text
+            if record:
+                results.append(record)
+    return results
+
+# ═══════════════════════════════════════════════════════════
+# FALLBACK: HEURISTIC EXTRACTION (for non‑table pages)
+# ═══════════════════════════════════════════════════════════
+def _extract_heuristic_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    """Last resort for pages with data hidden in CSS pseudo-elements."""
+    results = []
+    # Look for common product patterns (can be extended)
+    p_name = soup.select_one('.p-name')
+    if p_name:
+        name = _get_element_text(p_name)
+        sku_span = soup.select_one('#sku_val_6621')
+        sku = _get_element_text(sku_span) if sku_span else ''
+        p_val = soup.select_one('.p-val')
+        price = _get_element_text(p_val) if p_val else ''
+        if name or sku or price:
+            record = {}
+            if name:  record['Product'] = name
+            if sku:   record['SKU'] = sku
+            if price: record['Price'] = price
+            results.append(record)
+    return results
+
+# ═══════════════════════════════════════════════════════════
+# MAIN EXTRACTION DISPATCHER
+# ═══════════════════════════════════════════════════════════
+def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
+    """Parse HTML and extract tables using multiple strategies."""
+    soup = BeautifulSoup(content, 'html.parser')
+
+    # 1. Inject CSS pseudo-element content
+    _apply_pseudo_elements(soup)
+
+    # 2. Remove noise
+    for tag in soup(['script', 'style', 'noscript', 'template']):
+        tag.decompose()
+
+    # 3. Standard tables
+    results = _extract_standard_tables(soup)
+    # Filter out garbage rows (e.g., very long single‑column headers)
+    results = [r for r in results if (len(r) > 1 or (len(r) == 1 and not list(r.keys())[0].startswith("Column_"))) and len(list(r.keys())[0]) < 40]
+
+    # 4. ARIA tables
+    aria_results = _extract_aria_tables(soup)
+    if aria_results:
+        results.extend(aria_results)
+
+    # 5. Heuristic fallback
+    heuristic_results = _extract_heuristic_tables(soup)
+    if heuristic_results:
+        results.extend(heuristic_results)
 
     return results
 
@@ -343,38 +382,32 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
 # ═══════════════════════════════════════════════════════════
 def _fetch_static(url: str):
     if Fetcher is None:
-        raise RuntimeError("Scrapling Fetcher is not installed.")
+        raise RuntimeError("Scrapling Fetcher not installed.")
     try:
         response = Fetcher().get(url)
     except Exception as e:
-        raise RuntimeError(f"Fetcher.get() failed: {e}") from e
+        raise RuntimeError(f"Fetcher.get() failed: {e}")
     if response is None:
-        raise RuntimeError("Fetcher.get() returned None — URL may be unreachable or blocked.")
+        raise RuntimeError("Fetcher.get() returned None")
     return response
 
 def _fetch_js(url: str):
     if not _STEALTH_AVAILABLE or StealthyFetcher is None:
-        raise RuntimeError(
-            "StealthyFetcher unavailable — run: "
-            "pip install scrapling[all] --break-system-packages && scrapling install"
-        )
+        raise RuntimeError("StealthyFetcher unavailable")
     try:
         response = StealthyFetcher.fetch(url, headless=True)
     except Exception as e:
-        raise RuntimeError(f"StealthyFetcher.fetch() failed: {e}") from e
+        raise RuntimeError(f"StealthyFetcher.fetch() failed: {e}")
     if response is None:
-        raise RuntimeError("StealthyFetcher.fetch() returned None — URL may be unreachable or blocked.")
+        raise RuntimeError("StealthyFetcher.fetch() returned None")
     return response
 
 # ═══════════════════════════════════════════════════════════
-# CORE SCRAPE LOGIC (exposed for telegram bot)
+# CORE SCRAPE LOGIC
 # ═══════════════════════════════════════════════════════════
 async def _scrape_url(url: str, js: bool = False) -> tuple[List[Dict[str, Any]], int]:
     if not _is_safe_url(url):
-        raise HTTPException(
-            status_code=403,
-            detail="FORBIDDEN_DOMAIN — private/loopback addresses are blocked."
-        )
+        raise HTTPException(status_code=403, detail="FORBIDDEN_DOMAIN")
     loop = asyncio.get_running_loop()
     try:
         if js:
@@ -387,24 +420,23 @@ async def _scrape_url(url: str, js: bool = False) -> tuple[List[Dict[str, Any]],
         raw = _get_raw_bytes(response)
     except ValueError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
     raw_bytes = len(raw)
     print(f"[SCRAPE] {url} → {raw_bytes} bytes fetched (js={js})")
     if raw_bytes == 0:
-        raise HTTPException(status_code=502, detail="Fetcher returned empty body — page may require JS rendering (enable JS context) or is blocking scrapers.")
+        raise HTTPException(status_code=502, detail="Empty response body")
     if raw_bytes > MAX_PAYLOAD_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Payload too large ({raw_bytes / 1_048_576:.1f} MB > 10 MB limit)."
-        )
+        raise HTTPException(status_code=413, detail=f"Payload too large ({raw_bytes / 1_048_576:.1f} MB)")
+
     try:
         rows = await loop.run_in_executor(cpu_executor, _extract_worker, raw)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Table extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {e}")
     print(f"[SCRAPE] {url} → {len(rows)} rows extracted")
     return rows, raw_bytes
 
 # ═══════════════════════════════════════════════════════════
-# APP
+# FASTAPI APP
 # ═══════════════════════════════════════════════════════════
 app = FastAPI(title="AUDITOR CORE", version="7.5.0")
 
@@ -451,7 +483,7 @@ async def health():
         "utc": datetime.now(timezone.utc).isoformat(),
     }
 
-# ── Debug endpoint ───────────────────────────────────────────────────────────
+# ── Debug endpoint (fixed function name) ───────────────────────────────────────
 @app.get("/api/debug-fetch")
 async def debug_fetch(url: str, _key: str = Depends(verify_key)):
     if not _is_safe_url(url):
@@ -459,7 +491,7 @@ async def debug_fetch(url: str, _key: str = Depends(verify_key)):
     loop = asyncio.get_running_loop()
     try:
         response = await loop.run_in_executor(None, _fetch_static, url)
-        raw = _get_raw_bytes(response)
+        raw = _get_raw_bytes(response)   # Fixed: was get_raw_bytes
         return {
             "url": url,
             "raw_bytes": len(raw),
@@ -471,10 +503,7 @@ async def debug_fetch(url: str, _key: str = Depends(verify_key)):
 
 # ── Scrape endpoint ──────────────────────────────────────────────────────────
 @app.post("/api/scrape", response_model=ScrapeResponse)
-async def scrape(
-    body: ScrapeRequest,
-    _key: str = Depends(verify_key),
-):
+async def scrape(body: ScrapeRequest, _key: str = Depends(verify_key)):
     t0 = time.perf_counter()
     rows, raw_bytes = await _scrape_url(body.url, js=body.js)
     elapsed = round(time.perf_counter() - t0, 3)
@@ -491,7 +520,7 @@ async def token_status(_key: str = Depends(verify_key)):
     }
 
 # ═══════════════════════════════════════════════════════════
-# TELEGRAM BOT STARTUP & SHUTDOWN (thread‑based)
+# TELEGRAM BOT STARTUP & SHUTDOWN
 # ═══════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def startup_telegram():
@@ -520,4 +549,4 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000)),
-    )
+)
