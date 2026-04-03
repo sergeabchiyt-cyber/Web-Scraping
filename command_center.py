@@ -97,9 +97,6 @@ def _sanitize_key(text: str) -> str:
 
 # ═══════════════════════════════════════════════════════════
 # RAW CONTENT EXTRACTION FROM SCRAPLING RESPONSE
-# FIX: Scrapling Adaptor stores HTML as .html (str), not .content (bytes).
-#      .content may be empty or None even on a successful fetch.
-#      We try multiple attributes in priority order and encode to bytes.
 # ═══════════════════════════════════════════════════════════
 def _get_raw_bytes(response) -> bytes:
     """
@@ -184,12 +181,6 @@ def _find_headers(table) -> tuple[list, list]:
     """
     Robustly locate header row and data rows for any table structure.
     Returns (headers: list[str], data_rows: list[Tag]).
-
-    Strategy:
-      1. <thead> rows → use last thead row with the most non-empty cells as header
-      2. First <tr> that contains <th> elements
-      3. First <tr> whose cells produce the most non-positional (named) labels
-      4. Plain first row fallback
     """
     all_rows = table.find_all('tr')
     if not all_rows:
@@ -209,7 +200,6 @@ def _find_headers(table) -> tuple[list, list]:
     if thead:
         thead_rows = thead.find_all('tr')
         if thead_rows:
-            # Pick the thead row with the highest named-column score
             best_score, best_cells = -1, None
             for row in thead_rows:
                 score, cells = score_row(row)
@@ -217,7 +207,6 @@ def _find_headers(table) -> tuple[list, list]:
                     best_score, best_cells = score, cells
             if best_cells is not None:
                 headers   = [_cell_label(c, i) for i, c in enumerate(best_cells)]
-                # Data rows = everything in <tbody>, else all rows after the thead rows
                 tbody = table.find('tbody')
                 data_rows = tbody.find_all('tr') if tbody else [
                     r for r in all_rows if r not in thead_rows
@@ -225,7 +214,6 @@ def _find_headers(table) -> tuple[list, list]:
                 return headers, data_rows
 
     # --- No thead: scan all rows for the best header candidate ---
-    # Prefer rows with <th> elements; among those, pick the one with most named labels.
     th_rows     = [r for r in all_rows if r.find('th')]
     candidates  = th_rows if th_rows else all_rows
 
@@ -239,7 +227,6 @@ def _find_headers(table) -> tuple[list, list]:
         return [], []
 
     headers   = [_cell_label(c, i) for i, c in enumerate(best_cells)]
-    # Data rows = every row after the chosen header row (in the full row list)
     actual_idx = all_rows.index(candidates[best_idx])
     data_rows  = all_rows[actual_idx + 1:]
     return headers, data_rows
@@ -248,8 +235,6 @@ def _find_headers(table) -> tuple[list, list]:
 def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
     """
     Parses HTML bytes and extracts all <table> rows as dicts with semantic column names.
-    Uses universal header detection — works on icon-heavy (CoinGlass), text (TradingEconomics),
-    and any other table structure without site-specific logic.
     Pure function — safe to run in a subprocess.
     """
     soup = BeautifulSoup(content, 'html.parser')
@@ -266,14 +251,12 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
             cells = row.find_all(['td', 'th'])
             if not cells:
                 continue
-            # Tolerate rows with fewer cells (sparse tables); skip rows with more cells
             if len(cells) > len(headers):
                 continue
             record = {
                 headers[i]: c.get_text(separator=' ', strip=True)
                 for i, c in enumerate(cells)
             }
-            # Skip entirely empty rows
             if any(v for v in record.values()):
                 results.append(record)
 
@@ -281,11 +264,8 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
 
 # ═══════════════════════════════════════════════════════════
 # FETCH WRAPPERS
-# These run inside run_in_executor — exceptions will propagate
-# back to the async caller correctly.
 # ═══════════════════════════════════════════════════════════
 def _fetch_static(url: str):
-    """Synchronous static fetch — runs in thread executor."""
     if Fetcher is None:
         raise RuntimeError("Scrapling Fetcher is not installed.")
     try:
@@ -297,7 +277,6 @@ def _fetch_static(url: str):
     return response
 
 def _fetch_js(url: str):
-    """Synchronous headless fetch — runs in thread executor."""
     if not _STEALTH_AVAILABLE or StealthyFetcher is None:
         raise RuntimeError(
             "StealthyFetcher unavailable — run: "
@@ -330,7 +309,6 @@ async def _scrape_url(url: str, js: bool = False) -> tuple[List[Dict[str, Any]],
         else:
             response = await loop.run_in_executor(None, _fetch_static, url)
     except RuntimeError as e:
-        # Surface fetcher errors directly to the client
         raise HTTPException(status_code=502, detail=str(e))
 
     # ── Extract raw bytes from Scrapling response ──────────
@@ -411,10 +389,6 @@ async def health():
 # ── Debug endpoint — test fetcher directly, returns content preview ───────────
 @app.get("/api/debug-fetch")
 async def debug_fetch(url: str, _key: str = Depends(verify_key)):
-    """
-    Fetches a URL and returns a content preview without table extraction.
-    Useful for diagnosing fetcher issues on Railway.
-    """
     if not _is_safe_url(url):
         raise HTTPException(status_code=403, detail="FORBIDDEN_DOMAIN")
     loop = asyncio.get_running_loop()
@@ -452,18 +426,10 @@ async def token_status(_key: str = Depends(verify_key)):
     }
 
 # ═══════════════════════════════════════════════════════════
-# STARTUP
+# TELEGRAM BOT LIFESPAN (replaces old @app.on_event)
 # ═══════════════════════════════════════════════════════════
-@app.on_event("startup")
-async def startup():
-    try:
-        from telegram_bot import start_bot
-        start_bot()
-        print("[BOOT] Telegram bot started.")
-    except ImportError:
-        print("[BOOT] telegram_bot.py not found — skipping.")
-    except Exception as e:
-        print(f"[BOOT] Telegram bot failed: {e}")
+from telegram_bot import telegram_lifespan  # must be the corrected version
+app.router.lifespan_context = telegram_lifespan
 
 # ═══════════════════════════════════════════════════════════
 # ENTRY POINT
