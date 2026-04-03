@@ -137,9 +137,119 @@ def _get_raw_bytes(response) -> bytes:
 # ═══════════════════════════════════════════════════════════
 # EXTRACTION WORKER (top-level for ProcessPoolExecutor pickling)
 # ═══════════════════════════════════════════════════════════
+
+def _cell_label(cell, index: int) -> str:
+    """
+    Universal header label extractor for a single <th> or <td> cell.
+    Tries text content → aria-label → title → data-* values → positional fallback.
+    Works on any site regardless of whether headers use icons, spans, or plain text.
+    """
+    # 1. Visible text (strips all child tags)
+    text = cell.get_text(separator=' ', strip=True)
+    key  = _sanitize_key(text)
+    if key:
+        return key
+
+    # 2. aria-label (common in icon-heavy tables like CoinGlass)
+    aria = cell.get('aria-label', '').strip()
+    key  = _sanitize_key(aria)
+    if key:
+        return key
+
+    # 3. title attribute
+    title = cell.get('title', '').strip()
+    key   = _sanitize_key(title)
+    if key:
+        return key
+
+    # 4. Any data-* attribute value (e.g. data-column, data-key, data-field)
+    for attr, val in cell.attrs.items():
+        if attr.startswith('data-') and isinstance(val, str):
+            key = _sanitize_key(val)
+            if key:
+                return key
+
+    # 5. Check nested elements for any non-empty text (catches icon + hidden span patterns)
+    for child in cell.descendants:
+        if hasattr(child, 'get_text'):
+            nested = _sanitize_key(child.get_text(strip=True))
+            if nested:
+                return nested
+
+    # 6. Positional fallback
+    return f"col_{index}"
+
+
+def _find_headers(table) -> tuple[list, list]:
+    """
+    Robustly locate header row and data rows for any table structure.
+    Returns (headers: list[str], data_rows: list[Tag]).
+
+    Strategy:
+      1. <thead> rows → use last thead row with the most non-empty cells as header
+      2. First <tr> that contains <th> elements
+      3. First <tr> whose cells produce the most non-positional (named) labels
+      4. Plain first row fallback
+    """
+    all_rows = table.find_all('tr')
+    if not all_rows:
+        return [], []
+
+    def score_row(row):
+        """Higher score = better header candidate (more named, fewer positional cols)."""
+        cells = row.find_all(['th', 'td'])
+        if not cells:
+            return -1, cells
+        labels   = [_cell_label(c, i) for i, c in enumerate(cells)]
+        named    = sum(1 for l in labels if not l.startswith('col_'))
+        return named, cells
+
+    # --- Try <thead> first ---
+    thead = table.find('thead')
+    if thead:
+        thead_rows = thead.find_all('tr')
+        if thead_rows:
+            # Pick the thead row with the highest named-column score
+            best_score, best_cells = -1, None
+            for row in thead_rows:
+                score, cells = score_row(row)
+                if score > best_score and cells:
+                    best_score, best_cells = score, cells
+            if best_cells is not None:
+                headers   = [_cell_label(c, i) for i, c in enumerate(best_cells)]
+                # Data rows = everything in <tbody>, else all rows after the thead rows
+                tbody = table.find('tbody')
+                data_rows = tbody.find_all('tr') if tbody else [
+                    r for r in all_rows if r not in thead_rows
+                ]
+                return headers, data_rows
+
+    # --- No thead: scan all rows for the best header candidate ---
+    # Prefer rows with <th> elements; among those, pick the one with most named labels.
+    th_rows     = [r for r in all_rows if r.find('th')]
+    candidates  = th_rows if th_rows else all_rows
+
+    best_score, best_idx, best_cells = -1, 0, None
+    for idx, row in enumerate(candidates):
+        score, cells = score_row(row)
+        if score > best_score and cells:
+            best_score, best_idx, best_cells = score, idx, cells
+
+    if best_cells is None:
+        return [], []
+
+    headers   = [_cell_label(c, i) for i, c in enumerate(best_cells)]
+    # Data rows = every row after the chosen header row (in the full row list)
+    actual_idx = all_rows.index(candidates[best_idx])
+    data_rows  = all_rows[actual_idx + 1:]
+    return headers, data_rows
+
+
 def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
     """
-    Parses HTML bytes and extracts all <table> rows as dicts.
+    Parses HTML bytes and extracts all <table> rows as dicts with semantic column names.
+    Uses universal header detection — works on icon-heavy (CoinGlass), text (TradingEconomics),
+    and any other table structure without site-specific logic.
     Pure function — safe to run in a subprocess.
     """
     soup = BeautifulSoup(content, 'html.parser')
@@ -148,24 +258,25 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
 
     results = []
     for table in soup.find_all('table'):
-        rows = table.find_all('tr')
-        if not rows:
+        headers, data_rows = _find_headers(table)
+        if not headers:
             continue
-        header_cells = rows[0].find_all(['th', 'td'])
-        if not header_cells:
-            continue
-        headers = [
-            _sanitize_key(th.get_text(strip=True)) or f"col_{i}"
-            for i, th in enumerate(header_cells)
-        ]
-        for row in rows[1:]:
+
+        for row in data_rows:
             cells = row.find_all(['td', 'th'])
-            if len(cells) != len(headers):
+            if not cells:
                 continue
-            results.append({
-                headers[i]: c.get_text(strip=True)
+            # Tolerate rows with fewer cells (sparse tables); skip rows with more cells
+            if len(cells) > len(headers):
+                continue
+            record = {
+                headers[i]: c.get_text(separator=' ', strip=True)
                 for i, c in enumerate(cells)
-            })
+            }
+            # Skip entirely empty rows
+            if any(v for v in record.values()):
+                results.append(record)
+
     return results
 
 # ═══════════════════════════════════════════════════════════
