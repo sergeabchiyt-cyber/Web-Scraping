@@ -276,12 +276,13 @@ def _cell_label(cell, index: int) -> str:
       1. aria-label directly on the cell  ← CoinGlass puts label here on TH
       2. title directly on the cell
       3. data-* attribute directly on the cell
-      4. Visible non-SVG text (avoids icon-label pollution from SVG <title>)
-      5. aria-label / title on any descendant  ← some sites wrap in <div aria-label>
-      6. Full visible text including SVG <text>/<tspan>
+      4. Visible non-SVG text  (avoids spurious SVG icon labels in data cells)
+      5. aria-label / title / data-* on any descendant element
+      6. Full get_text() — catches SVG <title> text (e.g. "OI (BTC)" inside
+         CoinGlass sort-icon SVGs) that _el_text intentionally skips for data rows
       7. Positional fallback col_N
     """
-    # 1. aria-label on the cell itself (most reliable for icon-heavy tables)
+    # 1. aria-label on the cell itself
     key = _sanitize_key(cell.get('aria-label', ''))
     if key:
         return key
@@ -291,15 +292,14 @@ def _cell_label(cell, index: int) -> str:
     if key:
         return key
 
-    # 3. data-* on the cell itself (data-column, data-key, data-field, etc.)
+    # 3. data-* on the cell itself
     for attr, val in cell.attrs.items():
         if attr.startswith('data-') and isinstance(val, str):
             key = _sanitize_key(val)
             if key:
                 return key
 
-    # 4. Visible non-SVG text — skip SVG children entirely here so icon labels
-    #    like "sort" don't appear as header names
+    # 4. Visible non-SVG text (avoids icon-description pollution in data rows)
     text_parts = []
     for child in cell.children:
         if isinstance(child, NavigableString):
@@ -314,7 +314,7 @@ def _cell_label(cell, index: int) -> str:
     if key:
         return key
 
-    # 5. aria-label / title on any descendant element
+    # 5. aria-label / title / data-* on any descendant
     for child in cell.descendants:
         if not isinstance(child, Tag):
             continue
@@ -330,8 +330,13 @@ def _cell_label(cell, index: int) -> str:
                 if key:
                     return key
 
-    # 6. Full text including SVG <text>/<tspan>
-    key = _sanitize_key(_el_text(cell))
+    # 6. Full get_text() — BeautifulSoup extracts from ALL descendants including
+    #    SVG <title> nodes. This is deliberately last for headers so that a cell
+    #    containing a sort-icon SVG whose <title> says "OI (BTC)" still gets a
+    #    meaningful label even when no aria-label is present.
+    #    NOTE: _el_text skips SVG titles to protect DATA cell extraction.
+    #    For HEADER cells we want them; this restores that behaviour as a fallback.
+    key = _sanitize_key(cell.get_text(separator=' ', strip=True))
     if key:
         return key
 
@@ -593,20 +598,38 @@ def _extract_aria_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
 def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
     """
     Full extraction pipeline:
-      1. lxml parse (tag-soup repair)
-      2. CSS pseudo-element injection  [FIX-7: BEFORE decompose]
+      1. lxml parse (browser-aligned tag-soup repair)
+      2. CSS pseudo-element injection  [before style decompose]
       3. Noise removal
       4. Standard <table> extraction with rowspan/colspan carry
       5. ARIA grid extraction (coordinate mapping)
+      6. Div-row fallback (fires only when 0 table/ARIA results)
+      7. html.parser retry (fires when lxml yields 0 — catches pages where
+         lxml's strict repair restructures tables into unrecognizable DOM)
+
     Pure top-level function — safe to pickle into ProcessPoolExecutor.
     """
-    # lxml gives browser-aligned tag-soup repair vs html.parser structural drift
-    soup = BeautifulSoup(content, 'lxml')
+    results = _parse_and_extract(content, 'lxml')
 
-    # [FIX-7] Inject pseudo-elements BEFORE style tags are removed
+    # lxml can over-correct malformed HTML (moves rows, strips tbody, etc.)
+    # Fall back to html.parser which is more lenient about broken table nesting.
+    if not results:
+        results = _parse_and_extract(content, 'html.parser')
+
+    return results
+
+
+def _parse_and_extract(content: bytes, parser: str) -> List[Dict[str, Any]]:
+    """Single-parser extraction pass — called by _extract_worker with fallback."""
+    try:
+        soup = BeautifulSoup(content, parser)
+    except Exception:
+        return []
+
+    # Inject CSS pseudo-elements BEFORE style tags are decomposed
     _inject_pseudo_elements(soup)
 
-    # Remove noise after CSS injection
+    # Remove noise
     for tag in soup(['script', 'style', 'noscript', 'template', 'nav', 'footer', 'aside']):
         tag.decompose()
 
@@ -618,13 +641,13 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
         if not headers or not data_rows:
             continue
         records = _rows_to_records(headers, data_rows)
-        # Filter single-column header-only rows (e.g. date separators)
+        # Filter single-column header-only rows (date separators, group labels)
         records = [r for r in records if len(r) > 1 or (
             len(r) == 1 and not list(r.keys())[0].startswith('col_')
         )]
         results.extend(records)
 
-    # ── ARIA grid extraction (covers React/Vue virtualised tables) ──
+    # ── ARIA grid extraction ──
     aria_results = _extract_aria_tables(soup)
     seen = {str(sorted(r.items())) for r in results}
     for r in aria_results:
@@ -633,8 +656,7 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
             results.append(r)
             seen.add(key)
 
-    # ── Div-row fallback — fires when no <table> produced results ──
-    # TradingEconomics /calendar/country and many SPAs use div layouts.
+    # ── Div-row fallback — only when table+ARIA extraction produced nothing ──
     if not results:
         div_results = _extract_div_rows(soup)
         seen = {str(sorted(r.items())) for r in results}
