@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from pydantic import BaseModel
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 # ── Scrapling import ──────────────────────────────────────────────────────────
 try:
@@ -91,173 +91,201 @@ def _is_safe_url(url: str) -> bool:
     except Exception:
         return False
 
-def _sanitize_key(text: str) -> str:
-    clean = re.sub(r'[^a-zA-Z0-9]', '_', text.strip())
-    return re.sub(r'_+', '_', clean).strip('_').lower()[:64]
+def _clean_header(text: str) -> str:
+    """Convert raw header text to a clean, readable key."""
+    if not text:
+        return None
+    # Remove extra whitespace and special characters
+    cleaned = re.sub(r'[^\w\s]', ' ', text)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    # Capitalise each word
+    cleaned = ' '.join(word.capitalize() for word in cleaned.split())
+    return cleaned[:50] if cleaned else None
 
 # ═══════════════════════════════════════════════════════════
 # RAW CONTENT EXTRACTION FROM SCRAPLING RESPONSE
 # ═══════════════════════════════════════════════════════════
 def _get_raw_bytes(response) -> bytes:
-    """
-    Extract raw HTML bytes from a Scrapling Adaptor object.
-    Tries attributes in priority order — raises ValueError if nothing usable is found.
-    """
-    # 1. .html — primary Scrapling attribute (str)
     html = getattr(response, 'html', None)
     if html and isinstance(html, str) and len(html.strip()) > 0:
         return html.encode('utf-8', errors='replace')
-
-    # 2. .text — alias used in some Scrapling versions
     text = getattr(response, 'text', None)
     if text and isinstance(text, str) and len(text.strip()) > 0:
         return text.encode('utf-8', errors='replace')
-
-    # 3. .content — raw bytes (may be populated in some fetcher modes)
     content = getattr(response, 'content', None)
     if content and isinstance(content, bytes) and len(content) > 0:
         return content
-
-    # 4. .body — fallback used by some Scrapling versions
     body = getattr(response, 'body', None)
     if body:
         if isinstance(body, bytes) and len(body) > 0:
             return body
         if isinstance(body, str) and len(body.strip()) > 0:
             return body.encode('utf-8', errors='replace')
-
-    raise ValueError(
-        f"Scrapling response returned no usable content. "
-        f"Available attrs: {[a for a in dir(response) if not a.startswith('_')]}"
-    )
+    raise ValueError("No usable content found in Scrapling response")
 
 # ═══════════════════════════════════════════════════════════
-# EXTRACTION WORKER (top-level for ProcessPoolExecutor pickling)
+# UNIVERSAL TABLE EXTRACTION (handles colspan, rowspan, any site)
 # ═══════════════════════════════════════════════════════════
 
-def _cell_label(cell, index: int) -> str:
-    """
-    Universal header label extractor for a single <th> or <td> cell.
-    Tries text content → aria-label → title → data-* values → positional fallback.
-    Works on any site regardless of whether headers use icons, spans, or plain text.
-    """
-    # 1. Visible text (strips all child tags)
-    text = cell.get_text(separator=' ', strip=True)
-    key  = _sanitize_key(text)
-    if key:
-        return key
+def _get_cell_text(cell: Tag) -> str:
+    """Extract visible text from a cell, ignoring scripts/styles."""
+    for unwanted in cell(['script', 'style']):
+        unwanted.decompose()
+    return cell.get_text(separator=' ', strip=True)
 
-    # 2. aria-label (common in icon-heavy tables like CoinGlass)
+def _extract_header_from_cell(cell: Tag, index: int) -> str:
+    """
+    Get a meaningful header name from a <th> or <td> cell.
+    Priority: aria-label > title > visible text > data-* > position.
+    """
+    # 1. aria-label
     aria = cell.get('aria-label', '').strip()
-    key  = _sanitize_key(aria)
-    if key:
-        return key
-
-    # 3. title attribute
+    if aria:
+        cleaned = _clean_header(aria)
+        if cleaned:
+            return cleaned
+    # 2. title attribute
     title = cell.get('title', '').strip()
-    key   = _sanitize_key(title)
-    if key:
-        return key
-
-    # 4. Any data-* attribute value (e.g. data-column, data-key, data-field)
+    if title:
+        cleaned = _clean_header(title)
+        if cleaned:
+            return cleaned
+    # 3. Visible text
+    text = _get_cell_text(cell)
+    if text:
+        cleaned = _clean_header(text)
+        if cleaned:
+            return cleaned
+    # 4. Any data-* attribute
     for attr, val in cell.attrs.items():
-        if attr.startswith('data-') and isinstance(val, str):
-            key = _sanitize_key(val)
-            if key:
-                return key
+        if attr.startswith('data-') and isinstance(val, str) and val.strip():
+            cleaned = _clean_header(val)
+            if cleaned:
+                return cleaned
+    # 5. Fallback: position
+    return f"Column_{index+1}"
 
-    # 5. Check nested elements for any non-empty text (catches icon + hidden span patterns)
-    for child in cell.descendants:
-        if hasattr(child, 'get_text'):
-            nested = _sanitize_key(child.get_text(strip=True))
-            if nested:
-                return nested
-
-    # 6. Positional fallback
-    return f"col_{index}"
-
-
-def _find_headers(table) -> tuple[list, list]:
+def _parse_table_headers(table: Tag) -> List[str]:
     """
-    Robustly locate header row and data rows for any table structure.
-    Returns (headers: list[str], data_rows: list[Tag]).
+    Extract column headers from a table, respecting colspan/rowspan.
+    Returns a list of header strings (one per visible column).
     """
-    all_rows = table.find_all('tr')
-    if not all_rows:
-        return [], []
-
-    def score_row(row):
-        """Higher score = better header candidate (more named, fewer positional cols)."""
-        cells = row.find_all(['th', 'td'])
-        if not cells:
-            return -1, cells
-        labels   = [_cell_label(c, i) for i, c in enumerate(cells)]
-        named    = sum(1 for l in labels if not l.startswith('col_'))
-        return named, cells
-
-    # --- Try <thead> first ---
+    # First, try to find all header cells in thead or first rows
+    header_rows = []
     thead = table.find('thead')
     if thead:
-        thead_rows = thead.find_all('tr')
-        if thead_rows:
-            best_score, best_cells = -1, None
-            for row in thead_rows:
-                score, cells = score_row(row)
-                if score > best_score and cells:
-                    best_score, best_cells = score, cells
-            if best_cells is not None:
-                headers   = [_cell_label(c, i) for i, c in enumerate(best_cells)]
-                tbody = table.find('tbody')
-                data_rows = tbody.find_all('tr') if tbody else [
-                    r for r in all_rows if r not in thead_rows
-                ]
-                return headers, data_rows
+        header_rows = thead.find_all('tr')
+    else:
+        # No thead: take first row that contains <th> or looks like header
+        for row in table.find_all('tr'):
+            if row.find('th') or (len(row.find_all('td')) > 1 and row.find('td').get('class', []) == ['header']):
+                header_rows = [row]
+                break
+        if not header_rows and table.find_all('tr'):
+            # Fallback: first row as header
+            header_rows = [table.find_all('tr')[0]]
 
-    # --- No thead: scan all rows for the best header candidate ---
-    th_rows     = [r for r in all_rows if r.find('th')]
-    candidates  = th_rows if th_rows else all_rows
+    if not header_rows:
+        return []
 
-    best_score, best_idx, best_cells = -1, 0, None
-    for idx, row in enumerate(candidates):
-        score, cells = score_row(row)
-        if score > best_score and cells:
-            best_score, best_idx, best_cells = score, idx, cells
+    # Build a matrix of header cells with their colspan/rowspan
+    # We'll expand them into a flat list of column headers
+    columns = []
+    row_span_tracker = {}  # col_index -> (remaining_rows, header_text)
 
-    if best_cells is None:
-        return [], []
+    for row_idx, row in enumerate(header_rows):
+        cells = row.find_all(['th', 'td'])
+        col_idx = 0
+        for cell in cells:
+            # Skip cells that are still spanning from previous rows
+            while col_idx in row_span_tracker:
+                # If a span from above still active, use that header and advance
+                remaining, header = row_span_tracker[col_idx]
+                if remaining > 0:
+                    columns.append(header)
+                    row_span_tracker[col_idx] = (remaining - 1, header)
+                else:
+                    del row_span_tracker[col_idx]
+                col_idx += 1
 
-    headers   = [_cell_label(c, i) for i, c in enumerate(best_cells)]
-    actual_idx = all_rows.index(candidates[best_idx])
-    data_rows  = all_rows[actual_idx + 1:]
-    return headers, data_rows
+            # Get header text for this cell
+            header_text = _extract_header_from_cell(cell, col_idx)
+            colspan = int(cell.get('colspan', 1))
+            rowspan = int(cell.get('rowspan', 1))
 
+            # Add this header to columns (repeated for colspan)
+            for _ in range(colspan):
+                columns.append(header_text)
+                # If rowspan > 1, track for future rows
+                if rowspan > 1:
+                    row_span_tracker[col_idx] = (rowspan - 1, header_text)
+                col_idx += 1
+
+        # After processing row, fill any remaining spanned columns from above
+        while col_idx in row_span_tracker:
+            remaining, header = row_span_tracker[col_idx]
+            if remaining > 0:
+                columns.append(header)
+                row_span_tracker[col_idx] = (remaining - 1, header)
+            else:
+                del row_span_tracker[col_idx]
+            col_idx += 1
+
+    # Clean up any duplicates or empty headers
+    cleaned = []
+    for h in columns:
+        if h and h not in cleaned:  # keep first occurrence, avoid repeats
+            cleaned.append(h)
+    # Ensure we have at least one column
+    return cleaned if cleaned else [f"Column_{i+1}" for i in range(len(columns))]
 
 def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
     """
-    Parses HTML bytes and extracts all <table> rows as dicts with semantic column names.
-    Pure function — safe to run in a subprocess.
+    Parse HTML and extract all tables as list of dicts with clean headers.
+    Works on any website.
     """
     soup = BeautifulSoup(content, 'html.parser')
-    for tag in soup(['script', 'style', 'nav', 'footer', 'aside']):
+    # Remove noise
+    for tag in soup(['script', 'style', 'nav', 'footer', 'aside', 'header']):
         tag.decompose()
 
     results = []
     for table in soup.find_all('table'):
-        headers, data_rows = _find_headers(table)
+        headers = _parse_table_headers(table)
         if not headers:
             continue
+
+        # Find data rows (skip rows used as headers)
+        data_rows = []
+        # If we used thead, data rows are in tbody or after thead rows
+        if table.find('thead'):
+            tbody = table.find('tbody')
+            if tbody:
+                data_rows = tbody.find_all('tr')
+            else:
+                # No tbody: all rows after thead
+                all_rows = table.find_all('tr')
+                thead_rows = table.find('thead').find_all('tr')
+                data_rows = [r for r in all_rows if r not in thead_rows]
+        else:
+            # No thead: skip first row (used as header)
+            all_rows = table.find_all('tr')
+            if len(all_rows) > 1:
+                data_rows = all_rows[1:]
 
         for row in data_rows:
             cells = row.find_all(['td', 'th'])
             if not cells:
                 continue
-            if len(cells) > len(headers):
-                continue
-            record = {
-                headers[i]: c.get_text(separator=' ', strip=True)
-                for i, c in enumerate(cells)
-            }
-            if any(v for v in record.values()):
+            # Map cells to headers (truncate or pad)
+            record = {}
+            for i, cell in enumerate(cells):
+                if i >= len(headers):
+                    break
+                text = _get_cell_text(cell)
+                if text:
+                    record[headers[i]] = text
+            if record:
                 results.append(record)
 
     return results
@@ -291,7 +319,7 @@ def _fetch_js(url: str):
     return response
 
 # ═══════════════════════════════════════════════════════════
-# CORE SCRAPE LOGIC
+# CORE SCRAPE LOGIC (exposed for telegram bot)
 # ═══════════════════════════════════════════════════════════
 async def _scrape_url(url: str, js: bool = False) -> tuple[List[Dict[str, Any]], int]:
     if not _is_safe_url(url):
@@ -299,10 +327,7 @@ async def _scrape_url(url: str, js: bool = False) -> tuple[List[Dict[str, Any]],
             status_code=403,
             detail="FORBIDDEN_DOMAIN — private/loopback addresses are blocked."
         )
-
     loop = asyncio.get_running_loop()
-
-    # ── Fetch ──────────────────────────────────────────────
     try:
         if js:
             response = await loop.run_in_executor(None, _fetch_js, url)
@@ -310,31 +335,23 @@ async def _scrape_url(url: str, js: bool = False) -> tuple[List[Dict[str, Any]],
             response = await loop.run_in_executor(None, _fetch_static, url)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
-
-    # ── Extract raw bytes from Scrapling response ──────────
     try:
         raw = _get_raw_bytes(response)
     except ValueError as e:
         raise HTTPException(status_code=502, detail=str(e))
-
     raw_bytes = len(raw)
     print(f"[SCRAPE] {url} → {raw_bytes} bytes fetched (js={js})")
-
     if raw_bytes == 0:
         raise HTTPException(status_code=502, detail="Fetcher returned empty body — page may require JS rendering (enable JS context) or is blocking scrapers.")
-
     if raw_bytes > MAX_PAYLOAD_SIZE:
         raise HTTPException(
             status_code=413,
             detail=f"Payload too large ({raw_bytes / 1_048_576:.1f} MB > 10 MB limit)."
         )
-
-    # ── Parse tables ───────────────────────────────────────
     try:
         rows = await loop.run_in_executor(cpu_executor, _extract_worker, raw)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Table extraction failed: {e}")
-
     print(f"[SCRAPE] {url} → {len(rows)} rows extracted")
     return rows, raw_bytes
 
@@ -361,7 +378,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 # ── Frontend ──────────────────────────────────────────────────────────────────
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
-    base_dir  = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     html_path = os.path.join(base_dir, "index.html")
     if os.path.exists(html_path):
         return FileResponse(html_path)
@@ -379,14 +396,14 @@ async def get_api_key():
 @app.get("/api/health")
 async def health():
     return {
-        "status":              "ok",
-        "version":             "7.5.0",
-        "fetcher_available":   _FETCHER_AVAILABLE,
-        "stealth_available":   _STEALTH_AVAILABLE,
-        "utc":                 datetime.now(timezone.utc).isoformat(),
+        "status": "ok",
+        "version": "7.5.0",
+        "fetcher_available": _FETCHER_AVAILABLE,
+        "stealth_available": _STEALTH_AVAILABLE,
+        "utc": datetime.now(timezone.utc).isoformat(),
     }
 
-# ── Debug endpoint — test fetcher directly, returns content preview ───────────
+# ── Debug endpoint ───────────────────────────────────────────────────────────
 @app.get("/api/debug-fetch")
 async def debug_fetch(url: str, _key: str = Depends(verify_key)):
     if not _is_safe_url(url):
@@ -396,15 +413,15 @@ async def debug_fetch(url: str, _key: str = Depends(verify_key)):
         response = await loop.run_in_executor(None, _fetch_static, url)
         raw = _get_raw_bytes(response)
         return {
-            "url":        url,
-            "raw_bytes":  len(raw),
-            "preview":    raw[:500].decode('utf-8', errors='replace'),
+            "url": url,
+            "raw_bytes": len(raw),
+            "preview": raw[:500].decode('utf-8', errors='replace'),
             "attrs_found": [a for a in dir(response) if not a.startswith('_') and not callable(getattr(response, a, None))],
         }
     except Exception as e:
         return {"url": url, "error": str(e)}
 
-# ── Scrape ─────────────────────────────────────────────────────────────────────
+# ── Scrape endpoint ──────────────────────────────────────────────────────────
 @app.post("/api/scrape", response_model=ScrapeResponse)
 async def scrape(
     body: ScrapeRequest,
@@ -415,7 +432,7 @@ async def scrape(
     elapsed = round(time.perf_counter() - t0, 3)
     return ScrapeResponse(events=rows, raw_bytes=raw_bytes, elapsed=elapsed)
 
-# ── Token status ───────────────────────────────────────────────────────────────
+# ── Token status (mock) ──────────────────────────────────────────────────────
 @app.get("/api/token-status")
 async def token_status(_key: str = Depends(verify_key)):
     return {
@@ -426,10 +443,7 @@ async def token_status(_key: str = Depends(verify_key)):
     }
 
 # ═══════════════════════════════════════════════════════════
-# TELEGRAM BOT LIFESPAN (replaces old @app.on_event)
-# ═══════════════════════════════════════════════════════════
-# ═══════════════════════════════════════════════════════════
-# STARTUP & SHUTDOWN (Telegram bot)
+# TELEGRAM BOT STARTUP & SHUTDOWN (thread‑based)
 # ═══════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def startup_telegram():
@@ -449,6 +463,7 @@ async def shutdown_telegram():
         stop_bot()
     except ImportError:
         pass
+
 # ═══════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════
@@ -457,4 +472,4 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000)),
-    )
+        )
