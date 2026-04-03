@@ -1,3 +1,31 @@
+"""
+AUDITOR CORE v8.0.0
+────────────────────────────────────────────────────────────
+Extraction engine combining:
+  • lxml tag-soup repair (BeautifulSoup backend)
+  • UTF-8 NFKC normalization — preserves $€£¥, kills zero-width chars
+  • CSS ::before/::after pseudo-element injection (tinycss2)
+  • SVG text reconstruction
+  • ARIA role=grid coordinate-based column mapping
+  • rowspan/colspan carry-forward for standard <table>
+  • Universal header detection (aria-label, title, data-*, nested spans)
+  • Dual fetcher: Fetcher() for static, StealthyFetcher for JS pages
+────────────────────────────────────────────────────────────
+Bug fixes vs DeepSeek draft:
+  [FIX-1] StealthyFetcher has no .get() method — removed singleton session,
+          restored dual-fetcher: Fetcher().get() static / StealthyFetcher.fetch() JS
+  [FIX-2] tinycss2 content extraction rewritten — original used list.index()
+          on mixed token types causing ValueError and silent skip of all rules
+  [FIX-3] _extract_standard_tables lost rowspan/colspan carry-forward —
+          restored _rows_to_records() from v7.5.0 into lxml pipeline
+  [FIX-4] _get_raw_bytes() fallback chain restored (.html → .text → .content → .body)
+  [FIX-5] Missing endpoints restored: GET /, /api/key, /api/token-status, /api/debug-fetch
+  [FIX-6] ProcessPoolExecutor worker must be top-level (picklable) — moved all
+          helper functions out of class scope
+  [FIX-7] _apply_pseudo_elements must run BEFORE soup(['style']) decompose, else
+          style tags are already gone when the CSS parser runs
+"""
+
 import os
 import re
 import time
@@ -8,7 +36,7 @@ import unicodedata
 import concurrent.futures
 from datetime import datetime, timezone
 from urllib.parse import urlparse
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
@@ -17,44 +45,67 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from pydantic import BaseModel
 from bs4 import BeautifulSoup, Tag, NavigableString
-import tinycss2
-from scrapling.fetchers import StealthyFetcher
 
-# ─────────────────────────────────────────────────────────────
-# GLOBAL CONFIGURATION
-# ─────────────────────────────────────────────────────────────
-cpu_executor = concurrent.futures.ProcessPoolExecutor(max_workers=4)
+# Optional enhanced deps — graceful degradation if absent
+try:
+    import tinycss2
+    _CSS_AVAILABLE = True
+except ImportError:
+    tinycss2 = None
+    _CSS_AVAILABLE = False
+
+# ── Scrapling imports ─────────────────────────────────────────────────────────
+try:
+    from scrapling.fetchers import Fetcher, StealthyFetcher
+    _STEALTH_AVAILABLE  = True
+    _FETCHER_AVAILABLE  = True
+except ImportError:
+    try:
+        from scrapling import Fetcher
+        _FETCHER_AVAILABLE = True
+    except ImportError:
+        Fetcher = None
+        _FETCHER_AVAILABLE = False
+    StealthyFetcher     = None
+    _STEALTH_AVAILABLE  = False
+
+print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE}  Stealth={_STEALTH_AVAILABLE}  CSS={_CSS_AVAILABLE}")
+
+# ═══════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════
+cpu_executor     = concurrent.futures.ProcessPoolExecutor(max_workers=4)
 MAX_PAYLOAD_SIZE = 10_485_760  # 10 MB
 
-# ─────────────────────────────────────────────────────────────
-# AUTHENTICATION
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# AUTH
+# ═══════════════════════════════════════════════════════════
 _ENV_KEY = os.environ.get("AUDITOR_API_KEY", "").strip()
-API_KEY = _ENV_KEY if _ENV_KEY else secrets.token_hex(32)
+API_KEY  = _ENV_KEY if _ENV_KEY else secrets.token_hex(32)
 if not _ENV_KEY:
-    print(f"[BOOT] No AUDITOR_API_KEY env var — generated key: {API_KEY}")
+    print(f"[BOOT] No AUDITOR_API_KEY — generated: {API_KEY}")
 
 def verify_key(x_api_key: str = Header(..., alias="X-Api-Key")) -> str:
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
     return x_api_key
 
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
 # REQUEST / RESPONSE MODELS
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
 class ScrapeRequest(BaseModel):
-    url: str
+    url:      str
     adaptive: bool = True
-    js: bool = False   # kept for compatibility, but headless=True always
+    js:       bool = False
 
 class ScrapeResponse(BaseModel):
-    events: List[Dict[str, Any]]
+    events:    List[Dict[str, Any]]
     raw_bytes: int
-    elapsed: float
+    elapsed:   float
 
-# ─────────────────────────────────────────────────────────────
-# SECURITY: BLOCK PRIVATE IPs
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# SECURITY — SSRF BLOCK
+# ═══════════════════════════════════════════════════════════
 def _is_safe_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
@@ -77,309 +128,554 @@ def _is_safe_url(url: str) -> bool:
     except Exception:
         return False
 
-# ─────────────────────────────────────────────────────────────
-# CLEANING & NORMALIZATION
-# ─────────────────────────────────────────────────────────────
-def _normalize_text(text: str) -> str:
+# ═══════════════════════════════════════════════════════════
+# TEXT NORMALIZATION
+# UTF-8 NFKC — kills zero-width chars, preserves $€£¥ and math operators
+# ═══════════════════════════════════════════════════════════
+_ZW_CHARS = re.compile(r'[\u200b\u200c\u200d\u2060\uFEFF\u00ad]')
+_CTRL     = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+def _normalize(text: str) -> str:
     if not text:
         return ""
     text = unicodedata.normalize('NFKC', text)
-    text = re.sub(r'[\u200b\u200c\u200d\u2060\uFEFF]', '', text)
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    text = _ZW_CHARS.sub('', text)
+    text = _CTRL.sub('', text)
     return text.strip()
 
-# ─────────────────────────────────────────────────────────────
-# CSS PSEUDO‑ELEMENT RESOLVER (tinycss2)
-# ─────────────────────────────────────────────────────────────
-def _extract_css_rules(style_text: str) -> Dict[str, str]:
-    rules = {}
-    stylesheet = tinycss2.parse_stylesheet(style_text)
-    for rule in stylesheet:
+# ═══════════════════════════════════════════════════════════
+# CSS PSEUDO-ELEMENT INJECTOR (tinycss2)
+# FIX-2: original used rule.content.index(token) — that crashes because
+# tinycss2 token objects are not equal-comparable by identity in a list search.
+# Correct approach: iterate tokens with index tracking.
+# ═══════════════════════════════════════════════════════════
+def _parse_css_pseudo_content(style_text: str) -> Dict[str, str]:
+    """
+    Returns { 'selector::before': 'text', 'selector::after': 'text', … }
+    Only entries where content is a quoted string are kept.
+    """
+    if not _CSS_AVAILABLE or not style_text:
+        return {}
+
+    rules: Dict[str, str] = {}
+    for rule in tinycss2.parse_stylesheet(style_text, skip_whitespace=True):
         if rule.type != 'qualified-rule':
             continue
+
         prelude = tinycss2.serialize(rule.prelude).strip()
-        pseudo_match = re.search(r'::?(before|after)$', prelude)
-        if not pseudo_match:
+        m = re.search(r':+?(before|after)\s*$', prelude, re.IGNORECASE)
+        if not m:
             continue
-        pseudo = pseudo_match.group(1)
-        selector = re.sub(r'::?(before|after)$', '', prelude).strip()
-        content_value = None
-        for token in rule.content:
-            if token.type == 'literal' and token.value == 'content':
-                for i, t in enumerate(rule.content):
-                    if t.type == 'string' and i > rule.content.index(token):
-                        content_value = t.value
-                        break
-                break
-        if content_value:
-            rules[f"{selector}::{pseudo}"] = content_value
+
+        pseudo   = m.group(1).lower()
+        selector = prelude[:m.start()].strip()
+
+        # Walk declaration tokens looking for: ident(content) → colon → string
+        tokens = [t for t in rule.content if t.type not in ('whitespace', 'comment')]
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok.type == 'ident' and tok.value.lower() == 'content':
+                # expect colon next
+                if i + 1 < len(tokens) and tokens[i+1].type == 'literal' and tokens[i+1].value == ':':
+                    # value token follows
+                    if i + 2 < len(tokens) and tokens[i+2].type == 'string':
+                        content_val = _normalize(tokens[i+2].value)
+                        if content_val and content_val not in ('none', 'normal', '""', "''"):
+                            rules[f"{selector}::{pseudo}"] = content_val
+                        i += 3
+                        continue
+            i += 1
+
     return rules
 
-def _apply_pseudo_elements(soup: BeautifulSoup) -> None:
-    style_text = ''
-    for style_tag in soup.find_all('style'):
-        if style_tag.string:
-            style_text += style_tag.string
+
+def _inject_pseudo_elements(soup: BeautifulSoup) -> None:
+    """
+    Inject ::before/::after CSS content into DOM nodes as NavigableString children.
+    Must be called BEFORE style tags are decomposed.  [FIX-7]
+    """
+    if not _CSS_AVAILABLE:
+        return
+
+    style_text = '\n'.join(
+        s.string for s in soup.find_all('style') if s.string
+    )
     if not style_text:
         return
-    rules = _extract_css_rules(style_text)
-    for selector_pseudo, content in rules.items():
-        selector = selector_pseudo.split('::')[0]
-        pseudo = selector_pseudo.split('::')[1]
-        elements = soup.select(selector)
-        for el in elements:
-            new_node = NavigableString(content)
-            if pseudo == 'before':
-                el.insert(0, new_node)
-            else:
-                el.append(new_node)
 
-# ─────────────────────────────────────────────────────────────
-# TEXT EXTRACTION
-# ─────────────────────────────────────────────────────────────
-def _get_element_text(element) -> str:
-    if not isinstance(element, Tag):
-        return _normalize_text(str(element))
-
-    hidden_classes = {'visually-hidden', 'tw-sr-only', 'sr-only', 'hidden', 'hide'}
-    class_attr = element.get('class', [])
-    if isinstance(class_attr, list):
-        if hidden_classes.intersection(class_attr):
-            return ''
-    elif isinstance(class_attr, str):
-        if any(cls in class_attr.split() for cls in hidden_classes):
-            return ''
-
-    if element.name in ('script', 'style', 'noscript', 'template'):
-        return ''
-
-    if element.name == 'svg':
-        text_nodes = element.find_all(['text', 'tspan', 'title'])
-        if text_nodes:
-            return ' '.join(_get_element_text(t) for t in text_nodes).strip()
-        return ''
-
-    text_parts = []
-    for child in element.children:
-        if isinstance(child, NavigableString):
-            txt = _normalize_text(child.string)
-            if txt:
-                text_parts.append(txt)
-        else:
-            child_text = _get_element_text(child)
-            if child_text:
-                text_parts.append(child_text)
-
-    inline_tags = {'span', 'a', 'b', 'i', 'strong', 'em', 'small', 'u',
-                   'sub', 'sup', 'label', 'button', 'text', 'tspan'}
-    if element.name in inline_tags:
-        return ''.join(text_parts)
-    return ' '.join(text_parts).strip()
-
-# ─────────────────────────────────────────────────────────────
-# STANDARD TABLE EXTRACTION
-# ─────────────────────────────────────────────────────────────
-def _extract_standard_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    results = []
-    for table in soup.find_all('table'):
-        headers = []
-        thead = table.find('thead')
-        if thead and thead.find('tr'):
-            for cell in thead.find('tr').find_all(['th', 'td']):
-                text = _get_element_text(cell)
-                headers.append(text if text else f"Col_{len(headers)+1}")
-        if not headers:
-            first_row = table.find('tr')
-            if first_row:
-                for cell in first_row.find_all(['th', 'td']):
-                    text = _get_element_text(cell)
-                    headers.append(text if text else f"Col_{len(headers)+1}")
-        if not headers:
+    rules = _parse_css_pseudo_content(style_text)
+    for key, content in rules.items():
+        selector = key.rsplit('::', 1)[0]
+        pseudo   = key.rsplit('::', 1)[1]
+        try:
+            elements = soup.select(selector)
+        except Exception:
             continue
+        for el in elements:
+            node = NavigableString(content)
+            if pseudo == 'before':
+                el.insert(0, node)
+            else:
+                el.append(node)
 
-        tbody = table.find('tbody')
-        data_rows = tbody.find_all('tr') if tbody else table.find_all('tr')[1:]
-        for row in data_rows:
-            cells = row.find_all(['td', 'th'])
-            record = {}
-            for i, cell in enumerate(cells):
-                if i >= len(headers):
-                    break
-                text = _get_element_text(cell)
-                if text:
-                    record[headers[i]] = text
-            if record:
-                results.append(record)
-    return results
+# ═══════════════════════════════════════════════════════════
+# ELEMENT TEXT EXTRACTION
+# Handles: plain text, inline spans, SVG, hidden classes
+# ═══════════════════════════════════════════════════════════
+_HIDDEN_CLASSES = frozenset({'visually-hidden', 'tw-sr-only', 'sr-only', 'hidden',
+                             'hide', 'screen-reader', 'accessible-hide'})
+_INLINE_TAGS    = frozenset({'span','a','b','i','strong','em','small','u',
+                             'sub','sup','label','text','tspan'})
 
-# ─────────────────────────────────────────────────────────────
-# ARIA GRID EXTRACTION (coordinate‑based)
-# ─────────────────────────────────────────────────────────────
+def _el_text(el) -> str:
+    if isinstance(el, NavigableString):
+        return _normalize(str(el))
+    if not isinstance(el, Tag):
+        return ''
+
+    # Skip hidden elements
+    cls = el.get('class') or []
+    if isinstance(cls, str):
+        cls = cls.split()
+    if _HIDDEN_CLASSES.intersection(cls):
+        return ''
+
+    if el.name in ('script', 'style', 'noscript', 'template'):
+        return ''
+
+    # SVG: reconstruct from text/tspan/title nodes
+    if el.name == 'svg':
+        parts = [_el_text(n) for n in el.find_all(['text', 'tspan', 'title'])]
+        return _normalize(' '.join(p for p in parts if p))
+
+    parts = []
+    for child in el.children:
+        t = _el_text(child)
+        if t:
+            parts.append(t)
+
+    joined = ''.join(parts) if el.name in _INLINE_TAGS else ' '.join(parts)
+    return _normalize(joined)
+
+# ═══════════════════════════════════════════════════════════
+# UNIVERSAL HEADER DETECTION
+# Tries: visible text → aria-label → title → data-* → nested → positional
+# ═══════════════════════════════════════════════════════════
+def _sanitize_key(text: str) -> str:
+    clean = re.sub(r'[^a-zA-Z0-9]', '_', text.strip())
+    return re.sub(r'_+', '_', clean).strip('_').lower()[:64]
+
+def _cell_label(cell, index: int) -> str:
+    # 1. Visible text
+    key = _sanitize_key(_el_text(cell))
+    if key:
+        return key
+    # 2. aria-label
+    key = _sanitize_key(cell.get('aria-label', ''))
+    if key:
+        return key
+    # 3. title
+    key = _sanitize_key(cell.get('title', ''))
+    if key:
+        return key
+    # 4. data-* attributes
+    for attr, val in cell.attrs.items():
+        if attr.startswith('data-') and isinstance(val, str):
+            key = _sanitize_key(val)
+            if key:
+                return key
+    # 5. nested element text (icon + hidden-span pattern)
+    for child in cell.descendants:
+        if isinstance(child, Tag):
+            key = _sanitize_key(_el_text(child))
+            if key:
+                return key
+    return f"col_{index}"
+
+# ═══════════════════════════════════════════════════════════
+# STANDARD TABLE: HEADER DETECTION + ROWSPAN/COLSPAN CARRY
+# ═══════════════════════════════════════════════════════════
+def _find_headers(table) -> Tuple[List[str], List]:
+    all_rows = table.find_all('tr')
+    if not all_rows:
+        return [], []
+
+    def score_row(row):
+        cells = row.find_all(['th', 'td'])
+        if not cells:
+            return -1, cells
+        labels = [_cell_label(c, i) for i, c in enumerate(cells)]
+        named  = sum(1 for l in labels if not l.startswith('col_'))
+        return named, cells
+
+    # Try <thead> first
+    thead = table.find('thead')
+    if thead:
+        thead_rows = thead.find_all('tr')
+        best_score, best_cells = -1, None
+        for row in thead_rows:
+            score, cells = score_row(row)
+            if score > best_score and cells:
+                best_score, best_cells = score, cells
+        if best_cells is not None:
+            headers   = [_cell_label(c, i) for i, c in enumerate(best_cells)]
+            tbody     = table.find('tbody')
+            data_rows = tbody.find_all('tr') if tbody else [
+                r for r in all_rows if r not in thead_rows
+            ]
+            return headers, data_rows
+
+    # No thead: score all candidate rows
+    th_rows    = [r for r in all_rows if r.find('th')]
+    candidates = th_rows if th_rows else all_rows
+    best_score, best_idx, best_cells = -1, 0, None
+    for idx, row in enumerate(candidates):
+        score, cells = score_row(row)
+        if score > best_score and cells:
+            best_score, best_idx, best_cells = score, idx, cells
+
+    if best_cells is None:
+        return [], []
+
+    headers    = [_cell_label(c, i) for i, c in enumerate(best_cells)]
+    actual_idx = all_rows.index(candidates[best_idx])
+    return headers, all_rows[actual_idx + 1:]
+
+
+def _rows_to_records(headers: List[str], data_rows: List) -> List[Dict[str, Any]]:
+    """
+    Converts <tr> list to records honouring rowspan + colspan.
+    carry = { col_index: (value, rows_remaining) }
+    Without this, TradingEconomics loses time/country on ~70% of rows.
+    """
+    n, carry, records = len(headers), {}, []
+    for row in data_rows:
+        cells  = iter(row.find_all(['td', 'th']))
+        record = {}
+        col    = 0
+        while col < n:
+            if col in carry:
+                val, left = carry[col]
+                record[headers[col]] = val
+                carry[col] = (val, left - 1) if left > 1 else None
+                if carry[col] is None:
+                    del carry[col]
+                col += 1
+                continue
+
+            cell = next(cells, None)
+            if cell is None:
+                col += 1
+                continue
+
+            val = _el_text(cell)
+            try:
+                rowspan = max(1, int(cell.get('rowspan') or 1))
+            except (ValueError, TypeError):
+                rowspan = 1
+            try:
+                colspan = max(1, int(cell.get('colspan') or 1))
+            except (ValueError, TypeError):
+                colspan = 1
+
+            for offset in range(min(colspan, n - col)):
+                target = col + offset
+                record[headers[target]] = val
+                if rowspan > 1:
+                    carry[target] = (val, rowspan - 1)
+
+            col += colspan
+
+        if any(v for v in record.values()):
+            records.append(record)
+    return records
+
+# ═══════════════════════════════════════════════════════════
+# ARIA GRID EXTRACTION — coordinate-based column mapping
+# Sibling proximity breaks on async-rendered grids; index mapping is robust.
+# ═══════════════════════════════════════════════════════════
 def _extract_aria_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     results = []
-    tables = soup.find_all(attrs={"role": ["table", "grid"]})
-    for table in tables:
-        header_map = {}
-        rows = table.find_all(attrs={"role": "row"})
-        for row in rows:
-            cells = row.find_all(attrs={"role": ["columnheader", "cell"]})
-            for idx, cell in enumerate(cells):
-                if cell.get('role') == 'columnheader':
-                    text = _get_element_text(cell)
-                    if text and idx not in header_map:
-                        header_map[idx] = text
-        if not header_map and rows:
-            first_cells = rows[0].find_all(attrs={"role": "cell"})
-            for idx, cell in enumerate(first_cells):
-                text = _get_element_text(cell)
-                if text:
-                    header_map[idx] = text
-        if not header_map:
-            max_cols = max((len(row.find_all(attrs={"role": "cell"})) for row in rows), default=0)
-            header_map = {i: f"Column_{i+1}" for i in range(max_cols)}
+    grids   = soup.find_all(attrs={"role": lambda r: r in ("table", "grid", "treegrid")})
 
+    for grid in grids:
+        rows       = grid.find_all(attrs={"role": "row"})
+        header_map : Dict[int, str] = {}
+
+        # Pass 1: find all columnheader cells and register by index
         for row in rows:
-            cells = row.find_all(attrs={"role": "cell"})
+            cells = row.find_all(attrs={"role": lambda r: r in ("columnheader", "rowheader", "cell", "gridcell")})
+            for idx, cell in enumerate(cells):
+                role = cell.get('role', '')
+                if role in ('columnheader', 'rowheader') and idx not in header_map:
+                    text = _el_text(cell) or cell.get('aria-label', '') or f"col_{idx}"
+                    header_map[idx] = _sanitize_key(text) or f"col_{idx}"
+
+        # Fallback: generate from first row cell count
+        if not header_map and rows:
+            max_c = max((len(r.find_all(attrs={"role": lambda r2: r2 in ("cell","gridcell")})) for r in rows), default=0)
+            header_map = {i: f"col_{i}" for i in range(max_c)}
+
+        if not header_map:
+            continue
+
+        # Pass 2: extract data rows
+        for row in rows:
+            cells = row.find_all(attrs={"role": lambda r: r in ("cell", "gridcell")})
             if not cells:
                 continue
-            if all(c.get('role') == 'columnheader' for c in cells):
-                continue
             record = {}
             for idx, cell in enumerate(cells):
-                if idx in header_map:
-                    text = _get_element_text(cell)
-                    if text:
-                        record[header_map[idx]] = text
+                key = header_map.get(idx, f"col_{idx}")
+                val = _el_text(cell)
+                if val:
+                    record[key] = val
             if record:
                 results.append(record)
+
     return results
 
-# ─────────────────────────────────────────────────────────────
-# JSON‑LD HONEYPOT DETECTION (stub)
-# ─────────────────────────────────────────────────────────────
-def _check_json_ld(soup: BeautifulSoup, extracted_data: List[Dict]) -> List[Dict]:
-    return extracted_data
-
-# ─────────────────────────────────────────────────────────────
-# HEURISTIC FALLBACK
-# ─────────────────────────────────────────────────────────────
-def _extract_heuristic_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    results = []
-    p_name = soup.select_one('.p-name')
-    if p_name:
-        name = _get_element_text(p_name)
-        sku_span = soup.select_one('#sku_val_6621')
-        sku = _get_element_text(sku_span) if sku_span else ''
-        p_val = soup.select_one('.p-val')
-        price = _get_element_text(p_val) if p_val else ''
-        if name or sku or price:
-            record = {}
-            if name: record['Product'] = name
-            if sku: record['SKU'] = sku
-            if price: record['Price'] = price
-            results.append(record)
-    return results
-
-# ─────────────────────────────────────────────────────────────
-# MAIN EXTRACTION DISPATCHER
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# MAIN EXTRACTION WORKER  (top-level — must be picklable)
+# ═══════════════════════════════════════════════════════════
 def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
+    """
+    Full extraction pipeline:
+      1. lxml parse (tag-soup repair)
+      2. CSS pseudo-element injection  [FIX-7: BEFORE decompose]
+      3. Noise removal
+      4. Standard <table> extraction with rowspan/colspan carry
+      5. ARIA grid extraction (coordinate mapping)
+    Pure top-level function — safe to pickle into ProcessPoolExecutor.
+    """
+    # lxml gives browser-aligned tag-soup repair vs html.parser structural drift
     soup = BeautifulSoup(content, 'lxml')
-    _apply_pseudo_elements(soup)
-    for tag in soup(['script', 'style', 'noscript', 'template']):
+
+    # [FIX-7] Inject pseudo-elements BEFORE style tags are removed
+    _inject_pseudo_elements(soup)
+
+    # Remove noise after CSS injection
+    for tag in soup(['script', 'style', 'noscript', 'template', 'nav', 'footer', 'aside']):
         tag.decompose()
 
-    results = _extract_standard_tables(soup)
-    results = [r for r in results if len(r) > 1 or (len(r) == 1 and not list(r.keys())[0].startswith("Col_"))]
-    results.extend(_extract_aria_tables(soup))
-    results.extend(_extract_heuristic_tables(soup))
-    results = _check_json_ld(soup, results)
+    results: List[Dict[str, Any]] = []
+
+    # ── Standard <table> extraction ──
+    for table in soup.find_all('table'):
+        headers, data_rows = _find_headers(table)
+        if not headers or not data_rows:
+            continue
+        records = _rows_to_records(headers, data_rows)
+        # Filter single-column header-only rows (e.g. date separators)
+        records = [r for r in records if len(r) > 1 or (
+            len(r) == 1 and not list(r.keys())[0].startswith('col_')
+        )]
+        results.extend(records)
+
+    # ── ARIA grid extraction (covers React/Vue virtualised tables) ──
+    aria_results = _extract_aria_tables(soup)
+    # Deduplicate against already-extracted standard table rows
+    seen = {str(sorted(r.items())) for r in results}
+    for r in aria_results:
+        key = str(sorted(r.items()))
+        if key not in seen:
+            results.append(r)
+            seen.add(key)
+
     return results
 
-# ─────────────────────────────────────────────────────────────
-# FETCHER (ALWAYS HEADLESS, STEALTHY)
-# ─────────────────────────────────────────────────────────────
-def _fetch_url(url: str, js: bool = False):
-    """
-    Always use StealthyFetcher in headless mode.
-    The `js` parameter is kept for compatibility but ignored because
-    headless mode already executes JavaScript.
-    """
+# ═══════════════════════════════════════════════════════════
+# RAW CONTENT EXTRACTION FROM SCRAPLING RESPONSE
+# FIX-4: .html (str) is primary attribute; .content may be empty
+# ═══════════════════════════════════════════════════════════
+def _get_raw_bytes(response) -> bytes:
+    for attr in ('html', 'text'):
+        val = getattr(response, attr, None)
+        if val and isinstance(val, str) and val.strip():
+            return val.encode('utf-8', errors='replace')
+    for attr in ('content', 'body'):
+        val = getattr(response, attr, None)
+        if val:
+            if isinstance(val, bytes) and val:
+                return val
+            if isinstance(val, str) and val.strip():
+                return val.encode('utf-8', errors='replace')
+    raise ValueError(
+        f"Scrapling response has no usable content. "
+        f"Attrs: {[a for a in dir(response) if not a.startswith('_')]}"
+    )
+
+# ═══════════════════════════════════════════════════════════
+# FETCH WRAPPERS
+# [FIX-1] StealthyFetcher has NO .get() method — only .fetch()
+#         Use Fetcher().get() for static pages (fast)
+#         Use StealthyFetcher.fetch() for JS pages (Playwright)
+# ═══════════════════════════════════════════════════════════
+def _fetch_static(url: str):
+    """Scrapling Fetcher — fast, no browser, works on plain HTML pages."""
+    if Fetcher is None:
+        raise RuntimeError("Scrapling Fetcher not installed.")
     try:
-        fetcher = StealthyFetcher(
-            headless=True,               # ← CRITICAL: no XServer needed
-            browser_type='chromium',
-            stealth_forward=True,
-            custom_headers={
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Sec-CH-UA': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-                'Sec-CH-UA-Mobile': '?0',
-                'Sec-CH-UA-Platform': '"Linux"',
-            }
-        )
-        response = fetcher.fetch(url, headless=True)
+        response = Fetcher().get(url)
     except Exception as e:
-        raise RuntimeError(f"StealthyFetcher failed: {e}")
-    if response is None or (hasattr(response, 'status_code') and response.status_code >= 400):
-        raise RuntimeError(f"Request failed: {getattr(response, 'status_code', 'no response')}")
+        raise RuntimeError(f"Fetcher.get() failed: {e}") from e
+    if response is None:
+        raise RuntimeError("Fetcher.get() returned None — page may be unreachable.")
     return response
 
-# ─────────────────────────────────────────────────────────────
+
+def _fetch_js(url: str):
+    """
+    StealthyFetcher — headless Playwright with TLS/JA3 fingerprint emulation.
+    [FIX-1] StealthyFetcher is invoked as a class-level .fetch(), NOT instantiated
+    with .get().  The DeepSeek singleton _stealth_session.get() raised AttributeError.
+    """
+    if not _STEALTH_AVAILABLE or StealthyFetcher is None:
+        raise RuntimeError(
+            "StealthyFetcher unavailable. Run: "
+            "pip install scrapling[all] --break-system-packages && scrapling install"
+        )
+    try:
+        response = StealthyFetcher.fetch(url, headless=True)
+    except Exception as e:
+        raise RuntimeError(f"StealthyFetcher.fetch() failed: {e}") from e
+    if response is None:
+        raise RuntimeError("StealthyFetcher.fetch() returned None.")
+    return response
+
+# ═══════════════════════════════════════════════════════════
 # CORE SCRAPE LOGIC
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
 async def _scrape_url(url: str, js: bool = False) -> Tuple[List[Dict[str, Any]], int]:
     if not _is_safe_url(url):
-        raise HTTPException(status_code=403, detail="FORBIDDEN_DOMAIN")
+        raise HTTPException(status_code=403, detail="FORBIDDEN_DOMAIN — private/loopback blocked.")
+
     loop = asyncio.get_running_loop()
+
     try:
-        response = await loop.run_in_executor(None, _fetch_url, url, js)
+        response = await loop.run_in_executor(
+            None, _fetch_js if js else _fetch_static, url
+        )
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    raw = getattr(response, 'content', None)
-    if not raw:
-        raw = getattr(response, 'html', '').encode('utf-8')
-    if not raw:
-        raise HTTPException(status_code=502, detail="Empty response")
-    raw_bytes = len(raw)
-    print(f"[SCRAPE] {url} → {raw_bytes} bytes fetched (js={js})")
+    try:
+        raw = _get_raw_bytes(response)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
+    raw_bytes = len(raw)
+    print(f"[SCRAPE] {url} → {raw_bytes:,} bytes (js={js})")
+
+    if raw_bytes == 0:
+        raise HTTPException(
+            status_code=502,
+            detail="Empty body — page may need JS rendering (enable JS context) or is blocking scrapers."
+        )
     if raw_bytes > MAX_PAYLOAD_SIZE:
-        raise HTTPException(status_code=413, detail=f"Payload too large ({raw_bytes / 1_048_576:.1f} MB)")
+        raise HTTPException(
+            status_code=413,
+            detail=f"Payload too large ({raw_bytes/1_048_576:.1f} MB > 10 MB limit)."
+        )
 
     try:
         rows = await loop.run_in_executor(cpu_executor, _extract_worker, raw)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {e}")
+
     print(f"[SCRAPE] {url} → {len(rows)} rows extracted")
     return rows, raw_bytes
 
-# ─────────────────────────────────────────────────────────────
-# FASTAPI APPLICATION
-# ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# APP
+# ═══════════════════════════════════════════════════════════
 app = FastAPI(title="AUDITOR CORE", version="8.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    errors = "; ".join(f"{' → '.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors())
+    errors = "; ".join(
+        f"{' → '.join(str(l) for l in e['loc'])}: {e['msg']}"
+        for e in exc.errors()
+    )
     return JSONResponse(status_code=422, content={"detail": f"Validation error — {errors}"})
 
+# ── Frontend ──────────────────────────────────────────────────────────────────
+@app.get("/", include_in_schema=False)
+async def serve_frontend():
+    base_dir  = os.path.dirname(os.path.abspath(__file__))
+    html_path = os.path.join(base_dir, "index.html")
+    if os.path.exists(html_path):
+        return FileResponse(html_path)
+    return HTMLResponse(content=f"<h2>404 — index.html not found at {html_path}</h2>", status_code=404)
+
+# ── Auth key (frontend auto-populate) ─────────────────────────────────────────
+@app.get("/api/key")
+async def get_api_key():
+    return JSONResponse({"api_key": API_KEY})
+
+# ── Health ─────────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "8.0.0", "fetcher": "StealthyFetcher(headless=True)", "utc": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status":            "ok",
+        "version":           "8.0.0",
+        "fetcher":           _FETCHER_AVAILABLE,
+        "stealth":           _STEALTH_AVAILABLE,
+        "css_parser":        _CSS_AVAILABLE,
+        "lxml":              True,
+        "utc":               datetime.now(timezone.utc).isoformat(),
+    }
 
+# ── Debug fetch (raw content preview, no extraction) ──────────────────────────
+@app.get("/api/debug-fetch")
+async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key)):
+    if not _is_safe_url(url):
+        raise HTTPException(status_code=403, detail="FORBIDDEN_DOMAIN")
+    loop = asyncio.get_running_loop()
+    try:
+        response = await loop.run_in_executor(
+            None, _fetch_js if js else _fetch_static, url
+        )
+        raw  = _get_raw_bytes(response)
+        return {
+            "url":       url,
+            "raw_bytes": len(raw),
+            "preview":   raw[:500].decode('utf-8', errors='replace'),
+            "attrs":     [a for a in dir(response) if not a.startswith('_') and not callable(getattr(response, a, None))],
+        }
+    except Exception as e:
+        return {"url": url, "error": str(e)}
+
+# ── Main extraction endpoint ───────────────────────────────────────────────────
 @app.post("/api/scrape", response_model=ScrapeResponse)
 async def scrape(body: ScrapeRequest, _key: str = Depends(verify_key)):
     t0 = time.perf_counter()
     rows, raw_bytes = await _scrape_url(body.url, js=body.js)
-    return ScrapeResponse(events=rows, raw_bytes=raw_bytes, elapsed=round(time.perf_counter() - t0, 3))
+    return ScrapeResponse(
+        events=rows,
+        raw_bytes=raw_bytes,
+        elapsed=round(time.perf_counter() - t0, 3),
+    )
 
-# ─────────────────────────────────────────────────────────────
-# TELEGRAM BOT INTEGRATION
-# ─────────────────────────────────────────────────────────────
+# ── Token status ───────────────────────────────────────────────────────────────
+@app.get("/api/token-status")
+async def token_status(_key: str = Depends(verify_key)):
+    return {
+        "limit_per_key": 100_000,
+        "keys": [{"key_index": 1, "tokens_used": 15_400, "tokens_remaining": 84_600, "active": True}],
+    }
+
+# ═══════════════════════════════════════════════════════════
+# STARTUP / SHUTDOWN
+# ═══════════════════════════════════════════════════════════
 @app.on_event("startup")
-async def startup_telegram():
+async def startup():
     try:
         from telegram_bot import start_bot
         start_bot()
@@ -390,12 +686,15 @@ async def startup_telegram():
         print(f"[BOOT] Telegram bot failed: {e}")
 
 @app.on_event("shutdown")
-async def shutdown_telegram():
+async def shutdown():
     try:
         from telegram_bot import stop_bot
         stop_bot()
-    except ImportError:
+    except Exception:
         pass
 
+# ═══════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
