@@ -8,7 +8,7 @@ import unicodedata
 import concurrent.futures
 from datetime import datetime, timezone
 from urllib.parse import urlparse
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Tuple
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
@@ -45,7 +45,7 @@ def verify_key(x_api_key: str = Header(..., alias="X-Api-Key")) -> str:
 class ScrapeRequest(BaseModel):
     url: str
     adaptive: bool = True
-    js: bool = False
+    js: bool = False   # kept for compatibility, but headless=True always
 
 class ScrapeResponse(BaseModel):
     events: List[Dict[str, Any]]
@@ -78,7 +78,7 @@ def _is_safe_url(url: str) -> bool:
         return False
 
 # ─────────────────────────────────────────────────────────────
-# CLEANING & NORMALIZATION (UTF‑8 safe, preserves currency)
+# CLEANING & NORMALIZATION
 # ─────────────────────────────────────────────────────────────
 def _normalize_text(text: str) -> str:
     if not text:
@@ -258,7 +258,6 @@ def _extract_aria_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
 # JSON‑LD HONEYPOT DETECTION (stub)
 # ─────────────────────────────────────────────────────────────
 def _check_json_ld(soup: BeautifulSoup, extracted_data: List[Dict]) -> List[Dict]:
-    # In production, implement cross‑reference. For now, return as is.
     return extracted_data
 
 # ─────────────────────────────────────────────────────────────
@@ -298,31 +297,27 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
     return results
 
 # ─────────────────────────────────────────────────────────────
-# FETCHER (ALWAYS STEALTHY – FIXED)
+# FETCHER (ALWAYS HEADLESS, STEALTHY)
 # ─────────────────────────────────────────────────────────────
-_stealth_session = None
-
-def _get_stealth_session():
-    global _stealth_session
-    if _stealth_session is None:
-        _stealth_session = StealthyFetcher(
-            headless=False,
+def _fetch_url(url: str, js: bool = False):
+    """
+    Always use StealthyFetcher in headless mode.
+    The `js` parameter is kept for compatibility but ignored because
+    headless mode already executes JavaScript.
+    """
+    try:
+        fetcher = StealthyFetcher(
+            headless=True,               # ← CRITICAL: no XServer needed
             browser_type='chromium',
             stealth_forward=True,
             custom_headers={
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Sec-CH-UA': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
                 'Sec-CH-UA-Mobile': '?0',
-                'Sec-CH-UA-Platform': '"Windows"',
+                'Sec-CH-UA-Platform': '"Linux"',
             }
         )
-    return _stealth_session
-
-def _fetch_url(url: str, js: bool = False):
-    """Always use StealthyFetcher.fetch(); js flag controls headless."""
-    fetcher = _get_stealth_session()
-    try:
-        response = fetcher.fetch(url, headless=js)
+        response = fetcher.fetch(url, headless=True)
     except Exception as e:
         raise RuntimeError(f"StealthyFetcher failed: {e}")
     if response is None or (hasattr(response, 'status_code') and response.status_code >= 400):
@@ -372,7 +367,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "8.0.0", "fetcher": "StealthyFetcher", "utc": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "version": "8.0.0", "fetcher": "StealthyFetcher(headless=True)", "utc": datetime.now(timezone.utc).isoformat()}
 
 @app.post("/api/scrape", response_model=ScrapeResponse)
 async def scrape(body: ScrapeRequest, _key: str = Depends(verify_key)):
