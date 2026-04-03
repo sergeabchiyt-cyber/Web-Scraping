@@ -1,21 +1,23 @@
 import os
 import re
+import time
 import secrets
 import asyncio
 import socket
 import concurrent.futures
 from datetime import datetime, timezone
 from urllib.parse import urlparse
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from pydantic import BaseModel
 from bs4 import BeautifulSoup
 
-# ── Dependencies ──────────────────────────────────────────────────────────────
+# ── Scrapling import ──────────────────────────────────────────────────────────
 try:
     from scrapling.fetchers import Fetcher, StealthyFetcher
     _STEALTH_AVAILABLE = True
@@ -28,9 +30,9 @@ except ImportError:
     _STEALTH_AVAILABLE = False
 
 # ═══════════════════════════════════════════════════════════
-# GLOBAL EXECUTOR & CONFIG
+# CONFIG
 # ═══════════════════════════════════════════════════════════
-cpu_executor = concurrent.futures.ProcessPoolExecutor(max_workers=4)
+cpu_executor    = concurrent.futures.ProcessPoolExecutor(max_workers=4)
 MAX_PAYLOAD_SIZE = 10_485_760  # 10 MB
 
 # ═══════════════════════════════════════════════════════════
@@ -39,10 +41,10 @@ MAX_PAYLOAD_SIZE = 10_485_760  # 10 MB
 _ENV_KEY = os.environ.get("AUDITOR_API_KEY", "").strip()
 API_KEY  = _ENV_KEY if _ENV_KEY else secrets.token_hex(32)
 if not _ENV_KEY:
-    print(f"[BOOT] No AUDITOR_API_KEY set — generated key: {API_KEY}")
+    print(f"[BOOT] No AUDITOR_API_KEY env var — generated key: {API_KEY}")
 
 def verify_key(x_api_key: str = Header(..., alias="X-Api-Key")) -> str:
-    """FastAPI dependency — validates X-Api-Key header on every protected route."""
+    """Dependency — validates X-Api-Key on every protected route."""
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
     return x_api_key
@@ -64,7 +66,7 @@ class ScrapeResponse(BaseModel):
 # SECURITY UTILITIES
 # ═══════════════════════════════════════════════════════════
 def _is_safe_url(url: str) -> bool:
-    """Blocks private/loopback IPs (SSRF protection)."""
+    """Blocks private / loopback IPs — SSRF protection."""
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ('http', 'https'):
@@ -91,12 +93,12 @@ def _sanitize_key(text: str) -> str:
     return re.sub(r'_+', '_', clean).strip('_').lower()[:64]
 
 # ═══════════════════════════════════════════════════════════
-# EXTRACTION WORKER (runs in ProcessPoolExecutor)
+# EXTRACTION WORKER  (runs in ProcessPoolExecutor — must be top-level)
 # ═══════════════════════════════════════════════════════════
 def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
     """
-    Pure-function HTML table extractor — safe to run in a subprocess.
-    Returns a flat list of row dicts, one dict per table row.
+    Pure-function HTML table extractor — safe to pickle and run in a subprocess.
+    Returns a flat list of row dicts keyed by sanitized column names.
     """
     soup = BeautifulSoup(content, 'html.parser')
     for tag in soup(['script', 'style', 'nav', 'footer', 'aside']):
@@ -107,12 +109,13 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
         rows = table.find_all('tr')
         if not rows:
             continue
+        header_cells = rows[0].find_all(['th', 'td'])
+        if not header_cells:
+            continue
         headers = [
             _sanitize_key(th.get_text(strip=True)) or f"col_{i}"
-            for i, th in enumerate(rows[0].find_all(['th', 'td']))
+            for i, th in enumerate(header_cells)
         ]
-        if not headers:
-            continue
         for row in rows[1:]:
             cells = row.find_all(['td', 'th'])
             if len(cells) != len(headers):
@@ -125,17 +128,24 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
 # ═══════════════════════════════════════════════════════════
 async def _scrape_url(url: str, js: bool = False) -> tuple[List[Dict[str, Any]], int]:
     """
-    Fetches `url` with Scrapling (static or headless) and extracts tables.
+    Fetches `url` and extracts all HTML tables.
     Returns (rows, raw_byte_count).
+    Raises HTTPException on blocked domain, missing dependency, or oversized payload.
     """
     if not _is_safe_url(url):
-        raise HTTPException(status_code=403, detail="FORBIDDEN_DOMAIN — private/loopback addresses are not allowed.")
+        raise HTTPException(
+            status_code=403,
+            detail="FORBIDDEN_DOMAIN — private/loopback addresses are blocked."
+        )
 
-    loop = asyncio.get_running_loop()  # FIX: get_event_loop() deprecated in 3.10+
+    loop = asyncio.get_running_loop()  # get_event_loop() is deprecated in Python 3.10+
 
     if js:
         if not _STEALTH_AVAILABLE:
-            raise HTTPException(status_code=501, detail="StealthyFetcher unavailable — run: pip install scrapling[all] && scrapling install")
+            raise HTTPException(
+                status_code=501,
+                detail="StealthyFetcher unavailable — run: pip install scrapling[all] && scrapling install"
+            )
         response = await loop.run_in_executor(
             None, lambda: StealthyFetcher.fetch(url, headless=True)
         )
@@ -151,7 +161,10 @@ async def _scrape_url(url: str, js: bool = False) -> tuple[List[Dict[str, Any]],
 
     raw_bytes = len(response.content)
     if raw_bytes > MAX_PAYLOAD_SIZE:
-        raise HTTPException(status_code=413, detail=f"Payload too large ({raw_bytes} bytes > {MAX_PAYLOAD_SIZE}).")
+        raise HTTPException(
+            status_code=413,
+            detail=f"Payload too large ({raw_bytes / 1_048_576:.1f} MB > 10 MB limit)."
+        )
 
     rows = await loop.run_in_executor(cpu_executor, _extract_worker, response.content)
     return rows, raw_bytes
@@ -168,7 +181,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Frontend ──────────────────────────────────────────────────────────────────
+# Surface Pydantic validation errors (422) in a readable format
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    errors = "; ".join(
+        f"{' → '.join(str(l) for l in e['loc'])}: {e['msg']}"
+        for e in exc.errors()
+    )
+    return JSONResponse(status_code=422, content={"detail": f"Validation error — {errors}"})
+
+# ── Serve frontend ────────────────────────────────────────────────────────────
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
     base_dir  = os.path.dirname(os.path.abspath(__file__))
@@ -176,55 +198,48 @@ async def serve_frontend():
     if os.path.exists(html_path):
         return FileResponse(html_path)
     return HTMLResponse(
-        content=f"<h2>404: index.html not found at {html_path}</h2>",
+        content=f"<h2>404 — index.html not found at {html_path}</h2>",
         status_code=404,
     )
 
-# ── Auth info (used by frontend on load) ─────────────────────────────────────
+# ── Auth key endpoint (auto-populates frontend key field) ────────────────────
 @app.get("/api/key")
 async def get_api_key():
-    """
-    Returns the active API key so the frontend can auto-populate its key field.
-    Only expose this endpoint on trusted networks / behind auth proxy in production.
-    """
     return JSONResponse({"api_key": API_KEY})
 
-# ── Health ────────────────────────────────────────────────────────────────────
+# ── Health check ──────────────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
     return {
-        "status":            "ok",
-        "version":           "7.5.0",
-        "stealth_available": _STEALTH_AVAILABLE,
+        "status":              "ok",
+        "version":             "7.5.0",
+        "stealth_available":   _STEALTH_AVAILABLE,
         "scrapling_available": Fetcher is not None,
-        "utc":               datetime.now(timezone.utc).isoformat(),
+        "utc":                 datetime.now(timezone.utc).isoformat(),
     }
 
-# ── Main extraction endpoint ──────────────────────────────────────────────────
+# ── ✅ MAIN EXTRACTION ENDPOINT ───────────────────────────────────────────────
+# FIX: in the original code, scrape_url() was defined as a plain async function
+# but never registered as a FastAPI route — POST /api/scrape returned 404.
 @app.post("/api/scrape", response_model=ScrapeResponse)
 async def scrape(
-    body:    ScrapeRequest,
-    _key:    str = Depends(verify_key),   # enforces X-Api-Key header
+    body: ScrapeRequest,
+    _key: str = Depends(verify_key),   # enforces X-Api-Key header
 ):
     """
-    Scrapes `body.url` and returns extracted table rows as `events`.
-
-    - `js: false`  → Scrapling Fetcher (fast, static pages)
-    - `js: true`   → StealthyFetcher / Playwright (JS-rendered pages)
+    Scrapes body.url and returns extracted table rows as `events`.
+      js: false  →  Scrapling Fetcher   (fast, static HTML)
+      js: true   →  StealthyFetcher     (Playwright, JS-rendered pages)
     """
-    t0 = asyncio.get_event_loop().time()
+    t0 = time.perf_counter()
 
     rows, raw_bytes = await _scrape_url(body.url, js=body.js)
 
-    elapsed = asyncio.get_event_loop().time() - t0
+    elapsed = round(time.perf_counter() - t0, 3)
 
-    return ScrapeResponse(
-        events=rows,
-        raw_bytes=raw_bytes,
-        elapsed=round(elapsed, 3),
-    )
+    return ScrapeResponse(events=rows, raw_bytes=raw_bytes, elapsed=elapsed)
 
-# ── Token status (Telegram dashboard helper) ──────────────────────────────────
+# ── Token status (Telegram dashboard) ────────────────────────────────────────
 @app.get("/api/token-status")
 async def token_status(_key: str = Depends(verify_key)):
     return {
@@ -235,7 +250,7 @@ async def token_status(_key: str = Depends(verify_key)):
     }
 
 # ═══════════════════════════════════════════════════════════
-# STARTUP — Telegram bot (optional, won't crash server if absent)
+# STARTUP — Telegram bot (optional, gracefully skipped if absent)
 # ═══════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def startup():
@@ -244,9 +259,9 @@ async def startup():
         start_bot()
         print("[BOOT] Telegram bot started.")
     except ImportError:
-        print("[BOOT] telegram_bot.py not found — skipping bot startup.")
+        print("[BOOT] telegram_bot.py not found — skipping.")
     except Exception as e:
-        print(f"[BOOT] Telegram bot failed to start: {e}")
+        print(f"[BOOT] Telegram bot failed: {e}")
 
 # ═══════════════════════════════════════════════════════════
 # ENTRY POINT
