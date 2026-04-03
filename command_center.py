@@ -1,127 +1,749 @@
-import os
-import re
-import secrets
-import asyncio
-import socket
-import concurrent.futures
-from datetime import datetime, timezone
-from urllib.parse import urlparse
-from typing import Optional, List, Dict, Any, Union
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AUDITOR — Extraction Command</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Barlow+Condensed:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+/* ─────────────────────────────────────────────────────────────
+   TOKENS
+───────────────────────────────────────────────────────────── */
+:root {
+  --void:         #080706;
+  --panel:        #0d0c09;
+  --surface:      #141210;
+  --input:        #1a1814;
+  --border:       #232018;
+  --border-hot:   #4a3c18;
 
-import uvicorn
-from fastapi import FastAPI, HTTPException, Header, Depends, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
-from pydantic import BaseModel, HttpUrl
-from bs4 import BeautifulSoup
+  --amber:        #c8903a;
+  --amber-bright: #e8b84a;
+  --amber-dim:    #6a4c18;
+  --amber-glow:   rgba(200,144,58,.14);
 
-# ── Dependencies ──────────────────────────────────────────────────────────────
-try:
-    from scrapling.fetchers import Fetcher, StealthyFetcher
-    _STEALTH_AVAILABLE = True
-except ImportError:
-    from scrapling import Fetcher
-    StealthyFetcher = None
-    _STEALTH_AVAILABLE = False
+  --green:        #4eb86a;
+  --red:          #c04040;
+  --orange:       #c87820;
+  --blue:         #4878c0;
 
-# ═══════════════════════════════════════════════════════════
-# GLOBAL EXECUTOR & CONFIG
-# ═══════════════════════════════════════════════════════════
-cpu_executor = concurrent.futures.ProcessPoolExecutor(max_workers=4)
-MAX_PAYLOAD_SIZE = 10_485_760 
+  --text:         #b87a38;
+  --text-dim:     #5a4020;
+  --text-muted:   #2e2418;
 
-# Mock Token Status for Telegram Dashboard
-def get_token_status():
-    return {
-        "limit_per_key": 100000,
-        "keys": [
-            {"key_index": 1, "tokens_used": 15400, "tokens_remaining": 84600, "active": True}
-        ]
+  --f-ui:   'Barlow Condensed', sans-serif;
+  --f-mono: 'Space Mono', monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; overflow: hidden; }
+
+body {
+  background: var(--void);
+  color: var(--text);
+  font-family: var(--f-ui);
+  font-size: 14px;
+  display: grid;
+  grid-template-rows: 48px 1fr;
+  grid-template-columns: 252px 1fr 220px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* CRT scanlines */
+body::after {
+  content: '';
+  position: fixed; inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0px, transparent 3px,
+    rgba(0,0,0,.06) 3px, rgba(0,0,0,.06) 4px
+  );
+  pointer-events: none; z-index: 9900;
+}
+/* Ambient warmth */
+body::before {
+  content: '';
+  position: fixed; inset: 0;
+  background:
+    radial-gradient(ellipse 55% 45% at 25% 65%, rgba(200,144,58,.05) 0%, transparent 70%),
+    radial-gradient(ellipse 40% 55% at 78% 28%, rgba(200,144,58,.04) 0%, transparent 70%);
+  pointer-events: none; z-index: 0;
+}
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: var(--void); }
+::-webkit-scrollbar-thumb { background: var(--border-hot); }
+::-webkit-scrollbar-thumb:hover { background: var(--amber-dim); }
+
+/* ─────────────────────────────────────────────────────────────
+   TOP BAR
+───────────────────────────────────────────────────────────── */
+.topbar {
+  grid-column: 1 / -1; grid-row: 1;
+  background: var(--panel); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; padding: 0 0 0 16px;
+  position: relative; z-index: 100;
+}
+
+.brand {
+  font-family: var(--f-mono); font-weight: 700; font-size: 13px; letter-spacing: .14em;
+  color: var(--amber-bright); text-shadow: 0 0 14px rgba(232,184,74,.45);
+  margin-right: 12px; flex-shrink: 0;
+}
+.ver {
+  font-family: var(--f-mono); font-size: 9px; letter-spacing: .08em;
+  color: var(--text-muted); border: 1px solid var(--border); padding: 1px 5px;
+  margin-right: 18px; flex-shrink: 0;
+}
+.tsep { width: 1px; height: 22px; background: var(--border); margin-right: 16px; flex-shrink: 0; }
+
+.sys-strip { display: flex; align-items: center; gap: 18px; margin-right: auto; }
+.pip-grp {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text-dim);
+}
+.pip {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); flex-shrink: 0;
+  transition: background .3s, box-shadow .3s;
+}
+.pip.live { background: var(--green);  box-shadow: 0 0 7px var(--green);  animation: blink 2.8s ease-in-out infinite; }
+.pip.warn { background: var(--orange); box-shadow: 0 0 7px var(--orange); }
+.pip.dead { background: var(--red);    box-shadow: 0 0 7px var(--red);    animation: blink .7s ease-in-out infinite; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.35} }
+
+.metrics { display: flex; border-left: 1px solid var(--border); }
+.metric {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 0 16px; height: 48px; min-width: 70px; border-right: 1px solid var(--border); gap: 2px;
+}
+.metric-k { font-family: var(--f-mono); font-size: 8px; letter-spacing: .1em; text-transform: uppercase; color: var(--text-muted); }
+.metric-v { font-family: var(--f-mono); font-size: 13px; font-weight: 700; color: var(--amber); }
+
+.tab-nav { display: flex; height: 48px; border-left: 1px solid var(--border); }
+.tab-btn {
+  padding: 0 18px; background: transparent; border: none; border-bottom: 2px solid transparent;
+  font-family: var(--f-ui); font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--text-dim); cursor: pointer; transition: color .15s, border-color .15s;
+}
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--amber-bright); border-bottom-color: var(--amber); }
+
+/* ─────────────────────────────────────────────────────────────
+   LEFT SIDEBAR
+───────────────────────────────────────────────────────────── */
+.sidebar {
+  grid-column: 1; grid-row: 2;
+  background: var(--panel); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow: hidden; position: relative; z-index: 50;
+}
+
+.s-head {
+  padding: 12px 14px 9px; flex-shrink: 0;
+  font-family: var(--f-mono); font-size: 9px; font-weight: 700;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--amber-dim);
+  border-bottom: 1px solid var(--border);
+}
+.s-head::before { content: '// '; opacity: .55; }
+
+.ctrl-body { padding: 14px; display: flex; flex-direction: column; gap: 14px; flex: 1; min-height: 0; overflow-y: auto; }
+
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field-lbl { font-size: 9px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--text-dim); }
+
+.f-input {
+  background: var(--input); border: 1px solid var(--border);
+  color: var(--amber); padding: 8px 10px; font-family: var(--f-mono); font-size: 11px;
+  outline: none; width: 100%; transition: border-color .15s, box-shadow .15s; caret-color: var(--amber-bright);
+}
+.f-input:focus { border-color: var(--amber-dim); box-shadow: 0 0 0 1px var(--amber-dim) inset, 0 0 10px var(--amber-glow); }
+.f-input::placeholder { color: var(--text-muted); }
+
+.key-row { display: flex; align-items: center; gap: 8px; }
+.key-row .f-input { flex: 1; min-width: 0; }
+.k-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  background: var(--text-muted); transition: background .3s, box-shadow .3s;
+}
+.k-dot.ok  { background: var(--green); box-shadow: 0 0 7px var(--green); }
+.k-dot.err { background: var(--red);   box-shadow: 0 0 7px var(--red); }
+
+.ctrl-div { height: 1px; background: var(--border); }
+
+.tog-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 5px 0; cursor: pointer; user-select: none;
+}
+.tog-lbl { font-size: 12px; font-weight: 600; letter-spacing: .03em; color: var(--text); }
+.tog-track {
+  width: 30px; height: 16px; background: var(--input); border: 1px solid var(--border);
+  position: relative; transition: background .2s, border-color .2s; flex-shrink: 0;
+}
+.tog-track::after {
+  content: ''; position: absolute; top: 2px; left: 2px; width: 10px; height: 10px;
+  background: var(--text-dim); transition: transform .2s, background .2s;
+}
+.tog-row.on .tog-track { background: var(--amber-glow); border-color: var(--amber-dim); }
+.tog-row.on .tog-track::after { transform: translateX(14px); background: var(--amber); }
+
+.ctrl-foot { padding: 14px; display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--border); flex-shrink: 0; }
+
+.btn {
+  padding: 10px 14px; font-family: var(--f-ui); font-size: 12px; font-weight: 700;
+  letter-spacing: .1em; text-transform: uppercase; border: 1px solid var(--border);
+  background: var(--input); color: var(--text); cursor: pointer; transition: all .15s;
+  text-align: center; position: relative; overflow: hidden;
+}
+.btn-exec { background: rgba(200,144,58,.1); border-color: var(--amber-dim); color: var(--amber-bright); }
+.btn-exec:hover:not(:disabled) {
+  background: rgba(200,144,58,.18); border-color: var(--amber);
+  box-shadow: 0 0 14px var(--amber-glow), inset 0 0 14px var(--amber-glow);
+}
+.btn-exec:disabled { opacity: .4; cursor: not-allowed; }
+.btn-exec.running { color: var(--amber-dim); }
+.btn-exec.running::after {
+  content: '▮'; position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
+  animation: cur .7s step-end infinite;
+}
+@keyframes cur { 0%,100%{opacity:1} 50%{opacity:0} }
+.btn-exp { color: var(--text-dim); }
+.btn-exp:hover:not(:disabled) { border-color: var(--text-dim); color: var(--text); }
+.btn-exp:disabled { opacity: .25; cursor: not-allowed; }
+
+/* ─────────────────────────────────────────────────────────────
+   MAIN PANEL
+───────────────────────────────────────────────────────────── */
+.main-panel {
+  grid-column: 2; grid-row: 2;
+  display: flex; flex-direction: column; overflow: hidden;
+  position: relative; z-index: 10; background: var(--void);
+}
+
+.m-toolbar {
+  padding: 9px 14px; border-bottom: 1px solid var(--border); background: var(--panel);
+  display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+}
+.search-wrap {
+  flex: 1; display: flex; align-items: center; gap: 8px;
+  background: var(--input); border: 1px solid var(--border); padding: 6px 10px; transition: border-color .15s;
+}
+.search-wrap:focus-within { border-color: var(--amber-dim); }
+.search-ico { font-size: 9px; color: var(--text-muted); flex-shrink: 0; font-family: var(--f-mono); }
+.search-in {
+  background: transparent; border: none; outline: none;
+  color: var(--amber); font-family: var(--f-mono); font-size: 11px; width: 100%; caret-color: var(--amber-bright);
+}
+.search-in::placeholder { color: var(--text-muted); }
+.row-count { font-family: var(--f-mono); font-size: 9px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--text-dim); white-space: nowrap; }
+
+.data-area { flex: 1; overflow: auto; position: relative; }
+
+.state-c {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 14px;
+  color: var(--text-muted); font-family: var(--f-mono); font-size: 11px; letter-spacing: .06em;
+}
+.spinner { width: 22px; height: 22px; border: 1px solid var(--border); border-top-color: var(--amber); animation: spin .75s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.dtable { width: 100%; border-collapse: collapse; text-align: left; }
+.dtable thead th {
+  position: sticky; top: 0; padding: 8px 14px; background: var(--panel);
+  border-bottom: 1px solid var(--border); font-size: 9px; font-weight: 700;
+  letter-spacing: .1em; text-transform: uppercase; color: var(--text-dim); white-space: nowrap;
+}
+.dtable tbody td {
+  padding: 9px 14px; border-bottom: 1px solid var(--border);
+  font-family: var(--f-mono); font-size: 11px; white-space: nowrap; color: var(--text);
+}
+.dtable tbody tr:hover td { background: rgba(200,144,58,.04); }
+.c-name { font-family: var(--f-ui) !important; font-size: 13px !important; font-weight: 700 !important; color: var(--amber-bright) !important; white-space: normal !important; max-width: 260px; }
+.c-g    { color: var(--green)     !important; font-weight: 700 !important; }
+.c-o    { color: var(--orange)    !important; }
+.c-m    { color: var(--text-muted)!important; }
+.badge  { display: inline-block; padding: 1px 6px; font-size: 9px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.b-past { background: rgba(44,36,20,.6); color: var(--text-dim); border: 1px solid var(--border); }
+.b-pend { background: rgba(78,184,106,.1); color: var(--green); border: 1px solid rgba(78,184,106,.3); }
+
+/* ─────────────────────────────────────────────────────────────
+   RIGHT PANEL — LOG
+───────────────────────────────────────────────────────────── */
+.log-panel {
+  grid-column: 3; grid-row: 2; background: var(--panel); border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow: hidden; position: relative; z-index: 50;
+}
+.log-body {
+  flex: 1; overflow-y: auto; padding: 10px; font-family: var(--f-mono); font-size: 10px;
+  line-height: 1.6; display: flex; flex-direction: column; gap: 2px;
+}
+.l-e { word-break: break-all; color: var(--text-dim); }
+.l-e .ts { color: var(--text-muted); margin-right: 3px; }
+.l-e.info    { color: var(--blue); }
+.l-e.success { color: var(--green); }
+.l-e.error   { color: var(--red); }
+.l-e.warn    { color: var(--orange); }
+
+/* ─────────────────────────────────────────────────────────────
+   API DOCS
+───────────────────────────────────────────────────────────── */
+#api-view {
+  display: none; grid-column: 2 / 4; grid-row: 2;
+  overflow: auto; padding: 32px 40px; background: var(--void); position: relative; z-index: 20;
+}
+#api-view.vis { display: block; }
+.d-sec { max-width: 800px; margin-bottom: 40px; }
+.d-ttl {
+  font-family: var(--f-mono); font-size: 11px; font-weight: 700; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--amber); margin-bottom: 12px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--border);
+}
+.d-ttl::before { content: '// '; opacity: .5; }
+.d-txt { color: var(--text-dim); line-height: 1.75; margin-bottom: 12px; font-size: 13px; }
+.d-txt code { font-family: var(--f-mono); font-size: 11px; color: var(--amber); background: var(--surface); padding: 1px 5px; }
+.m-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; font-family: var(--f-mono); font-size: 12px; }
+.mb { padding: 2px 8px; font-size: 9px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+.mb-post { background: rgba(72,120,192,.15); color: var(--blue); border: 1px solid rgba(72,120,192,.3); }
+.mb-get  { background: rgba(78,184,106,.15); color: var(--green); border: 1px solid rgba(78,184,106,.3); }
+.cblk { background: var(--surface); border: 1px solid var(--border); padding: 14px; margin-bottom: 14px; position: relative; font-family: var(--f-mono); font-size: 11px; }
+.cblk pre { white-space: pre-wrap; word-break: break-all; margin: 0; color: var(--text-dim); }
+.cpb {
+  position: absolute; top: 8px; right: 8px; background: transparent; border: 1px solid var(--border);
+  color: var(--text-dim); font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  padding: 3px 8px; cursor: pointer; font-family: var(--f-ui); transition: all .15s;
+}
+.cpb:hover { border-color: var(--amber-dim); color: var(--amber); }
+.ptbl { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 14px; }
+.ptbl th, .ptbl td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+.ptbl th { color: var(--text-dim); font-size: 9px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+.ptbl td:first-child { font-family: var(--f-mono); font-size: 11px; color: var(--amber); }
+.p-req { color: var(--red); font-size: 9px; font-weight: 700; margin-left: 5px; }
+</style>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<header class="topbar">
+  <span class="brand">AUDITOR</span>
+  <span class="ver">v7.5.0</span>
+  <div class="tsep"></div>
+  <div class="sys-strip">
+    <div class="pip-grp">
+      <div class="pip" id="conn-pip"></div>
+      <span id="conn-lbl">STANDBY</span>
+    </div>
+    <div class="pip-grp">
+      <div class="pip" id="js-pip"></div>
+      <span id="js-lbl">JS OFF</span>
+    </div>
+  </div>
+  <div class="metrics">
+    <div class="metric">
+      <span class="metric-k">Vol</span>
+      <span class="metric-v" id="stat-vol">0</span>
+    </div>
+    <div class="metric">
+      <span class="metric-k">Pending</span>
+      <span class="metric-v" id="stat-pend">0</span>
+    </div>
+    <div class="metric">
+      <span class="metric-k">Latency</span>
+      <span class="metric-v" id="stat-lat">—</span>
+    </div>
+  </div>
+  <nav class="tab-nav">
+    <button class="tab-btn active" data-tab="data" onclick="switchTab('data')">Data Output</button>
+    <button class="tab-btn"        data-tab="api"  onclick="switchTab('api')">API Reference</button>
+  </nav>
+</header>
+
+<!-- LEFT SIDEBAR -->
+<aside class="sidebar">
+  <div class="s-head">Target Acquisition</div>
+  <div class="ctrl-body">
+    <div class="field">
+      <label class="field-lbl" for="url-input">Target URI</label>
+      <input class="f-input" id="url-input" type="text"
+             value="https://tradingeconomics.com/calendar"
+             autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label class="field-lbl">API Key</label>
+      <div class="key-row">
+        <input class="f-input" id="api-key" type="text"
+               placeholder="Auto-load or enter manually"
+               autocomplete="off" spellcheck="false">
+        <div class="k-dot" id="k-dot" title="Key status"></div>
+      </div>
+    </div>
+    <div class="ctrl-div"></div>
+    <div class="tog-row" id="js-tog" onclick="toggleJS()">
+      <span class="tog-lbl">JS Execution Context</span>
+      <div class="tog-track"></div>
+    </div>
+  </div>
+  <div class="ctrl-foot">
+    <button class="btn btn-exec" id="run-btn" onclick="runExtraction()">Execute Extraction</button>
+    <button class="btn btn-exp"  id="dl-btn"  disabled onclick="exportPayload()">Export Payload (JSON)</button>
+  </div>
+</aside>
+
+<!-- MAIN PANEL -->
+<main class="main-panel" id="main-panel">
+  <div class="m-toolbar">
+    <div class="search-wrap">
+      <span class="search-ico">▸</span>
+      <input class="search-in" id="search-in" type="text"
+             placeholder="Filter by indicator, country, value…"
+             oninput="applyFilter()">
+    </div>
+    <span class="row-count" id="row-count">—</span>
+  </div>
+  <div class="data-area" id="data-area">
+    <div class="state-c"><div>Awaiting execution command.</div></div>
+  </div>
+</main>
+
+<!-- LOG PANEL -->
+<aside class="log-panel" id="log-panel">
+  <div class="s-head">Mission Log</div>
+  <div class="log-body" id="log-body">
+    <div class="l-e"><span class="ts">--:--:--</span>System initialized.</div>
+  </div>
+</aside>
+
+<!-- API DOCS (spans col 2–4) -->
+<div id="api-view"></div>
+
+<script>
+/* ── CONFIG ────────────────────────────────────────────────
+   FIX: original had `? BASE_URL` (self-reference → ReferenceError on localhost).
+─────────────────────────────────────────────────────────── */
+const BASE_URL = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+  ? 'http://localhost:8000'
+  : location.origin;
+
+const state = { events: [], view: 'data', jsOn: false };
+
+/* ── UTILS ─────────────────────────────────────────────────── */
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+
+function log(msg, type = '') {
+  const body = $('log-body');
+  const d = document.createElement('div');
+  d.className = 'l-e' + (type ? ' ' + type : '');
+  const ts = new Date().toISOString().slice(11, 19);
+  d.innerHTML = `<span class="ts">${ts}</span>${esc(msg)}`;
+  body.prepend(d);
+  while (body.children.length > 200) body.removeChild(body.lastChild);
+}
+
+function setConn(s) {
+  $('conn-pip').className = 'pip' + (s ? ' ' + s : '');
+  $('conn-lbl').textContent = ({ live:'ONLINE', warn:'DEGRADED', dead:'OFFLINE' }[s] ?? 'STANDBY');
+}
+
+/* ── API KEY ────────────────────────────────────────────────── */
+function getKey() { return $('api-key').value.trim(); }
+function setKeyDot(ok) { $('k-dot').className = 'k-dot ' + (ok ? 'ok' : 'err'); }
+
+async function loadKey() {
+  try {
+    const r = await fetch(BASE_URL + '/api/key', { signal: AbortSignal.timeout(5000) });
+    if (r.ok) {
+      const d = await r.json();
+      const k = d.api_key || '';
+      if (k) {
+        $('api-key').value = k; setKeyDot(true); setConn('live');
+        log('Server online — API key loaded.', 'success');
+      } else {
+        setKeyDot(false); setConn('warn');
+        log('Server returned empty key — enter manually.', 'warn');
+      }
+    } else {
+      setKeyDot(false); setConn('warn');
+      log(`/api/key → HTTP ${r.status}. Enter key manually.`, 'warn');
+    }
+  } catch {
+    setConn('dead');
+    log('Server unreachable — enter API key manually.', 'error');
+  }
+}
+
+$('api-key').addEventListener('input', () => setKeyDot($('api-key').value.trim().length > 0));
+
+/* ── JS TOGGLE ──────────────────────────────────────────────── */
+function toggleJS() {
+  state.jsOn = !state.jsOn;
+  $('js-tog').classList.toggle('on', state.jsOn);
+  $('js-pip').className     = 'pip' + (state.jsOn ? ' live' : '');
+  $('js-lbl').textContent   = state.jsOn ? 'JS ON' : 'JS OFF';
+  log(`JS context ${state.jsOn ? 'ENABLED' : 'DISABLED'}`, state.jsOn ? 'info' : '');
+}
+
+/* ── TAB SWITCH ─────────────────────────────────────────────── */
+function switchTab(tab) {
+  state.view = tab;
+  document.querySelectorAll('.tab-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.tab === tab));
+  const isApi = tab === 'api';
+  $('main-panel').style.display = isApi ? 'none' : 'flex';
+  $('log-panel').style.display  = isApi ? 'none' : 'flex';
+  $('api-view').classList.toggle('vis', isApi);
+  if (isApi) renderApiDocs();
+}
+
+/* ── TABLE RENDER ───────────────────────────────────────────── */
+function getName(ev) {
+  for (const f of ['indicator','title','name','event','headline','product','label'])
+    if (ev[f]) return String(ev[f]);
+  return '—';
+}
+
+function renderTable(events) {
+  const area = $('data-area');
+  $('row-count').textContent = events.length ? `${events.length} ROW${events.length !== 1 ? 'S' : ''}` : '—';
+
+  if (!events.length) {
+    area.innerHTML = `<div class="state-c"><div>No data matches filter.</div></div>`;
+    return;
+  }
+
+  const nameKeys  = new Set(['indicator','title','name','event','headline','product','label']);
+  const fixedCols = ['country','date','event_date','time','event_time','event_datetime_utc',
+                     'period','actual','value','forecast','consensus','previous','is_past'];
+  const fixedSet  = new Set(fixedCols);
+  const extra     = new Set();
+  for (const ev of events)
+    for (const k of Object.keys(ev))
+      if (!nameKeys.has(k)) extra.add(k);
+
+  const used  = fixedCols.filter(c => events.some(e => e[c] != null && e[c] !== ''));
+  const other = [...extra]
+    .filter(c => !fixedSet.has(c) && !nameKeys.has(c) && events.some(e => e[c] != null && e[c] !== ''))
+    .slice(0, 4);
+  const cols = [...used, ...other];
+  const lbl  = c => c.replace(/_/g,' ').replace(/\b\w/g, x => x.toUpperCase());
+
+  function fmtCell(ev, c) {
+    const v = ev[c];
+    if (c === 'is_past') return v === true
+      ? `<span class="badge b-past">Past</span>`
+      : `<span class="badge b-pend">Pending</span>`;
+    if (v == null || v === '') return `<span class="c-m">—</span>`;
+    const s = esc(String(v));
+    if (c === 'actual' || c === 'value')       return `<span class="c-g">${s}</span>`;
+    if (c === 'forecast' || c === 'consensus') return `<span class="c-o">${s}</span>`;
+    return s;
+  }
+
+  area.innerHTML = `
+    <table class="dtable">
+      <thead><tr>
+        <th>Indicator / Name</th>
+        ${cols.map(c => `<th>${lbl(c)}</th>`).join('')}
+      </tr></thead>
+      <tbody>${events.map(ev => `<tr>
+        <td class="c-name">${esc(getName(ev))}</td>
+        ${cols.map(c => `<td>${fmtCell(ev, c)}</td>`).join('')}
+      </tr>`).join('')}</tbody>
+    </table>`;
+}
+
+/* ── FILTER ─────────────────────────────────────────────────── */
+function applyFilter() {
+  const q = ($('search-in').value || '').toLowerCase();
+  renderTable(state.events.filter(ev =>
+    !q || Object.values(ev).join(' ').toLowerCase().includes(q)));
+}
+
+/* ── EXECUTE EXTRACTION ─────────────────────────────────────── */
+async function runExtraction() {
+  const url = ($('url-input').value || '').trim();
+  const key = getKey();
+  if (!url) { log('Target URI is required.', 'error'); return; }
+  if (!key) { log('API key required — enter manually or check server.', 'error'); return; }
+
+  const btn = $('run-btn');
+  btn.disabled = true; btn.classList.add('running'); btn.textContent = 'Extracting';
+  $('dl-btn').disabled = true;
+  state.events = [];
+  ['stat-vol','stat-pend'].forEach(id => $(id).textContent = '0');
+  $('stat-lat').textContent  = '—';
+  $('row-count').textContent = '—';
+
+  $('data-area').innerHTML = `
+    <div class="state-c">
+      <div class="spinner"></div>
+      <div>Targeting ${esc(url)}</div>
+    </div>`;
+
+  log(`Dispatching → ${url}`, 'info');
+  log(`JS context: ${state.jsOn ? 'ON' : 'OFF'}`);
+  const t0 = performance.now();
+
+  try {
+    const res = await fetch(BASE_URL + '/api/scrape', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Api-Key': key },
+      body:    JSON.stringify({ url, js: state.jsOn, adaptive: true }),
+    });
+
+    // Use server-reported latency if available, else client-side.
+    const clientLat = ((performance.now() - t0) / 1000).toFixed(2) + 's';
+
+    if (!res.ok) {
+      let detail = res.statusText;
+      try { const j = await res.json(); detail = j.detail || j.error || detail; } catch {}
+      throw new Error(`HTTP ${res.status} — ${detail}`);
     }
 
-# ═══════════════════════════════════════════════════════════
-# SECURITY & PARSER UTILITIES
-# ═══════════════════════════════════════════════════════════
+    const data = await res.json();
 
-def _is_safe_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme not in ('http', 'https'): return False
-        hostname = parsed.hostname
-        if not hostname: return False
-        ip = socket.gethostbyname(hostname)
-        ip_int = int.from_bytes(socket.inet_aton(ip), 'big')
-        private_blocks = [
-            (0x0A000000, 0xFF000000), (0xAC100000, 0xFFF00000),
-            (0xC0A80000, 0xFFFF0000), (0x7F000000, 0xFF000000),
-            (0xA9FE0000, 0xFFFF0000), (0x00000000, 0xFF000000)
-        ]
-        return not any((ip_int & mask) == (net & mask) for net, mask in private_blocks)
-    except: return False
+    // Response shape: ScrapeResponse { events: [...], raw_bytes: N, elapsed: N }
+    // Also handles legacy shapes for compatibility.
+    let items = [];
+    if      (Array.isArray(data))          items = data;
+    else if (Array.isArray(data.events))   items = data.events;   // ← v7.5.0 primary
+    else if (Array.isArray(data.items))    items = data.items;
+    else if (Array.isArray(data.data))     items = data.data;
+    else if (typeof data === 'object')     items = [data];
 
-def _sanitize_key(text: str) -> str:
-    clean = re.sub(r'[^a-zA-Z0-9]', '_', text.strip())
-    return re.sub(r'_+', '_', clean).strip('_').lower()[:64]
+    // Prefer server-reported elapsed; fall back to client measurement.
+    const lat = data.elapsed != null ? `${data.elapsed}s` : clientLat;
+    $('stat-lat').textContent = lat;
 
-def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
-    soup = BeautifulSoup(content, 'html.parser')
-    for tag in soup(['script', 'style', 'nav', 'footer', 'aside']): tag.decompose()
-    results = []
-    for table in soup.find_all('table'):
-        rows = table.find_all('tr')
-        if not rows: continue
-        headers = [_sanitize_key(th.get_text(strip=True)) or f"col_{i}" for i, th in enumerate(rows[0].find_all(['th', 'td']))]
-        for row in rows[1:]:
-            cells = row.find_all(['td', 'th'])
-            if len(cells) != len(headers): continue
-            results.append({headers[i]: c.get_text(strip=True) for i, c in enumerate(cells)})
-    return results
+    state.events = items;
+    const pending = items.filter(e => e.is_past === false).length;
+    $('stat-vol').textContent  = items.length;
+    $('stat-pend').textContent = pending;
 
-# ═══════════════════════════════════════════════════════════
-# API ORCHESTRATION
-# ═══════════════════════════════════════════════════════════
+    if (data.raw_bytes != null) log(`Raw payload: ${(data.raw_bytes / 1024).toFixed(1)} KB`);
 
-app = FastAPI(title="AUDITOR CORE", version="7.5.0")
+    if (!items.length) {
+      log('Extraction succeeded — no structured records on target.', 'warn');
+      $('data-area').innerHTML = `<div class="state-c"><div>Target returned no extractable records.</div></div>`;
+    } else {
+      log(`Complete — ${items.length} records captured in ${lat}.`, 'success');
+      $('dl-btn').disabled = false;
+      applyFilter();
+    }
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
-)
+  } catch (err) {
+    const lat = ((performance.now() - t0) / 1000).toFixed(2) + 's';
+    $('stat-lat').textContent = lat;
+    log(`Extraction failed: ${err.message}`, 'error');
+    $('data-area').innerHTML = `
+      <div class="state-c" style="color:var(--red);text-align:center;padding:0 24px">
+        ${esc(err.message)}
+      </div>`;
+  } finally {
+    btn.disabled = false; btn.classList.remove('running'); btn.textContent = 'Execute Extraction';
+  }
+}
 
-_ENV_KEY = os.environ.get("AUDITOR_API_KEY", "").strip()
-API_KEY = _ENV_KEY if _ENV_KEY else secrets.token_hex(32)
-if not _ENV_KEY: print(f"[BOOT] AUTH KEY: {API_KEY}")
+/* ── EXPORT ─────────────────────────────────────────────────── */
+function exportPayload() {
+  if (!state.events.length) return;
+  const a    = document.createElement('a');
+  a.href     = URL.createObjectURL(
+    new Blob([JSON.stringify(state.events, null, 2)], { type: 'application/json' }));
+  a.download = `auditor_${Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  log(`Exported ${state.events.length} records.`, 'success');
+}
 
-@app.get("/")
-async def serve_frontend():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    html_path = os.path.join(base_dir, "index.html")
-    if os.path.exists(html_path):
-        return FileResponse(html_path)
-    return HTMLResponse(content=f"<h2>404: index.html missing at {html_path}</h2>", status_code=404)
+/* ── API DOCS ───────────────────────────────────────────────── */
+function renderApiDocs() {
+  const k = getKey() || '<API_KEY>';
+  const b = BASE_URL;
+  $('api-view').innerHTML = `
+    <div class="d-sec">
+      <div class="d-ttl">Authentication</div>
+      <div class="d-txt">Pass the API key via the <code>X-Api-Key</code> header on every protected request.
+        Set <code>AUDITOR_API_KEY</code> on the host — if unset a random key is generated at boot and printed
+        to stdout. The <code>GET /api/key</code> endpoint returns the active key for auto-population.</div>
+      <div class="cblk">
+        <button class="cpb" onclick="cpBlock('dk',this)">Copy</button>
+        <pre id="dk">X-Api-Key: ${esc(k)}</pre>
+      </div>
+    </div>
 
-async def scrape_url(url: str, adaptive: bool = True, js: bool = False):
-    if not _is_safe_url(url):
-        raise ValueError("FORBIDDEN_DOMAIN")
-    
-    loop = asyncio.get_event_loop()
-    if js:
-        if not _STEALTH_AVAILABLE: raise ImportError("StealthFetcher missing")
-        response = await loop.run_in_executor(None, lambda: StealthyFetcher.fetch(url, headless=True))
-    else:
-        response = await loop.run_in_executor(None, lambda: Fetcher().get(url))
-    
-    if not response or not hasattr(response, 'content'):
-        return {"events": []}, 0
+    <div class="d-sec">
+      <div class="d-ttl">POST /api/scrape</div>
+      <div class="d-txt">Scrapes <code>url</code> with Scrapling (static or headless) and extracts all
+        HTML tables via BeautifulSoup. Schema inferred from table headers — no manual mapping required.</div>
+      <div class="m-row"><span class="mb mb-post">POST</span><code>/api/scrape</code></div>
+      <table class="ptbl">
+        <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>url <span class="p-req">REQ</span></td><td>string</td><td>Target URI.</td></tr>
+          <tr><td>adaptive</td><td>boolean</td><td>Scrapling adaptive match — default <code>true</code>.</td></tr>
+          <tr><td>js</td><td>boolean</td><td>StealthyFetcher / Playwright for JS-rendered DOMs — default <code>false</code>.</td></tr>
+        </tbody>
+      </table>
+      <div class="d-txt">Response: <code>{"events":[{...}], "raw_bytes": N, "elapsed": N}</code></div>
+      <div class="cblk">
+        <button class="cpb" onclick="cpBlock('dc1',this)">Copy</button>
+        <pre id="dc1">curl -X POST ${b}/api/scrape \
+  -H "X-Api-Key: ${esc(k)}" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://tradingeconomics.com/calendar","js":false}'</pre>
+      </div>
+      <div class="cblk">
+        <button class="cpb" onclick="cpBlock('dc2',this)">Copy</button>
+        <pre id="dc2">curl -X POST ${b}/api/scrape \
+  -H "X-Api-Key: ${esc(k)}" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://www.coinglass.com/open-interest/BTC","js":true}'</pre>
+      </div>
+    </div>
 
-    raw_count = len(response.content)
-    data = await loop.run_in_executor(cpu_executor, _extract_worker, response.content)
-    return {"events": data}, raw_count
+    <div class="d-sec">
+      <div class="d-ttl">GET /api/health</div>
+      <div class="d-txt">No auth required. Returns server status, version, and Scrapling availability.</div>
+      <div class="m-row"><span class="mb mb-get">GET</span><code>/api/health</code></div>
+      <div class="cblk">
+        <button class="cpb" onclick="cpBlock('dhc',this)">Copy</button>
+        <pre id="dhc">curl ${b}/api/health</pre>
+      </div>
+    </div>
 
-@app.on_event("startup")
-async def startup():
-    from telegram_bot import start_bot
-    start_bot()
+    <div class="d-sec">
+      <div class="d-ttl">JS Rendering Setup</div>
+      <div class="d-txt">StealthyFetcher requires Playwright. Run once on the host:</div>
+      <div class="cblk">
+        <button class="cpb" onclick="cpBlock('dsetup',this)">Copy</button>
+        <pre id="dsetup">pip install scrapling[all] --break-system-packages
+scrapling install</pre>
+      </div>
+      <div class="d-txt">Compatibility: <code>tradingeconomics.com</code> (js:false) ·
+        <code>investing.com</code> (js:true) · <code>coinglass.com</code> (js:true) ·
+        <code>MarketWatch</code> ✗ Cloudflare blocked</div>
+    </div>
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    <div class="d-sec">
+      <div class="d-ttl">Security Model</div>
+      <div class="d-txt">All target URIs validated before execution. Private / loopback addresses blocked
+        (SSRF protection): <code>10.x</code>, <code>172.16–31.x</code>, <code>192.168.x</code>,
+        <code>127.x</code>, <code>169.254.x</code>. Max payload: <code>10 MB</code>.
+        Extraction runs in <code>ProcessPoolExecutor</code> (max 4 workers).</div>
+    </div>`;
+}
+
+function cpBlock(id, btn) {
+  const node = document.getElementById(id);
+  if (!node) return;
+  navigator.clipboard.writeText(node.textContent).then(() => {
+    const o = btn.textContent; btn.textContent = 'COPIED';
+    setTimeout(() => btn.textContent = o, 2000);
+  });
+}
+
+/* ── INIT ───────────────────────────────────────────────────── */
+loadKey();
+</script>
+</body>
+</html>
