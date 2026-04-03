@@ -21,18 +21,23 @@ from bs4 import BeautifulSoup
 try:
     from scrapling.fetchers import Fetcher, StealthyFetcher
     _STEALTH_AVAILABLE = True
+    _FETCHER_AVAILABLE = True
 except ImportError:
     try:
         from scrapling import Fetcher
+        _FETCHER_AVAILABLE = True
     except ImportError:
         Fetcher = None
+        _FETCHER_AVAILABLE = False
     StealthyFetcher = None
     _STEALTH_AVAILABLE = False
+
+print(f"[BOOT] Fetcher available: {_FETCHER_AVAILABLE}, Stealth available: {_STEALTH_AVAILABLE}")
 
 # ═══════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════
-cpu_executor    = concurrent.futures.ProcessPoolExecutor(max_workers=4)
+cpu_executor     = concurrent.futures.ProcessPoolExecutor(max_workers=4)
 MAX_PAYLOAD_SIZE = 10_485_760  # 10 MB
 
 # ═══════════════════════════════════════════════════════════
@@ -44,7 +49,6 @@ if not _ENV_KEY:
     print(f"[BOOT] No AUDITOR_API_KEY env var — generated key: {API_KEY}")
 
 def verify_key(x_api_key: str = Header(..., alias="X-Api-Key")) -> str:
-    """Dependency — validates X-Api-Key on every protected route."""
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
     return x_api_key
@@ -63,10 +67,9 @@ class ScrapeResponse(BaseModel):
     elapsed:   float
 
 # ═══════════════════════════════════════════════════════════
-# SECURITY UTILITIES
+# SECURITY
 # ═══════════════════════════════════════════════════════════
 def _is_safe_url(url: str) -> bool:
-    """Blocks private / loopback IPs — SSRF protection."""
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ('http', 'https'):
@@ -77,12 +80,12 @@ def _is_safe_url(url: str) -> bool:
         ip = socket.gethostbyname(hostname)
         ip_int = int.from_bytes(socket.inet_aton(ip), 'big')
         private_blocks = [
-            (0x0A000000, 0xFF000000),  # 10.0.0.0/8
-            (0xAC100000, 0xFFF00000),  # 172.16.0.0/12
-            (0xC0A80000, 0xFFFF0000),  # 192.168.0.0/16
-            (0x7F000000, 0xFF000000),  # 127.0.0.0/8
-            (0xA9FE0000, 0xFFFF0000),  # 169.254.0.0/16
-            (0x00000000, 0xFF000000),  # 0.0.0.0/8
+            (0x0A000000, 0xFF000000),
+            (0xAC100000, 0xFFF00000),
+            (0xC0A80000, 0xFFFF0000),
+            (0x7F000000, 0xFF000000),
+            (0xA9FE0000, 0xFFFF0000),
+            (0x00000000, 0xFF000000),
         ]
         return not any((ip_int & mask) == (net & mask) for net, mask in private_blocks)
     except Exception:
@@ -93,12 +96,51 @@ def _sanitize_key(text: str) -> str:
     return re.sub(r'_+', '_', clean).strip('_').lower()[:64]
 
 # ═══════════════════════════════════════════════════════════
-# EXTRACTION WORKER  (runs in ProcessPoolExecutor — must be top-level)
+# RAW CONTENT EXTRACTION FROM SCRAPLING RESPONSE
+# FIX: Scrapling Adaptor stores HTML as .html (str), not .content (bytes).
+#      .content may be empty or None even on a successful fetch.
+#      We try multiple attributes in priority order and encode to bytes.
+# ═══════════════════════════════════════════════════════════
+def _get_raw_bytes(response) -> bytes:
+    """
+    Extract raw HTML bytes from a Scrapling Adaptor object.
+    Tries attributes in priority order — raises ValueError if nothing usable is found.
+    """
+    # 1. .html — primary Scrapling attribute (str)
+    html = getattr(response, 'html', None)
+    if html and isinstance(html, str) and len(html.strip()) > 0:
+        return html.encode('utf-8', errors='replace')
+
+    # 2. .text — alias used in some Scrapling versions
+    text = getattr(response, 'text', None)
+    if text and isinstance(text, str) and len(text.strip()) > 0:
+        return text.encode('utf-8', errors='replace')
+
+    # 3. .content — raw bytes (may be populated in some fetcher modes)
+    content = getattr(response, 'content', None)
+    if content and isinstance(content, bytes) and len(content) > 0:
+        return content
+
+    # 4. .body — fallback used by some Scrapling versions
+    body = getattr(response, 'body', None)
+    if body:
+        if isinstance(body, bytes) and len(body) > 0:
+            return body
+        if isinstance(body, str) and len(body.strip()) > 0:
+            return body.encode('utf-8', errors='replace')
+
+    raise ValueError(
+        f"Scrapling response returned no usable content. "
+        f"Available attrs: {[a for a in dir(response) if not a.startswith('_')]}"
+    )
+
+# ═══════════════════════════════════════════════════════════
+# EXTRACTION WORKER (top-level for ProcessPoolExecutor pickling)
 # ═══════════════════════════════════════════════════════════
 def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
     """
-    Pure-function HTML table extractor — safe to pickle and run in a subprocess.
-    Returns a flat list of row dicts keyed by sanitized column names.
+    Parses HTML bytes and extracts all <table> rows as dicts.
+    Pure function — safe to run in a subprocess.
     """
     soup = BeautifulSoup(content, 'html.parser')
     for tag in soup(['script', 'style', 'nav', 'footer', 'aside']):
@@ -120,53 +162,91 @@ def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
             cells = row.find_all(['td', 'th'])
             if len(cells) != len(headers):
                 continue
-            results.append({headers[i]: c.get_text(strip=True) for i, c in enumerate(cells)})
+            results.append({
+                headers[i]: c.get_text(strip=True)
+                for i, c in enumerate(cells)
+            })
     return results
+
+# ═══════════════════════════════════════════════════════════
+# FETCH WRAPPERS
+# These run inside run_in_executor — exceptions will propagate
+# back to the async caller correctly.
+# ═══════════════════════════════════════════════════════════
+def _fetch_static(url: str):
+    """Synchronous static fetch — runs in thread executor."""
+    if Fetcher is None:
+        raise RuntimeError("Scrapling Fetcher is not installed.")
+    try:
+        response = Fetcher().get(url)
+    except Exception as e:
+        raise RuntimeError(f"Fetcher.get() failed: {e}") from e
+    if response is None:
+        raise RuntimeError("Fetcher.get() returned None — URL may be unreachable or blocked.")
+    return response
+
+def _fetch_js(url: str):
+    """Synchronous headless fetch — runs in thread executor."""
+    if not _STEALTH_AVAILABLE or StealthyFetcher is None:
+        raise RuntimeError(
+            "StealthyFetcher unavailable — run: "
+            "pip install scrapling[all] --break-system-packages && scrapling install"
+        )
+    try:
+        response = StealthyFetcher.fetch(url, headless=True)
+    except Exception as e:
+        raise RuntimeError(f"StealthyFetcher.fetch() failed: {e}") from e
+    if response is None:
+        raise RuntimeError("StealthyFetcher.fetch() returned None — URL may be unreachable or blocked.")
+    return response
 
 # ═══════════════════════════════════════════════════════════
 # CORE SCRAPE LOGIC
 # ═══════════════════════════════════════════════════════════
 async def _scrape_url(url: str, js: bool = False) -> tuple[List[Dict[str, Any]], int]:
-    """
-    Fetches `url` and extracts all HTML tables.
-    Returns (rows, raw_byte_count).
-    Raises HTTPException on blocked domain, missing dependency, or oversized payload.
-    """
     if not _is_safe_url(url):
         raise HTTPException(
             status_code=403,
             detail="FORBIDDEN_DOMAIN — private/loopback addresses are blocked."
         )
 
-    loop = asyncio.get_running_loop()  # get_event_loop() is deprecated in Python 3.10+
+    loop = asyncio.get_running_loop()
 
-    if js:
-        if not _STEALTH_AVAILABLE:
-            raise HTTPException(
-                status_code=501,
-                detail="StealthyFetcher unavailable — run: pip install scrapling[all] && scrapling install"
-            )
-        response = await loop.run_in_executor(
-            None, lambda: StealthyFetcher.fetch(url, headless=True)
-        )
-    else:
-        if Fetcher is None:
-            raise HTTPException(status_code=501, detail="Scrapling is not installed.")
-        response = await loop.run_in_executor(
-            None, lambda: Fetcher().get(url)
-        )
+    # ── Fetch ──────────────────────────────────────────────
+    try:
+        if js:
+            response = await loop.run_in_executor(None, _fetch_js, url)
+        else:
+            response = await loop.run_in_executor(None, _fetch_static, url)
+    except RuntimeError as e:
+        # Surface fetcher errors directly to the client
+        raise HTTPException(status_code=502, detail=str(e))
 
-    if not response or not hasattr(response, 'content'):
-        return [], 0
+    # ── Extract raw bytes from Scrapling response ──────────
+    try:
+        raw = _get_raw_bytes(response)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
-    raw_bytes = len(response.content)
+    raw_bytes = len(raw)
+    print(f"[SCRAPE] {url} → {raw_bytes} bytes fetched (js={js})")
+
+    if raw_bytes == 0:
+        raise HTTPException(status_code=502, detail="Fetcher returned empty body — page may require JS rendering (enable JS context) or is blocking scrapers.")
+
     if raw_bytes > MAX_PAYLOAD_SIZE:
         raise HTTPException(
             status_code=413,
             detail=f"Payload too large ({raw_bytes / 1_048_576:.1f} MB > 10 MB limit)."
         )
 
-    rows = await loop.run_in_executor(cpu_executor, _extract_worker, response.content)
+    # ── Parse tables ───────────────────────────────────────
+    try:
+        rows = await loop.run_in_executor(cpu_executor, _extract_worker, raw)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Table extraction failed: {e}")
+
+    print(f"[SCRAPE] {url} → {len(rows)} rows extracted")
     return rows, raw_bytes
 
 # ═══════════════════════════════════════════════════════════
@@ -181,7 +261,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Surface Pydantic validation errors (422) in a readable format
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     errors = "; ".join(
@@ -190,7 +269,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     )
     return JSONResponse(status_code=422, content={"detail": f"Validation error — {errors}"})
 
-# ── Serve frontend ────────────────────────────────────────────────────────────
+# ── Frontend ──────────────────────────────────────────────────────────────────
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
     base_dir  = os.path.dirname(os.path.abspath(__file__))
@@ -202,44 +281,56 @@ async def serve_frontend():
         status_code=404,
     )
 
-# ── Auth key endpoint (auto-populates frontend key field) ────────────────────
+# ── Key ───────────────────────────────────────────────────────────────────────
 @app.get("/api/key")
 async def get_api_key():
     return JSONResponse({"api_key": API_KEY})
 
-# ── Health check ──────────────────────────────────────────────────────────────
+# ── Health ─────────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
     return {
         "status":              "ok",
         "version":             "7.5.0",
+        "fetcher_available":   _FETCHER_AVAILABLE,
         "stealth_available":   _STEALTH_AVAILABLE,
-        "scrapling_available": Fetcher is not None,
         "utc":                 datetime.now(timezone.utc).isoformat(),
     }
 
-# ── ✅ MAIN EXTRACTION ENDPOINT ───────────────────────────────────────────────
-# FIX: in the original code, scrape_url() was defined as a plain async function
-# but never registered as a FastAPI route — POST /api/scrape returned 404.
+# ── Debug endpoint — test fetcher directly, returns content preview ───────────
+@app.get("/api/debug-fetch")
+async def debug_fetch(url: str, _key: str = Depends(verify_key)):
+    """
+    Fetches a URL and returns a content preview without table extraction.
+    Useful for diagnosing fetcher issues on Railway.
+    """
+    if not _is_safe_url(url):
+        raise HTTPException(status_code=403, detail="FORBIDDEN_DOMAIN")
+    loop = asyncio.get_running_loop()
+    try:
+        response = await loop.run_in_executor(None, _fetch_static, url)
+        raw = _get_raw_bytes(response)
+        return {
+            "url":        url,
+            "raw_bytes":  len(raw),
+            "preview":    raw[:500].decode('utf-8', errors='replace'),
+            "attrs_found": [a for a in dir(response) if not a.startswith('_') and not callable(getattr(response, a, None))],
+        }
+    except Exception as e:
+        return {"url": url, "error": str(e)}
+
+# ── Scrape ─────────────────────────────────────────────────────────────────────
 @app.post("/api/scrape", response_model=ScrapeResponse)
 async def scrape(
     body: ScrapeRequest,
-    _key: str = Depends(verify_key),   # enforces X-Api-Key header
+    _key: str = Depends(verify_key),
 ):
-    """
-    Scrapes body.url and returns extracted table rows as `events`.
-      js: false  →  Scrapling Fetcher   (fast, static HTML)
-      js: true   →  StealthyFetcher     (Playwright, JS-rendered pages)
-    """
     t0 = time.perf_counter()
-
     rows, raw_bytes = await _scrape_url(body.url, js=body.js)
-
     elapsed = round(time.perf_counter() - t0, 3)
-
     return ScrapeResponse(events=rows, raw_bytes=raw_bytes, elapsed=elapsed)
 
-# ── Token status (Telegram dashboard) ────────────────────────────────────────
+# ── Token status ───────────────────────────────────────────────────────────────
 @app.get("/api/token-status")
 async def token_status(_key: str = Depends(verify_key)):
     return {
@@ -250,7 +341,7 @@ async def token_status(_key: str = Depends(verify_key)):
     }
 
 # ═══════════════════════════════════════════════════════════
-# STARTUP — Telegram bot (optional, gracefully skipped if absent)
+# STARTUP
 # ═══════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def startup():
