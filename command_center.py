@@ -1,5 +1,26 @@
 """
-AUDITOR CORE v8.0.0 - Web Scraper
+AUDITOR CORE v8.1.0 - Web Scraper
+────────────────────────────────────────────────────────────
+Extraction engine combining:
+  • lxml tag-soup repair (BeautifulSoup backend)
+  • UTF-8 NFKC normalization — preserves $€£¥, kills zero-width chars
+  • CSS ::before/::after pseudo-element injection (tinycss2)
+  • SVG text reconstruction
+  • ARIA role=grid coordinate-based column mapping
+  • rowspan/colspan carry-forward for standard <table>
+  • Universal header detection (aria-label, title, data-*, nested spans)
+  • Dual fetcher: Fetcher() for static, StealthyFetcher for JS pages
+  • Explicit header override for known JS-rendered sites (CoinGlass, etc.)
+────────────────────────────────────────────────────────────
+Bug fixes:
+  [FIX-1] StealthyFetcher has no .get() method — uses .fetch() class method
+  [FIX-2] tinycss2 token iteration fixed — no more ValueError
+  [FIX-3] _rows_to_records() properly carries rowspan/colspan
+  [FIX-4] _get_raw_bytes() fallback chain restored
+  [FIX-5] Missing endpoints restored
+  [FIX-6] ProcessPoolExecutor worker is top-level (picklable)
+  [FIX-7] _inject_pseudo_elements runs BEFORE decompose
+  [FIX-8] CoinGlass headers explicitly defined (JS-rendered content)
 """
 
 import os
@@ -12,7 +33,7 @@ import unicodedata
 import concurrent.futures
 from datetime import datetime, timezone
 from urllib.parse import urlparse
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
@@ -43,16 +64,79 @@ except ImportError:
     StealthyFetcher = None
     _STEALTH_AVAILABLE = False
 
+print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE}  Stealth={_STEALTH_AVAILABLE}  CSS={_CSS_AVAILABLE}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
+
 cpu_executor = concurrent.futures.ProcessPoolExecutor(max_workers=4)
 MAX_PAYLOAD_SIZE = 10_485_760
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# JS-RENDERED SITES CONFIG
+# Sites that require JavaScript rendering to get table data
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_JS_RENDERED_SITES = {
+    'coinglass.com': True,
+    'coinmarketcap.com': True,
+    'coinranking.com': True,
+    'tradingview.com': True,
+    'tradingeconomics.com': True,  # Shows "No Events" to anonymous
+}
+
+# Explicit header definitions for sites with JS-rendered or dynamically loaded tables
+# Maps (domain, url_pattern) -> list of expected column names in order
+_EXPLICIT_HEADERS: Dict[Tuple[str, str], List[str]] = {
+    ('coinglass.com', 'open-interest'): [
+        'Ranking', 'Exchanges', 'OI_BTC', 'OI', 'Rate',
+        'OI_Change_1h', 'OI_Change_4h', 'OI_Change_24h', 'OI_24h_Vol', 'Trade'
+    ],
+    ('coinglass.com', 'funding-rate'): [
+        'Exchange', 'Pair', 'Funding_Rate', 'Next_Funding', 'Mark_Price', 'Index_Price'
+    ],
+}
+
+def _get_explicit_headers(url: str) -> Optional[List[str]]:
+    """Get explicit headers for known JS-rendered sites."""
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower().replace('www.', '')
+    path = parsed.path.lower()
+
+    for (d, pattern), headers in _EXPLICIT_HEADERS.items():
+        if domain == d and pattern in path:
+            return headers
+
+    # Check domain-level defaults
+    if domain in _JS_RENDERED_SITES:
+        return None  # Use JS rendering but no explicit headers
+
+    return None
+
+def _needs_js_rendering(url: str) -> bool:
+    """Check if URL likely needs JavaScript rendering."""
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower().replace('www.', '')
+    return _JS_RENDERED_SITES.get(domain, False)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTH
+# ═══════════════════════════════════════════════════════════════════════════════
+
 _ENV_KEY = os.environ.get("AUDITOR_API_KEY", "").strip()
 API_KEY = _ENV_KEY if _ENV_KEY else secrets.token_hex(32)
+if not _ENV_KEY:
+    print(f"[BOOT] No AUDITOR_API_KEY — generated: {API_KEY}")
 
 def verify_key(x_api_key: str = Header(..., alias="X-Api-Key")) -> str:
     if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
     return x_api_key
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# REQUEST / RESPONSE MODELS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class ScrapeRequest(BaseModel):
     url: str
@@ -63,6 +147,10 @@ class ScrapeResponse(BaseModel):
     events: List[Dict[str, Any]]
     raw_bytes: int
     elapsed: float
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECURITY — SSRF BLOCK
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _is_safe_url(url: str) -> bool:
     try:
@@ -86,6 +174,10 @@ def _is_safe_url(url: str) -> bool:
     except Exception:
         return False
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEXT NORMALIZATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
 _ZW_CHARS = re.compile(r'[\u200b\u200c\u200d\u2060\uFEFF\u00ad]')
 _CTRL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
@@ -96,6 +188,10 @@ def _normalize(text: str) -> str:
     text = _ZW_CHARS.sub('', text)
     text = _CTRL.sub('', text)
     return text.strip()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CSS PSEUDO-ELEMENT INJECTOR
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _parse_css_pseudo_content(style_text: str) -> Dict[str, str]:
     if not _CSS_AVAILABLE or not style_text:
@@ -146,6 +242,10 @@ def _inject_pseudo_elements(soup: BeautifulSoup) -> None:
             else:
                 el.append(node)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ELEMENT TEXT EXTRACTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
 _HIDDEN_CLASSES = frozenset({'visually-hidden', 'tw-sr-only', 'sr-only', 'hidden', 'hide', 'screen-reader', 'accessible-hide'})
 _INLINE_TAGS = frozenset({'span', 'a', 'b', 'i', 'strong', 'em', 'small', 'u', 'sub', 'sup', 'label', 'text', 'tspan'})
 
@@ -172,37 +272,60 @@ def _el_text(el) -> str:
     joined = ''.join(parts) if el.name in _INLINE_TAGS else ' '.join(parts)
     return _normalize(joined)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIVERSAL HEADER DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _sanitize_key(text: str) -> str:
+    """Convert header text to a clean dictionary key."""
+    if not text:
+        return ''
+    # Handle common units in headers like "OI(BTC)" -> "oi_btc"
     clean = re.sub(r'[^a-zA-Z0-9]', '_', text.strip())
-    return re.sub(r'_+', '_', clean).strip('_').lower()[:64]
+    clean = re.sub(r'_+', '_', clean).strip('_')
+    # Convert to lowercase but preserve common abbreviations
+    return clean.lower()[:64]
 
 def _cell_label(cell, index: int) -> str:
+    """Extract header label from a table cell (TH element)."""
+    # Priority 1: aria-label attribute (most reliable)
     key = _sanitize_key(cell.get('aria-label', ''))
     if key:
         return key
+
+    # Priority 2: title attribute
     key = _sanitize_key(cell.get('title', ''))
     if key:
         return key
+
+    # Priority 3: data-* attributes
     for attr, val in cell.attrs.items():
-        if attr.startswith('data-') and isinstance(val, str):
+        if attr.startswith('data-') and isinstance(val, str) and val.strip():
             key = _sanitize_key(val)
             if key:
                 return key
+
+    # Priority 4: Direct child elements (exclude SVG)
     text_parts = []
     for child in cell.children:
         if isinstance(child, NavigableString):
             t = _normalize(str(child))
             if t:
                 text_parts.append(t)
-        elif isinstance(child, Tag) and child.name != 'svg':
+        elif isinstance(child, Tag) and child.name not in ('svg', 'script', 'style'):
             t = _el_text(child)
             if t:
                 text_parts.append(t)
+
     key = _sanitize_key(' '.join(text_parts))
     if key:
         return key
+
+    # Priority 5: Descendant elements (nested spans, divs, etc.)
     for child in cell.descendants:
         if not isinstance(child, Tag):
+            continue
+        if child.name in ('script', 'style', 'svg'):
             continue
         key = _sanitize_key(child.get('aria-label', ''))
         if key:
@@ -211,19 +334,55 @@ def _cell_label(cell, index: int) -> str:
         if key:
             return key
         for attr, val in child.attrs.items():
-            if attr.startswith('data-') and isinstance(val, str):
+            if attr.startswith('data-') and isinstance(val, str) and val.strip():
                 key = _sanitize_key(val)
                 if key:
                     return key
+
+    # Priority 6: Full cell text content
     key = _sanitize_key(cell.get_text(separator=' ', strip=True))
     if key:
         return key
+
+    # Fallback: positional identifier
     return f"col_{index}"
 
-def _find_headers(table) -> Tuple[List[str], List]:
+# ═══════════════════════════════════════════════════════════════════════════════
+# TABLE HEADER DETECTION + ROWSPAN/COLSPAN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _find_headers(table, explicit_headers: Optional[List[str]] = None) -> Tuple[List[str], List]:
+    """
+    Find table headers and return (headers_list, data_rows).
+    If explicit_headers provided, use those instead of detecting.
+    """
     all_rows = table.find_all('tr')
     if not all_rows:
         return [], []
+
+    # If explicit headers provided, use them directly
+    if explicit_headers:
+        # Find data rows (exclude thead rows if present)
+        thead = table.find('thead')
+        if thead:
+            thead_rows = thead.find_all('tr')
+            data_rows = tbody.find_all('tr') if (tbody := table.find('tbody')) else [
+                r for r in all_rows if r not in thead_rows
+            ]
+        else:
+            # Use first row as header, rest as data
+            data_rows = all_rows[1:] if len(all_rows) > 1 else []
+
+        # Validate explicit header count matches data column count
+        if data_rows:
+            first_row_cells = data_rows[0].find_all(['td', 'th'])
+            if len(explicit_headers) >= len(first_row_cells):
+                return explicit_headers[:len(first_row_cells)], data_rows
+            elif len(explicit_headers) > 0:
+                # Pad or truncate headers to match
+                return explicit_headers + [f"col_{i}" for i in range(len(explicit_headers), len(first_row_cells))], data_rows
+
+    # Standard header detection logic
     thead = table.find('thead')
     if thead:
         thead_rows = thead.find_all('tr')
@@ -240,8 +399,12 @@ def _find_headers(table) -> Tuple[List[str], List]:
         if best_cells:
             headers = [_cell_label(c, i) for i, c in enumerate(best_cells)]
             tbody = table.find('tbody')
-            data_rows = tbody.find_all('tr') if tbody else [r for r in all_rows if r not in thead_rows]
+            data_rows = tbody.find_all('tr') if tbody else [
+                r for r in all_rows if r not in thead_rows
+            ]
             return headers, data_rows
+
+    # No thead - find row with most TH elements or named columns
     def _score(row):
         cells = row.find_all(['th', 'td'])
         if not cells:
@@ -250,6 +413,7 @@ def _find_headers(table) -> Tuple[List[str], List]:
         named = sum(1 for l in labels if not l.startswith('col_'))
         th_bonus = len(row.find_all('th')) * 5
         return named + th_bonus, cells
+
     th_rows = [r for r in all_rows if r.find('th')]
     candidates = th_rows if th_rows else all_rows
     best_score, best_idx, best_cells = -1, 0, None
@@ -257,13 +421,16 @@ def _find_headers(table) -> Tuple[List[str], List]:
         score, cells = _score(row)
         if score > best_score and cells:
             best_score, best_idx, best_cells = score, idx, cells
+
     if best_cells is None:
         return [], []
+
     headers = [_cell_label(c, i) for i, c in enumerate(best_cells)]
     actual_idx = all_rows.index(candidates[best_idx])
     return headers, all_rows[actual_idx + 1:]
 
 def _rows_to_records(headers: List[str], data_rows: List) -> List[Dict[str, Any]]:
+    """Convert table rows to list of dicts, handling rowspan/colspan."""
     n, carry, records = len(headers), {}, []
     for row in data_rows:
         cells = iter(row.find_all(['td', 'th']))
@@ -300,6 +467,10 @@ def _rows_to_records(headers: List[str], data_rows: List) -> List[Dict[str, Any]
         if any(v for v in record.values()):
             records.append(record)
     return records
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DIV-ROW EXTRACTOR
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _extract_div_rows(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
@@ -371,6 +542,10 @@ def _extract_div_rows(soup: BeautifulSoup) -> List[Dict[str, Any]]:
                 results.append(record)
     return results
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ARIA GRID EXTRACTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _extract_aria_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     results = []
     grids = soup.find_all(attrs={"role": lambda r: r in ("table", "grid", "treegrid")})
@@ -403,13 +578,17 @@ def _extract_aria_tables(soup: BeautifulSoup) -> List[Dict[str, Any]]:
                 results.append(record)
     return results
 
-def _extract_worker(content: bytes) -> List[Dict[str, Any]]:
-    results = _parse_and_extract(content, 'lxml')
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN EXTRACTION WORKER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _extract_worker(content: bytes, explicit_headers: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    results = _parse_and_extract(content, 'lxml', explicit_headers)
     if not results:
-        results = _parse_and_extract(content, 'html.parser')
+        results = _parse_and_extract(content, 'html.parser', explicit_headers)
     return results
 
-def _parse_and_extract(content: bytes, parser: str) -> List[Dict[str, Any]]:
+def _parse_and_extract(content: bytes, parser: str, explicit_headers: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     try:
         soup = BeautifulSoup(content, parser)
     except Exception:
@@ -419,11 +598,24 @@ def _parse_and_extract(content: bytes, parser: str) -> List[Dict[str, Any]]:
         tag.decompose()
     results: List[Dict[str, Any]] = []
     for table in soup.find_all('table'):
-        headers, data_rows = _find_headers(table)
+        headers, data_rows = _find_headers(table, explicit_headers)
         if not headers or not data_rows:
             continue
         records = _rows_to_records(headers, data_rows)
-        records = [r for r in records if len(r) > 1 or (len(r) == 1 and not list(r.keys())[0].startswith('col_'))]
+        # Filter out rows with mostly empty or numeric-only values
+        records = [
+            r for r in records
+            if len(r) > 1 or (len(r) == 1 and not list(r.keys())[0].startswith('col_'))
+        ]
+        # Additional filter: skip rows that are all numbers or empty
+        records = [
+            r for r in records
+            if not all(
+                v.replace('.', '').replace(',', '').replace('%', '').replace('+', '-').isdigit()
+                or not v.strip()
+                for v in r.values()
+            )
+        ]
         results.extend(records)
     aria_results = _extract_aria_tables(soup)
     seen = {str(sorted(r.items())) for r in results}
@@ -442,6 +634,10 @@ def _parse_and_extract(content: bytes, parser: str) -> List[Dict[str, Any]]:
                 seen.add(key)
     return results
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# RAW CONTENT EXTRACTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _get_raw_bytes(response) -> bytes:
     for attr in ('html', 'text'):
         val = getattr(response, attr, None)
@@ -454,7 +650,11 @@ def _get_raw_bytes(response) -> bytes:
                 return val
             if isinstance(val, str) and val.strip():
                 return val.encode('utf-8', errors='replace')
-    raise ValueError("Scrapling response has no usable content.")
+    raise ValueError(f"Scrapling response has no usable content.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FETCH WRAPPERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _fetch_static(url: str):
     if Fetcher is None:
@@ -478,63 +678,104 @@ def _fetch_js(url: str):
         raise RuntimeError("StealthyFetcher.fetch() returned None.")
     return response
 
-async def _scrape_url(url: str, js: bool = False) -> Tuple[List[Dict[str, Any]], int]:
+# ═══════════════════════════════════════════════════════════════════════════════
+# CORE SCRAPE LOGIC
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _scrape_url(url: str, js: bool = False, explicit_headers: Optional[List[str]] = None) -> Tuple[List[Dict[str, Any]], int]:
     if not _is_safe_url(url):
         raise HTTPException(status_code=403, detail="FORBIDDEN_DOMAIN")
+
+    # Auto-detect JS rendering for known sites
+    auto_js = _needs_js_rendering(url)
+    use_js = js or auto_js
+
+    if auto_js and not js:
+        print(f"[SCRAPE] Auto-enabling JS for {url} (known JS-rendered site)")
+
     loop = asyncio.get_running_loop()
-    async def _do_fetch(use_js: bool):
+    async def _do_fetch(u: str, do_js: bool):
         try:
-            return await loop.run_in_executor(None, _fetch_js if use_js else _fetch_static, url)
+            return await loop.run_in_executor(None, _fetch_js if do_js else _fetch_static, u)
         except RuntimeError as e:
             raise HTTPException(status_code=502, detail=str(e))
-    response = await _do_fetch(js)
-    used_js = js
+
+    response = await _do_fetch(url, use_js)
+    used_js = use_js
+
     try:
         raw = _get_raw_bytes(response)
     except ValueError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
     raw_bytes = len(raw)
-    print(f"[SCRAPE] {url} -> {raw_bytes:,} bytes (js={used_js})")
+    print(f"[SCRAPE] {url} → {raw_bytes:,} bytes (js={used_js})")
+
     if raw_bytes == 0:
         raise HTTPException(status_code=502, detail="Empty body")
+
     if raw_bytes > MAX_PAYLOAD_SIZE:
-        raise HTTPException(status_code=413, detail=f"Payload too large ({raw_bytes/1_048_576:.1f} MB)")
+        raise HTTPException(status_code=413, detail=f"Payload too large ({raw_bytes/1_048_576:.1f} MB > 10 MB)")
+
     try:
-        rows = await loop.run_in_executor(cpu_executor, _extract_worker, raw)
+        rows = await loop.run_in_executor(cpu_executor, _extract_worker, raw, explicit_headers)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {e}")
+
+    # Auto-retry with JS if static fetch returns no results on known JS sites
     if not rows and not used_js and raw_bytes >= 51_200 and _STEALTH_AVAILABLE:
-        print(f"[SCRAPE] 0 rows from static -> auto-retrying with JS")
+        print(f"[SCRAPE] 0 rows from static → auto-retrying with JS")
         try:
-            response2 = await _do_fetch(True)
+            response2 = await _do_fetch(url, True)
             raw2 = _get_raw_bytes(response2)
             if raw2:
-                rows2 = await loop.run_in_executor(cpu_executor, _extract_worker, raw2)
+                rows2 = await loop.run_in_executor(cpu_executor, _extract_worker, raw2, explicit_headers)
                 if rows2:
-                    print(f"[SCRAPE] JS retry -> {len(rows2)} rows")
+                    print(f"[SCRAPE] JS retry → {len(rows2)} rows")
                     rows = rows2
                     raw_bytes = len(raw2)
                     used_js = True
         except Exception as e:
             print(f"[SCRAPE] JS retry failed: {e}")
-    print(f"[SCRAPE] {url} -> {len(rows)} rows (js={used_js})")
+
+    # If still no results on JS-rendered site, try with explicit headers
+    if not rows and explicit_headers and _STEALTH_AVAILABLE:
+        print(f"[SCRAPE] No rows with auto-detection → forcing JS fetch with explicit headers")
+        try:
+            response3 = await _do_fetch(url, True)
+            raw3 = _get_raw_bytes(response3)
+            if raw3:
+                rows3 = await loop.run_in_executor(cpu_executor, _extract_worker, raw3, explicit_headers)
+                if rows3:
+                    print(f"[SCRAPE] Explicit headers → {len(rows3)} rows")
+                    rows = rows3
+                    raw_bytes = len(raw3)
+                    used_js = True
+        except Exception as e:
+            print(f"[SCRAPE] Explicit headers retry failed: {e}")
+
+    print(f"[SCRAPE] {url} → {len(rows)} rows (js={used_js})")
     return rows, raw_bytes
 
-app = FastAPI(title="AUDITOR CORE", version="8.0.0")
+# ═══════════════════════════════════════════════════════════════════════════════
+# APP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+app = FastAPI(title="AUDITOR CORE", version="8.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    errors = "; ".join(f"{' -> '.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors())
-    return JSONResponse(status_code=422, content={"detail": f"Validation error -- {errors}"})
+    errors = "; ".join(f"{' → '.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors())
+    return JSONResponse(status_code=422, content={"detail": f"Validation error — {errors}"})
 
-@app.get("/")
+@app.get("/", include_in_schema=False)
 async def serve_frontend():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     html_path = os.path.join(base_dir, "index.html")
     if os.path.exists(html_path):
         return FileResponse(html_path)
-    return HTMLResponse(content="<h2>404 -- index.html not found</h2>", status_code=404)
+    return HTMLResponse(content=f"<h2>404 — index.html not found</h2>", status_code=404)
 
 @app.get("/api/key")
 async def get_api_key():
@@ -544,11 +785,13 @@ async def get_api_key():
 async def health():
     return {
         "status": "ok",
-        "version": "8.0.0",
+        "version": "8.1.0",
         "fetcher": _FETCHER_AVAILABLE,
         "stealth": _STEALTH_AVAILABLE,
         "css_parser": _CSS_AVAILABLE,
         "lxml": True,
+        "auto_js_sites": list(_JS_RENDERED_SITES.keys()),
+        "explicit_headers": list(set(k[0] for k in _EXPLICIT_HEADERS.keys())),
         "utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -567,12 +810,13 @@ async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key
 @app.post("/api/scrape", response_model=ScrapeResponse)
 async def scrape(body: ScrapeRequest, _key: str = Depends(verify_key)):
     t0 = time.perf_counter()
-    rows, raw_bytes = await _scrape_url(body.url, js=body.js)
+    explicit_headers = _get_explicit_headers(body.url)
+    rows, raw_bytes = await _scrape_url(body.url, js=body.js, explicit_headers=explicit_headers)
     return ScrapeResponse(events=rows, raw_bytes=raw_bytes, elapsed=round(time.perf_counter() - t0, 3))
 
 @app.get("/api/token-status")
 async def token_status(_key: str = Depends(verify_key)):
-    return {"limit_per_key": 100000, "keys": [{"tokens_used": 15400, "tokens_remaining": 84600, "active": True}]}
+    return {"limit_per_key": 100_000, "keys": [{"tokens_used": 15400, "tokens_remaining": 84600, "active": True}]}
 
 @app.on_event("startup")
 async def startup():
@@ -581,7 +825,7 @@ async def startup():
         start_bot()
         print("[BOOT] Telegram bot started.")
     except ImportError:
-        print("[BOOT] telegram_bot.py not found.")
+        print("[BOOT] telegram_bot.py not found — skipping.")
     except Exception as e:
         print(f"[BOOT] Telegram bot failed: {e}")
 
