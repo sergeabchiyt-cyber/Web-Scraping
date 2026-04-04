@@ -1,12 +1,12 @@
 """
-AUDITOR CORE v9.3.0 - AI-Powered Universal Web Scraper (Accuracy Optimized)
-────────────────────────────────────────────────────────────────────────────
+AUDITOR CORE v9.4.0 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
+────────────────────────────────────────────────────────────────────────────────────
 Changes:
-  • Load environment variables from .env file
-  • Increased MAX_HTML_FOR_AI to 120,000 characters for better context
-  • Improved prompt to format numbers as B, M, T (e.g., $1.23B, 456M)
-  • AI-only extraction (no fallback)
-────────────────────────────────────────────────────────────────────────────
+  • Uses readability-lxml to extract main content (tables, lists, data) – no hard cap
+  • Falls back to BeautifulSoup if readability not installed
+  • Only truncates when exceeding model's token limit (safe 500k chars)
+  • Improved number formatting (B, M, T suffixes) with strict "copy then format" rule
+────────────────────────────────────────────────────────────────────────────────────
 """
 
 # Load environment variables from .env file first
@@ -32,6 +32,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from pydantic import BaseModel
+from bs4 import BeautifulSoup
+
+# ── Readability (for main content extraction) ────────────────────────────────
+try:
+    from readability import Document
+    _READABILITY_AVAILABLE = True
+    print("[BOOT] readability-lxml loaded")
+except ImportError:
+    Document = None
+    _READABILITY_AVAILABLE = False
+    print("[BOOT] readability-lxml not installed – using BeautifulSoup fallback")
 
 # ── Mistral AI ────────────────────────────────────────────────────────────────
 try:
@@ -64,17 +75,18 @@ print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE}  Stealth={_STEALTH_AVAILABLE}  Mistr
 
 cpu_executor = concurrent.futures.ProcessPoolExecutor(max_workers=4)
 MAX_PAYLOAD_SIZE = 10_485_760          # 10 MB
-MAX_HTML_FOR_AI = 120_000              # Increased for accuracy (was 40,000)
-MAX_RECORDS = 100                      # Maximum records AI should return
+# No hard cap – but we keep a safety limit to avoid hitting model's 256k token limit
+# ~4 chars per token => 1M chars safe; we set 500k to be conservative.
+MAX_SAFE_CHARS = 500_000
+MAX_RECORDS = 100
 
 # ── Mistral AI Configuration ─────────────────────────────────────────────────
 _MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
 if not _MISTRAL_API_KEY:
     print("[ERROR] MISTRAL_API_KEY environment variable not set. AI extraction will fail.")
-_MISTRAL_MODEL = "codestral-latest"    # Keep codestral for best accuracy
+_MISTRAL_MODEL = "codestral-latest"
 
 def _get_mistral_client() -> Optional[Mistral]:
-    """Return Mistral client if available and API key is set, else None."""
     if not _MISTRAL_AVAILABLE:
         print("[AI] Mistral library not installed.")
         return None
@@ -84,7 +96,7 @@ def _get_mistral_client() -> Optional[Mistral]:
     return Mistral(api_key=_MISTRAL_API_KEY)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# API KEY AUTHENTICATION (for this service, not Mistral)
+# API KEY AUTHENTICATION (for this service)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _ENV_KEY = os.environ.get("AUDITOR_API_KEY", "").strip()
@@ -93,7 +105,6 @@ if not _ENV_KEY:
     print(f"[BOOT] No AUDITOR_API_KEY — generated: {API_KEY}")
 
 def verify_key(x_api_key: str = Header(..., alias="X-Api-Key")) -> str:
-    """Verify the API key for this service."""
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
     return x_api_key
@@ -106,7 +117,7 @@ class ScrapeRequest(BaseModel):
     url: str
     adaptive: bool = True
     js: bool = False
-    extract_type: str = "auto"  # "table", "list", "card", "auto"
+    extract_type: str = "auto"
 
 class ScrapeResponse(BaseModel):
     events: List[Dict[str, Any]]
@@ -118,7 +129,6 @@ class ScrapeResponse(BaseModel):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _is_safe_url(url: str) -> bool:
-    """Block requests to private/local IPs to prevent SSRF attacks."""
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ('http', 'https'):
@@ -129,64 +139,81 @@ def _is_safe_url(url: str) -> bool:
         ip = socket.gethostbyname(hostname)
         ip_int = int.from_bytes(socket.inet_aton(ip), 'big')
         private_blocks = [
-            (0x0A000000, 0xFF000000),   # 10.0.0.0/8
-            (0xAC100000, 0xFFF00000),   # 172.16.0.0/12
-            (0xC0A80000, 0xFFFF0000),   # 192.168.0.0/16
-            (0x7F000000, 0xFF000000),   # 127.0.0.0/8
-            (0xA9FE0000, 0xFFFF0000),   # 169.254.0.0/16
-            (0x00000000, 0xFF000000),   # 0.0.0.0/8
+            (0x0A000000, 0xFF000000), (0xAC100000, 0xFFF00000),
+            (0xC0A80000, 0xFFFF0000), (0x7F000000, 0xFF000000),
+            (0xA9FE0000, 0xFFFF0000), (0x00000000, 0xFF000000),
         ]
         return not any((ip_int & mask) == (net & mask) for net, mask in private_blocks)
     except Exception:
         return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HTML PREPROCESSING
+# DYNAMIC MAIN CONTENT EXTRACTION (no hard cap)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _ZW_CHARS = re.compile(r'[\u200b\u200c\u200d\u2060\uFEFF\u00ad]')
 
 def _normalize(text: str) -> str:
-    """Strip zero-width characters and normalize Unicode."""
     if not text:
         return ""
     text = unicodedata.normalize('NFKC', text)
     text = _ZW_CHARS.sub('', text)
     return text.strip()
 
-def _preprocess_html(html: bytes) -> str:
+def _extract_main_content(html: str) -> str:
+    """Extract the core content (tables, lists, data) using readability or BeautifulSoup."""
+    if _READABILITY_AVAILABLE and Document:
+        try:
+            doc = Document(html)
+            main_html = doc.summary()
+            # Clean up readability's extra markup
+            soup = BeautifulSoup(main_html, 'html.parser')
+            # Remove script/style remnants
+            for tag in soup(['script', 'style', 'nav', 'footer', 'aside']):
+                tag.decompose()
+            return str(soup)
+        except Exception as e:
+            print(f"[EXTRACT] readability failed: {e}, falling back to BeautifulSoup")
+    # Fallback: use BeautifulSoup to keep only table/list/div containers
+    soup = BeautifulSoup(html, 'html.parser')
+    for tag in soup(['script', 'style', 'nav', 'footer', 'aside', 'header']):
+        tag.decompose()
+    # Keep only tags likely to contain data
+    main_content = soup.find_all(['table', 'ul', 'ol', 'div', 'section'])
+    if not main_content:
+        return str(soup)
+    return ''.join(str(tag) for tag in main_content)
+
+def _preprocess_html(html_bytes: bytes) -> str:
     """
-    Decode HTML, remove script/style tags, and truncate for AI consumption.
+    Decode, extract main content, and only truncate if exceeding MAX_SAFE_CHARS.
     """
     try:
-        text = html.decode('utf-8', errors='replace')
+        text = html_bytes.decode('utf-8', errors='replace')
     except Exception:
-        text = html.decode('latin-1', errors='replace')
+        text = html_bytes.decode('latin-1', errors='replace')
 
-    # Remove script, style, and noscript blocks
-    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<noscript[^>]*>.*?</noscript>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # Extract main content (removes noise, keeps data)
+    main = _extract_main_content(text)
+    print(f"[PREPROCESS] Original: {len(text):,} chars → Main content: {len(main):,} chars")
 
-    if len(text) > MAX_HTML_FOR_AI:
-        text = text[:MAX_HTML_FOR_AI] + "\n\n[... TRUNCATED ...]"
-
-    return text
+    if len(main) > MAX_SAFE_CHARS:
+        # Keep first 80% and last 20% (tables often at top, but sometimes pagination at bottom)
+        keep_start = int(MAX_SAFE_CHARS * 0.8)
+        keep_end = MAX_SAFE_CHARS - keep_start
+        main = main[:keep_start] + "\n[... TRUNCATED ...]\n" + main[-keep_end:]
+        print(f"[PREPROCESS] Truncated to {MAX_SAFE_CHARS:,} chars")
+    return main
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AI EXTRACTION ENGINE (Universal, with number formatting)
+# AI EXTRACTION ENGINE (with number formatting)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> List[Dict[str, Any]]:
-    """
-    Extract structured data from HTML using Mistral AI.
-    Returns empty list if AI extraction fails.
-    """
     result = _extract_with_mistral(html_content, url, extract_type)
     return result if result is not None else []
 
 def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[List[Dict[str, Any]]]:
-    """Call Mistral AI and parse the JSON response."""
     client = _get_mistral_client()
     if not client:
         return None
@@ -194,88 +221,70 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
     prompt = _build_accuracy_prompt(html, url, extract_type)
 
     try:
-        print(f"[AI] Sending request to {_MISTRAL_MODEL}...")
+        print(f"[AI] Sending to {_MISTRAL_MODEL} (HTML size: {len(html):,} chars)")
         response = client.chat.complete(
             model=_MISTRAL_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,  # Lowest temperature for consistent, deterministic output
+            temperature=0.0,
         )
         content = response.choices[0].message.content
-        print(f"[AI] Received response ({len(content)} chars)")
+        print(f"[AI] Response received ({len(content)} chars)")
         return _parse_ai_response(content)
     except Exception as e:
         print(f"[AI] Mistral extraction failed: {e}")
         return None
 
 def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
-    """
-    Create a prompt that instructs AI to format numbers with B/M/T suffixes.
-    """
     structure_hint = ""
     if extract_type == "table":
-        structure_hint = "The page likely contains HTML tables. Extract each row as an object."
+        structure_hint = "Extract each table row as an object."
     elif extract_type == "list":
-        structure_hint = "The page likely contains repeated list items. Extract each item as an object."
+        structure_hint = "Extract each list item as an object."
     elif extract_type == "card":
-        structure_hint = "The page likely contains card-like components. Extract each card as an object."
+        structure_hint = "Extract each card as an object."
     else:
-        structure_hint = "Look for any repeated data structures: tables, lists, cards, or grids."
+        structure_hint = "Look for any repeated data structures (tables, lists, cards)."
 
-    return f"""You are a data extraction assistant with a focus on ACCURACY and NUMBER FORMATTING.
+    return f"""You are a data extraction assistant. Your task is to copy numbers EXACTLY as they appear in the HTML, then format them with B (billions), M (millions), or T (trillions) suffixes.
+
+CRITICAL RULES:
+- DO NOT invent numbers. If a number is missing, use null.
+- For numbers >= 1,000,000, convert to: $1.23B, 45.6M, 2.1T (one decimal place if needed).
+- For percentages, keep as is (e.g., 52.34%).
+- For numbers < 1,000,000, keep raw with commas (e.g., 123,456).
+- For currency, keep the symbol ($, €, £) before the formatted number.
+- If you cannot find the data, return an empty array.
 
 URL: {url}
-Extraction hint: {structure_hint}
+Hint: {structure_hint}
 
-CRITICAL NUMBER FORMATTING RULES:
-- For numbers 1 million and above: Use suffixes B (billions), M (millions), T (trillions)
-- Examples: 1,234,567,890 → 1.23B | 45,600,000 → 45.6M | 2,100,000,000,000 → 2.1T
-- For numbers below 1 million: Keep as raw number (e.g., 123,456)
-- For currency: Keep the currency symbol ($, €, £) before the formatted number
-- Percentages: Keep as number with % sign (e.g., 52.34%)
-- Dates/times: Keep in original format, do not change
+HTML (main content extracted):
+{html}
 
-OUTPUT REQUIREMENTS:
-- Return a JSON array of objects. Each object = one data record.
-- If column headers exist (e.g., <th>), use them as keys (convert to snake_case).
-- If no headers, use generic keys like "column_1", "column_2".
-- Trim whitespace, normalize Unicode.
-- Exclude navigation, ads, pagination, layout elements.
-- Limit to the first {MAX_RECORDS} meaningful records.
-- Output ONLY valid JSON. No explanations, markdown, or code fences.
-
-HTML content:
-{html[:110000]}
+Return ONLY a JSON array of objects. Example row:
+{{"exchange": "Binance", "long": "$1.23B", "short": "$0.98B", "total": "$2.21B"}}
 
 JSON array:"""
 
 def _parse_ai_response(content: str) -> Optional[List[Dict[str, Any]]]:
-    """Extract JSON array from AI response, handling markdown code blocks."""
     if not content:
         return None
-
     content = content.strip()
-    # Remove markdown code fences if present
     if content.startswith('```'):
         lines = content.split('\n')
-        # Find the first line that doesn't start with ```
         content = '\n'.join(line for line in lines if not line.startswith('```') and '```' not in line)
-
-    # Locate the first '[' and last ']'
     start = content.find('[')
     end = content.rfind(']') + 1
     if start == -1 or end == 0:
         return None
-
     json_str = content[start:end]
     try:
         data = json.loads(json_str)
         if isinstance(data, list):
-            print(f"[AI] Successfully parsed {len(data)} records")
+            print(f"[AI] Parsed {len(data)} records")
             return data[:MAX_RECORDS]
     except json.JSONDecodeError as e:
-        print(f"[AI] JSON parsing error: {e}")
-        return None
-
+        print(f"[AI] JSON parse error: {e}")
     return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -283,7 +292,6 @@ def _parse_ai_response(content: str) -> Optional[List[Dict[str, Any]]]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _fetch_static(url: str):
-    """Use Scrapling Fetcher for static HTML pages."""
     if Fetcher is None:
         raise RuntimeError("Scrapling Fetcher not installed.")
     try:
@@ -291,13 +299,12 @@ def _fetch_static(url: str):
     except Exception as e:
         raise RuntimeError(f"Fetcher.get() failed: {e}") from e
     if response is None:
-        raise RuntimeError("Fetcher.get() returned None — page unreachable.")
+        raise RuntimeError("Fetcher.get() returned None.")
     return response
 
 def _fetch_js(url: str):
-    """Use StealthyFetcher (Playwright) for JavaScript-heavy pages."""
     if not _STEALTH_AVAILABLE or StealthyFetcher is None:
-        raise RuntimeError("StealthyFetcher unavailable. Install scrapling[all] and run 'scrapling install'.")
+        raise RuntimeError("StealthyFetcher unavailable.")
     try:
         response = StealthyFetcher.fetch(url, headless=True)
     except Exception as e:
@@ -307,7 +314,6 @@ def _fetch_js(url: str):
     return response
 
 def _get_raw_bytes(response) -> bytes:
-    """Extract HTML bytes from a Scrapling response object."""
     for attr in ('html', 'text'):
         val = getattr(response, attr, None)
         if val and isinstance(val, str) and val.strip():
@@ -326,12 +332,8 @@ def _get_raw_bytes(response) -> bytes:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _scrape_url(url: str, js: bool = False, extract_type: str = "auto") -> Tuple[List[Dict[str, Any]], int]:
-    """
-    Fetch the URL (static or JS) and extract data using AI.
-    Returns (extracted_records, raw_bytes).
-    """
     if not _is_safe_url(url):
-        raise HTTPException(status_code=403, detail="Forbidden: private/local IP addresses are blocked.")
+        raise HTTPException(status_code=403, detail="Forbidden: private/local IP blocked.")
 
     loop = asyncio.get_running_loop()
 
@@ -353,21 +355,19 @@ async def _scrape_url(url: str, js: bool = False, extract_type: str = "auto") ->
     print(f"[SCRAPE] {url} → {raw_bytes:,} bytes (js={used_js})")
 
     if raw_bytes == 0:
-        raise HTTPException(status_code=502, detail="Empty response body — page may be blocking scrapers.")
+        raise HTTPException(status_code=502, detail="Empty body.")
     if raw_bytes > MAX_PAYLOAD_SIZE:
-        raise HTTPException(status_code=413, detail=f"Payload too large ({raw_bytes/1_048_576:.1f} MB > 10 MB limit).")
+        raise HTTPException(status_code=413, detail=f"Payload too large ({raw_bytes/1_048_576:.1f} MB).")
 
     html_clean = _preprocess_html(raw)
 
-    # AI extraction (no fallback)
     try:
         rows = await loop.run_in_executor(cpu_executor, extract_with_ai, html_clean, url, extract_type)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI extraction failed: {e}")
 
-    # Auto JS retry if static fetch returned no data but page is large
     if not rows and not used_js and raw_bytes >= 51_200 and _STEALTH_AVAILABLE:
-        print(f"[SCRAPE] No records from static fetch — retrying with JavaScript rendering")
+        print(f"[SCRAPE] No records from static – retrying with JS")
         try:
             response2 = await _do_fetch(True)
             raw2 = _get_raw_bytes(response2)
@@ -375,20 +375,19 @@ async def _scrape_url(url: str, js: bool = False, extract_type: str = "auto") ->
                 html_clean2 = _preprocess_html(raw2)
                 rows2 = await loop.run_in_executor(cpu_executor, extract_with_ai, html_clean2, url, extract_type)
                 if rows2:
-                    print(f"[SCRAPE] JS retry → {len(rows2)} records")
                     rows = rows2
                     raw_bytes = len(raw2)
         except Exception as e:
             print(f"[SCRAPE] JS retry failed: {e}")
 
-    print(f"[SCRAPE] {url} → {len(rows)} records extracted")
+    print(f"[SCRAPE] {url} → {len(rows)} records")
     return rows, raw_bytes
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FASTAPI APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AUDITOR CORE", version="9.3.0")
+app = FastAPI(title="AUDITOR CORE", version="9.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -399,10 +398,7 @@ app.add_middleware(
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    errors = "; ".join(
-        f"{' → '.join(str(l) for l in e['loc'])}: {e['msg']}"
-        for e in exc.errors()
-    )
+    errors = "; ".join(f"{' → '.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors())
     return JSONResponse(status_code=422, content={"detail": f"Validation error — {errors}"})
 
 @app.get("/", include_in_schema=False)
@@ -421,12 +417,13 @@ async def get_api_key():
 async def health():
     return {
         "status": "ok",
-        "version": "9.3.0",
+        "version": "9.4.0",
         "fetcher": _FETCHER_AVAILABLE,
         "stealth": _STEALTH_AVAILABLE,
         "mistral": _MISTRAL_AVAILABLE,
+        "readability": _READABILITY_AVAILABLE,
         "ai_model": _MISTRAL_MODEL if _MISTRAL_AVAILABLE else None,
-        "max_html_chars": MAX_HTML_FOR_AI,
+        "max_safe_chars": MAX_SAFE_CHARS,
         "utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -450,7 +447,6 @@ async def scrape(body: ScrapeRequest, _key: str = Depends(verify_key)):
 
 @app.get("/api/token-status")
 async def token_status(_key: str = Depends(verify_key)):
-    # Placeholder – you can implement actual usage tracking if needed
     return {"limit_per_key": 100_000, "keys": [{"key_index": 1, "tokens_used": 0, "tokens_remaining": 100_000, "active": True}]}
 
 @app.on_event("startup")
@@ -460,7 +456,7 @@ async def startup():
         start_bot()
         print("[BOOT] Telegram bot started.")
     except ImportError:
-        print("[BOOT] telegram_bot.py not found — skipping.")
+        print("[BOOT] telegram_bot.py not found – skipping.")
     except Exception as e:
         print(f"[BOOT] Telegram bot failed: {e}")
 
