@@ -346,46 +346,59 @@ def _cell_label(cell, index: int) -> str:
 # STANDARD TABLE: HEADER DETECTION + ROWSPAN/COLSPAN CARRY
 # ═══════════════════════════════════════════════════════════
 def _find_headers(table) -> Tuple[List[str], List]:
+    """
+    Returns (headers, data_rows).
+
+    Rule: <thead> is ALWAYS authoritative. Never score-compare it against
+    <tbody> rows. This fixes CoinGlass where:
+      - <thead> cells are icon-only SVG → produce positional labels
+      - <tbody> first row ("All" totals) has text → would win the scorer
+      - Without this rule, "121.40K BTC" becomes a column header name
+
+    When no <thead> exists, fall back to scoring <th>-containing rows.
+    """
     all_rows = table.find_all('tr')
     if not all_rows:
         return [], []
 
-    def score_row(row):
+    # ── Path A: <thead> present → use it unconditionally ─────────────────────
+    thead = table.find('thead')
+    if thead:
+        thead_rows = thead.find_all('tr')
+        # Pick the thead row with the most cells; break ties by named-label count
+        best_cells, best_key = None, (-1, -1)
+        for row in thead_rows:
+            cells = row.find_all(['th', 'td'])
+            if not cells:
+                continue
+            labels = [_cell_label(c, i) for i, c in enumerate(cells)]
+            named  = sum(1 for l in labels if not l.startswith('col_'))
+            key    = (len(cells), named)
+            if key > best_key:
+                best_key, best_cells = key, cells
+
+        if best_cells:
+            headers   = [_cell_label(c, i) for i, c in enumerate(best_cells)]
+            tbody     = table.find('tbody')
+            data_rows = (tbody.find_all('tr') if tbody
+                         else [r for r in all_rows if r not in thead_rows])
+            return headers, data_rows
+
+    # ── Path B: no <thead> → score rows, strongly prefer <th> rows ───────────
+    def _score(row):
         cells = row.find_all(['th', 'td'])
         if not cells:
             return -1, cells
         labels   = [_cell_label(c, i) for i, c in enumerate(cells)]
         named    = sum(1 for l in labels if not l.startswith('col_'))
-        th_count = len(row.find_all('th'))
-        # Heavy bonus for structural <th> elements — prevents a data row with
-        # numeric values (e.g. CoinGlass "All" summary row) from outscoring
-        # an icon-based header row that has aria-labels but no visible text.
-        th_bonus = th_count * 5
+        th_bonus = len(row.find_all('th')) * 5
         return named + th_bonus, cells
 
-    # Try <thead> first — always preferred over body rows
-    thead = table.find('thead')
-    if thead:
-        thead_rows = thead.find_all('tr')
-        best_score, best_cells = -1, None
-        for row in thead_rows:
-            score, cells = score_row(row)
-            if score > best_score and cells:
-                best_score, best_cells = score, cells
-        if best_cells is not None:
-            headers   = [_cell_label(c, i) for i, c in enumerate(best_cells)]
-            tbody     = table.find('tbody')
-            data_rows = tbody.find_all('tr') if tbody else [
-                r for r in all_rows if r not in thead_rows
-            ]
-            return headers, data_rows
-
-    # No thead: score all rows, strongly prefer rows with <th> elements
     th_rows    = [r for r in all_rows if r.find('th')]
     candidates = th_rows if th_rows else all_rows
     best_score, best_idx, best_cells = -1, 0, None
     for idx, row in enumerate(candidates):
-        score, cells = score_row(row)
+        score, cells = _score(row)
         if score > best_score and cells:
             best_score, best_idx, best_cells = score, idx, cells
 
@@ -731,17 +744,31 @@ def _fetch_js(url: str):
 # CORE SCRAPE LOGIC
 # ═══════════════════════════════════════════════════════════
 async def _scrape_url(url: str, js: bool = False) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Fetch + extract pipeline.
+
+    Auto-retry logic:
+      If static fetch (js=False) returns ≥50 KB but 0 rows, the page is almost
+      certainly client-side rendered. We automatically retry with StealthyFetcher
+      (headless Playwright) rather than requiring the user to re-submit.
+      This silently fixes: TradingEconomics /calendar/country, investing.com
+      filtered pages, and any SPA where the shell HTML has no pre-rendered table.
+    """
     if not _is_safe_url(url):
         raise HTTPException(status_code=403, detail="FORBIDDEN_DOMAIN — private/loopback blocked.")
 
     loop = asyncio.get_running_loop()
 
-    try:
-        response = await loop.run_in_executor(
-            None, _fetch_js if js else _fetch_static, url
-        )
-    except RuntimeError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+    async def _do_fetch(use_js: bool):
+        try:
+            return await loop.run_in_executor(
+                None, _fetch_js if use_js else _fetch_static, url
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
+    response  = await _do_fetch(js)
+    used_js   = js
 
     try:
         raw = _get_raw_bytes(response)
@@ -749,12 +776,12 @@ async def _scrape_url(url: str, js: bool = False) -> Tuple[List[Dict[str, Any]],
         raise HTTPException(status_code=502, detail=str(e))
 
     raw_bytes = len(raw)
-    print(f"[SCRAPE] {url} → {raw_bytes:,} bytes (js={js})")
+    print(f"[SCRAPE] {url} → {raw_bytes:,} bytes (js={used_js})")
 
     if raw_bytes == 0:
         raise HTTPException(
             status_code=502,
-            detail="Empty body — page may need JS rendering (enable JS context) or is blocking scrapers."
+            detail="Empty body — page may be blocking scrapers."
         )
     if raw_bytes > MAX_PAYLOAD_SIZE:
         raise HTTPException(
@@ -767,7 +794,25 @@ async def _scrape_url(url: str, js: bool = False) -> Tuple[List[Dict[str, Any]],
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {e}")
 
-    print(f"[SCRAPE] {url} → {len(rows)} rows extracted")
+    # ── Auto JS retry ─────────────────────────────────────────────────────────
+    # If static fetch got substantial HTML (≥50 KB) but extracted nothing,
+    # the page is client-side rendered. Retry transparently with Playwright.
+    if not rows and not used_js and raw_bytes >= 51_200 and _STEALTH_AVAILABLE:
+        print(f"[SCRAPE] 0 rows from static fetch ({raw_bytes:,} bytes) → auto-retrying with JS")
+        try:
+            response2 = await _do_fetch(True)
+            raw2      = _get_raw_bytes(response2)
+            if raw2:
+                rows2 = await loop.run_in_executor(cpu_executor, _extract_worker, raw2)
+                if rows2:
+                    print(f"[SCRAPE] JS retry → {len(rows2)} rows")
+                    rows      = rows2
+                    raw_bytes = len(raw2)
+                    used_js   = True
+        except Exception as e:
+            print(f"[SCRAPE] JS retry failed: {e} — returning 0 rows from static")
+
+    print(f"[SCRAPE] {url} → {len(rows)} rows (js={used_js})")
     return rows, raw_bytes
 
 # ═══════════════════════════════════════════════════════════
