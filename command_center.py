@@ -7,7 +7,8 @@ Architecture:
   • NO fallback extraction – relies entirely on AI
 ────────────────────────────────────────────────────────────
 """
-
+from dotenv import load_dotenv
+load_dotenv()
 import os
 import re
 import time
