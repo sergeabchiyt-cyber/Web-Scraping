@@ -19,7 +19,7 @@ import json
 import concurrent.futures
 from datetime import datetime, timezone
 from urllib.parse import urlparse
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
