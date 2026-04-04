@@ -7,3 +7,4 @@ httpx
 beautifulsoup4
 lxml
 tinycss2
+mistralai
