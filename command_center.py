@@ -1,12 +1,18 @@
 """
-AUDITOR CORE v9.4.0 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
+AUDITOR CORE v9.4.1 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
 ────────────────────────────────────────────────────────────────────────────────────
-Changes:
+Changes v9.4.1:
+  • FIXED: Prompt is now fully header-driven — AI reads actual column headers from
+    the HTML and uses them as JSON keys. No hardcoded field names (long/short/total).
+  • FIXED: All columns extracted, not just 3. Includes OI Change 1h/4h/24h, Rate%, etc.
+  • Values copied exactly as-is: signs (+/-), units (BTC/$/%/K/M/B/T) preserved.
+  • Removed example row from prompt — it was causing label hallucination.
+
+Changes v9.4.0:
   • FIXED: Replaced readability-lxml (destroys data pages) with surgical noise removal
   • FIXED: BS4 fallback now BLACKLISTS noise instead of whitelisting tags
   • Strips class/id/style attributes to reduce payload 30-40% with zero data loss
   • Only truncates when exceeding model's token limit (safe 500k chars)
-  • Improved number formatting (B, M, T suffixes) with strict "copy then format" rule
 ────────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -244,12 +250,13 @@ def _preprocess_html(html_bytes: bytes) -> str:
     return main
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AI EXTRACTION ENGINE (with number formatting)
+# AI EXTRACTION ENGINE — universal, header-driven
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> List[Dict[str, Any]]:
     result = _extract_with_mistral(html_content, url, extract_type)
     return result if result is not None else []
+
 
 def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[List[Dict[str, Any]]]:
     client = _get_mistral_client()
@@ -272,47 +279,62 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
         print(f"[AI] Mistral extraction failed: {e}")
         return None
 
+
 def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
-    structure_hint = ""
-    if extract_type == "table":
-        structure_hint = "Extract each table row as an object."
-    elif extract_type == "list":
-        structure_hint = "Extract each list item as an object."
-    elif extract_type == "card":
-        structure_hint = "Extract each card as an object."
-    else:
-        structure_hint = "Look for any repeated data structures (tables, lists, cards)."
+    """
+    Fully header-driven universal prompt.
 
-    return f"""You are a data extraction assistant. Your task is to copy numbers EXACTLY as they appear in the HTML, then format them with B (billions), M (millions), or T (trillions) suffixes.
+    The AI reads whatever column headers / field labels exist in the HTML
+    and uses them verbatim as JSON keys. No example rows, no hardcoded field
+    names — this prevents label hallucination and works on any website.
+    """
+    structure_hint = {
+        "table": "Extract each <tr> data row as one object. Use the <th> or header row text as JSON keys.",
+        "list":  "Extract each list item as one object. Use any visible label/title as the key.",
+        "card":  "Extract each card or repeated block as one object. Use visible field labels as keys.",
+    }.get(
+        extract_type,
+        "Identify the dominant repeated data structure (table rows, list items, or cards). "
+        "Use whatever column headers or field labels are present in the HTML as JSON keys.",
+    )
 
-CRITICAL RULES:
-- DO NOT invent numbers. If a number is missing, use null.
-- For numbers >= 1,000,000, convert to: $1.23B, 45.6M, 2.1T (one decimal place if needed).
-- For percentages, keep as is (e.g., 52.34%).
-- For numbers < 1,000,000, keep raw with commas (e.g., 123,456).
-- For currency, keep the symbol ($, €, £) before the formatted number.
-- If you cannot find the data, return an empty array.
+    return f"""You are a universal data extraction engine. Extract all structured data from the HTML below.
+
+STRICT RULES — follow every one:
+1. READ the actual column headers or field labels from the HTML. Use them EXACTLY as JSON keys.
+   Do NOT rename, translate, shorten, or invent keys.
+2. Extract EVERY column / field you find. Do not skip any.
+3. Copy ALL values EXACTLY as they appear — preserve signs (+/-), units (BTC, ETH, $, %, K, M, B, T),
+   colors encoded as text (e.g. "red", "green"), and any other formatting present.
+4. If a cell is empty or the value is missing, use null.
+5. Do NOT add fields that are not present in the source HTML.
+6. Do NOT hallucinate data. If you are unsure about a value, use null.
+7. Return ONLY a valid JSON array of objects — no markdown fences, no explanation, no preamble.
+8. If no structured data is found, return an empty array: []
+
+{structure_hint}
 
 URL: {url}
-Hint: {structure_hint}
 
-HTML (noise removed, main content only):
+HTML:
 {html}
 
-Return ONLY a JSON array of objects. Example row:
-{{"exchange": "Binance", "long": "$1.23B", "short": "$0.98B", "total": "$2.21B"}}
-
 JSON array:"""
+
 
 def _parse_ai_response(content: str) -> Optional[List[Dict[str, Any]]]:
     if not content:
         return None
     content = content.strip()
+    # Strip markdown fences if model added them despite instructions
     if content.startswith('```'):
         lines = content.split('\n')
-        content = '\n'.join(line for line in lines if not line.startswith('```') and '```' not in line)
+        content = '\n'.join(
+            line for line in lines
+            if not line.startswith('```') and '```' not in line
+        )
     start = content.find('[')
-    end = content.rfind(']') + 1
+    end   = content.rfind(']') + 1
     if start == -1 or end == 0:
         return None
     json_str = content[start:end]
@@ -340,6 +362,7 @@ def _fetch_static(url: str):
         raise RuntimeError("Fetcher.get() returned None.")
     return response
 
+
 def _fetch_js(url: str):
     if not _STEALTH_AVAILABLE or StealthyFetcher is None:
         raise RuntimeError("StealthyFetcher unavailable.")
@@ -350,6 +373,7 @@ def _fetch_js(url: str):
     if response is None:
         raise RuntimeError("StealthyFetcher.fetch() returned None.")
     return response
+
 
 def _get_raw_bytes(response) -> bytes:
     for attr in ('html', 'text'):
@@ -369,7 +393,12 @@ def _get_raw_bytes(response) -> bytes:
 # MAIN SCRAPE PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _scrape_url(url: str, js: bool = False, extract_type: str = "auto") -> Tuple[List[Dict[str, Any]], int]:
+async def _scrape_url(
+    url: str,
+    js: bool = False,
+    extract_type: str = "auto",
+) -> Tuple[List[Dict[str, Any]], int]:
+
     if not _is_safe_url(url):
         raise HTTPException(status_code=403, detail="Forbidden: private/local IP blocked.")
 
@@ -377,12 +406,14 @@ async def _scrape_url(url: str, js: bool = False, extract_type: str = "auto") ->
 
     async def _do_fetch(use_js: bool):
         try:
-            return await loop.run_in_executor(None, _fetch_js if use_js else _fetch_static, url)
+            return await loop.run_in_executor(
+                None, _fetch_js if use_js else _fetch_static, url
+            )
         except RuntimeError as e:
             raise HTTPException(status_code=502, detail=str(e))
 
     response = await _do_fetch(js)
-    used_js = js
+    used_js  = js
 
     try:
         raw = _get_raw_bytes(response)
@@ -395,25 +426,33 @@ async def _scrape_url(url: str, js: bool = False, extract_type: str = "auto") ->
     if raw_bytes == 0:
         raise HTTPException(status_code=502, detail="Empty body.")
     if raw_bytes > MAX_PAYLOAD_SIZE:
-        raise HTTPException(status_code=413, detail=f"Payload too large ({raw_bytes/1_048_576:.1f} MB).")
+        raise HTTPException(
+            status_code=413,
+            detail=f"Payload too large ({raw_bytes / 1_048_576:.1f} MB).",
+        )
 
     html_clean = _preprocess_html(raw)
 
     try:
-        rows = await loop.run_in_executor(cpu_executor, extract_with_ai, html_clean, url, extract_type)
+        rows = await loop.run_in_executor(
+            cpu_executor, extract_with_ai, html_clean, url, extract_type
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI extraction failed: {e}")
 
+    # Auto-retry with JS renderer if static fetch yielded nothing
     if not rows and not used_js and raw_bytes >= 51_200 and _STEALTH_AVAILABLE:
-        print(f"[SCRAPE] No records from static – retrying with JS")
+        print(f"[SCRAPE] No records from static — retrying with JS")
         try:
             response2 = await _do_fetch(True)
             raw2 = _get_raw_bytes(response2)
             if raw2:
                 html_clean2 = _preprocess_html(raw2)
-                rows2 = await loop.run_in_executor(cpu_executor, extract_with_ai, html_clean2, url, extract_type)
+                rows2 = await loop.run_in_executor(
+                    cpu_executor, extract_with_ai, html_clean2, url, extract_type
+                )
                 if rows2:
-                    rows = rows2
+                    rows      = rows2
                     raw_bytes = len(raw2)
         except Exception as e:
             print(f"[SCRAPE] JS retry failed: {e}")
@@ -425,7 +464,7 @@ async def _scrape_url(url: str, js: bool = False, extract_type: str = "auto") ->
 # FASTAPI APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AUDITOR CORE", version="9.4.0")
+app = FastAPI(title="AUDITOR CORE", version="9.4.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -434,36 +473,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    errors = "; ".join(f"{' → '.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors())
+    errors = "; ".join(
+        f"{' → '.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors()
+    )
     return JSONResponse(status_code=422, content={"detail": f"Validation error — {errors}"})
+
 
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir  = os.path.dirname(os.path.abspath(__file__))
     html_path = os.path.join(base_dir, "index.html")
     if os.path.exists(html_path):
         return FileResponse(html_path)
     return HTMLResponse(content="<h2>404 — index.html not found</h2>", status_code=404)
 
+
 @app.get("/api/key")
 async def get_api_key():
     return JSONResponse({"api_key": API_KEY})
 
+
 @app.get("/api/health")
 async def health():
     return {
-        "status": "ok",
-        "version": "9.4.0",
-        "fetcher": _FETCHER_AVAILABLE,
-        "stealth": _STEALTH_AVAILABLE,
-        "mistral": _MISTRAL_AVAILABLE,
-        "readability": False,   # disabled — surgical noise removal used instead
-        "ai_model": _MISTRAL_MODEL if _MISTRAL_AVAILABLE else None,
+        "status":        "ok",
+        "version":       "9.4.1",
+        "fetcher":       _FETCHER_AVAILABLE,
+        "stealth":       _STEALTH_AVAILABLE,
+        "mistral":       _MISTRAL_AVAILABLE,
+        "readability":   False,   # disabled — surgical noise removal used instead
+        "ai_model":      _MISTRAL_MODEL if _MISTRAL_AVAILABLE else None,
         "max_safe_chars": MAX_SAFE_CHARS,
-        "utc": datetime.now(timezone.utc).isoformat(),
+        "utc":           datetime.now(timezone.utc).isoformat(),
     }
+
 
 @app.get("/api/debug-fetch")
 async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key)):
@@ -471,31 +517,44 @@ async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key
         raise HTTPException(status_code=403, detail="Forbidden domain")
     loop = asyncio.get_running_loop()
     try:
-        response = await loop.run_in_executor(None, _fetch_js if js else _fetch_static, url)
-        raw = _get_raw_bytes(response)
+        response = await loop.run_in_executor(
+            None, _fetch_js if js else _fetch_static, url
+        )
+        raw     = _get_raw_bytes(response)
         cleaned = _preprocess_html(raw)
         return {
-            "url": url,
-            "raw_bytes": len(raw),
+            "url":           url,
+            "raw_bytes":     len(raw),
             "cleaned_chars": len(cleaned),
             "retention_pct": round(100 * len(cleaned) / max(len(raw), 1), 1),
-            "preview": cleaned[:2000],
+            "preview":       cleaned[:2000],
         }
     except Exception as e:
         return {"url": url, "error": str(e)}
 
+
 @app.post("/api/scrape", response_model=ScrapeResponse)
 async def scrape(body: ScrapeRequest, _key: str = Depends(verify_key)):
     t0 = time.perf_counter()
-    rows, raw_bytes = await _scrape_url(body.url, js=body.js, extract_type=body.extract_type)
-    return ScrapeResponse(events=rows, raw_bytes=raw_bytes, elapsed=round(time.perf_counter() - t0, 3))
+    rows, raw_bytes = await _scrape_url(
+        body.url, js=body.js, extract_type=body.extract_type
+    )
+    return ScrapeResponse(
+        events=rows,
+        raw_bytes=raw_bytes,
+        elapsed=round(time.perf_counter() - t0, 3),
+    )
+
 
 @app.get("/api/token-status")
 async def token_status(_key: str = Depends(verify_key)):
     return {
         "limit_per_key": 100_000,
-        "keys": [{"key_index": 1, "tokens_used": 0, "tokens_remaining": 100_000, "active": True}],
+        "keys": [
+            {"key_index": 1, "tokens_used": 0, "tokens_remaining": 100_000, "active": True}
+        ],
     }
+
 
 @app.on_event("startup")
 async def startup():
@@ -508,6 +567,7 @@ async def startup():
     except Exception as e:
         print(f"[BOOT] Telegram bot failed: {e}")
 
+
 @app.on_event("shutdown")
 async def shutdown():
     try:
@@ -515,6 +575,7 @@ async def shutdown():
         stop_bot()
     except Exception:
         pass
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
