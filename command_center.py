@@ -1,14 +1,18 @@
 """
-AUDITOR CORE v9.2.0 - AI-Powered Universal Web Scraper
-────────────────────────────────────────────────────────────
-Architecture:
-  • Scrapling fetchers for static/JS content retrieval
-  • Mistral AI (codestral-latest) for structured data extraction
-  • NO fallback extraction – relies entirely on AI
-────────────────────────────────────────────────────────────
+AUDITOR CORE v9.3.0 - AI-Powered Universal Web Scraper (Accuracy Optimized)
+────────────────────────────────────────────────────────────────────────────
+Changes:
+  • Load environment variables from .env file
+  • Increased MAX_HTML_FOR_AI to 120,000 characters for better context
+  • Improved prompt to format numbers as B, M, T (e.g., $1.23B, 456M)
+  • AI-only extraction (no fallback)
+────────────────────────────────────────────────────────────────────────────
 """
+
+# Load environment variables from .env file first
 from dotenv import load_dotenv
 load_dotenv()
+
 import os
 import re
 import time
@@ -20,7 +24,7 @@ import json
 import concurrent.futures
 from datetime import datetime, timezone
 from urllib.parse import urlparse
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
@@ -60,14 +64,14 @@ print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE}  Stealth={_STEALTH_AVAILABLE}  Mistr
 
 cpu_executor = concurrent.futures.ProcessPoolExecutor(max_workers=4)
 MAX_PAYLOAD_SIZE = 10_485_760          # 10 MB
-MAX_HTML_FOR_AI = 40_000               # Truncate HTML before AI call
+MAX_HTML_FOR_AI = 120_000              # Increased for accuracy (was 40,000)
 MAX_RECORDS = 100                      # Maximum records AI should return
 
 # ── Mistral AI Configuration ─────────────────────────────────────────────────
 _MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
 if not _MISTRAL_API_KEY:
     print("[ERROR] MISTRAL_API_KEY environment variable not set. AI extraction will fail.")
-_MISTRAL_MODEL = "codestral-latest"
+_MISTRAL_MODEL = "codestral-latest"    # Keep codestral for best accuracy
 
 def _get_mistral_client() -> Optional[Mistral]:
     """Return Mistral client if available and API key is set, else None."""
@@ -170,7 +174,7 @@ def _preprocess_html(html: bytes) -> str:
     return text
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AI EXTRACTION ENGINE (Universal, no hardcoded fields)
+# AI EXTRACTION ENGINE (Universal, with number formatting)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> List[Dict[str, Any]]:
@@ -187,14 +191,14 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
     if not client:
         return None
 
-    prompt = _build_universal_prompt(html, url, extract_type)
+    prompt = _build_accuracy_prompt(html, url, extract_type)
 
     try:
         print(f"[AI] Sending request to {_MISTRAL_MODEL}...")
         response = client.chat.complete(
             model=_MISTRAL_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
+            temperature=0.0,  # Lowest temperature for consistent, deterministic output
         )
         content = response.choices[0].message.content
         print(f"[AI] Received response ({len(content)} chars)")
@@ -203,37 +207,44 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
         print(f"[AI] Mistral extraction failed: {e}")
         return None
 
-def _build_universal_prompt(html: str, url: str, extract_type: str) -> str:
+def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
     """
-    Create a generic extraction prompt that works for any structured data.
-    No domain-specific column names or hardcoded fields.
+    Create a prompt that instructs AI to format numbers with B/M/T suffixes.
     """
-    # Provide guidance based on extract_type
     structure_hint = ""
     if extract_type == "table":
         structure_hint = "The page likely contains HTML tables. Extract each row as an object."
     elif extract_type == "list":
-        structure_hint = "The page likely contains repeated list items (e.g., <li>, <div class='item'>). Extract each item as an object."
+        structure_hint = "The page likely contains repeated list items. Extract each item as an object."
     elif extract_type == "card":
         structure_hint = "The page likely contains card-like components. Extract each card as an object."
-    else:  # auto
+    else:
         structure_hint = "Look for any repeated data structures: tables, lists, cards, or grids."
 
-    return f"""You are a data extraction assistant. Extract ALL structured data records from the provided HTML.
+    return f"""You are a data extraction assistant with a focus on ACCURACY and NUMBER FORMATTING.
 
 URL: {url}
 Extraction hint: {structure_hint}
 
-Return a JSON array of objects. Each object represents one data record (row, item, card, etc.).
-- If the page has column headers (e.g., <th>), use those as keys (convert to snake_case).
-- If no headers exist, use generic keys like "column_1", "column_2", etc.
-- Keep values as strings (trim whitespace, normalize).
-- Do NOT include navigation, ads, pagination, or layout elements.
+CRITICAL NUMBER FORMATTING RULES:
+- For numbers 1 million and above: Use suffixes B (billions), M (millions), T (trillions)
+- Examples: 1,234,567,890 → 1.23B | 45,600,000 → 45.6M | 2,100,000,000,000 → 2.1T
+- For numbers below 1 million: Keep as raw number (e.g., 123,456)
+- For currency: Keep the currency symbol ($, €, £) before the formatted number
+- Percentages: Keep as number with % sign (e.g., 52.34%)
+- Dates/times: Keep in original format, do not change
+
+OUTPUT REQUIREMENTS:
+- Return a JSON array of objects. Each object = one data record.
+- If column headers exist (e.g., <th>), use them as keys (convert to snake_case).
+- If no headers, use generic keys like "column_1", "column_2".
+- Trim whitespace, normalize Unicode.
+- Exclude navigation, ads, pagination, layout elements.
 - Limit to the first {MAX_RECORDS} meaningful records.
-- Output ONLY valid JSON. Do not add explanations, markdown formatting, or code fences.
+- Output ONLY valid JSON. No explanations, markdown, or code fences.
 
 HTML content:
-{html[:35000]}
+{html[:110000]}
 
 JSON array:"""
 
@@ -377,7 +388,7 @@ async def _scrape_url(url: str, js: bool = False, extract_type: str = "auto") ->
 # FASTAPI APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AUDITOR CORE", version="9.2.0")
+app = FastAPI(title="AUDITOR CORE", version="9.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -410,11 +421,12 @@ async def get_api_key():
 async def health():
     return {
         "status": "ok",
-        "version": "9.2.0",
+        "version": "9.3.0",
         "fetcher": _FETCHER_AVAILABLE,
         "stealth": _STEALTH_AVAILABLE,
         "mistral": _MISTRAL_AVAILABLE,
         "ai_model": _MISTRAL_MODEL if _MISTRAL_AVAILABLE else None,
+        "max_html_chars": MAX_HTML_FOR_AI,
         "utc": datetime.now(timezone.utc).isoformat(),
     }
 
