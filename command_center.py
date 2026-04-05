@@ -1,30 +1,36 @@
 """
-AUDITOR CORE v9.7.0 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
+AUDITOR CORE v9.7.1 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
 ────────────────────────────────────────────────────────────────────────────────────
-Changes v9.7.0:
-  • ADDED dynamic row-boundary batching for large tables:
-    - Measures average row size from first 10 rows of the actual HTML
-    - Calculates exact batch size: usable_chars / avg_row_chars
-    - Batches are ALWAYS cut between </tr> and <tr> — never mid-row
-    - Each batch includes the header row so AI knows column names
-    - Single oversized row gets its own batch rather than being skipped
-    - All batches merged into one final list after extraction
-    - Pages that fit in one batch (e.g. CoinGlass 24 rows) skip batching entirely
-  • ADDED detailed batch logging:
-    - [BATCH] plan: N rows → B batches, avg row size, batch size calculated
-    - [BATCH] #N/total: rows X–Y, chars sent, tokens estimated
-    - [BATCH] #N result: M records extracted
-    - [BATCH] merge: total records after combining all batches
-    - [BATCH] single row overflow: row index logged when a row exceeds limit alone
+Changes v9.7.1:
+
+  FIXED P1 — No delay between batches hitting rate limit.
+             Added BATCH_DELAY_SECS = 62 second sleep between each batch call.
+             Logged as [BATCH] waiting Xs before next batch.
+
+  FIXED P2 — No retry on 429. Failed batches were silently skipped (0 records).
+             Added retry loop: up to BATCH_MAX_RETRIES=3 attempts per batch.
+             On 429: waits BATCH_RETRY_WAIT_SECS=65s then retries.
+             On other errors: fails immediately, no retry.
+             Logged as [BATCH] #N retry A/3 after 429 — waiting Xs.
+
+  FIXED P4 — Time/date columns missing because they had no <th> header.
+             Added _infer_column_names(): scans headerless columns and assigns
+             semantic names based on content patterns:
+               - HH:MM pattern       → "Time"
+               - date/month words    → "Date"
+               - 2-letter uppercase  → "Country"
+               - % or decimal number → "Value"
+             Replaces col_2/col_3/col_4 with meaningful names before AI sees HTML.
 
 Previous fixes (all retained):
-  v9.6.0 — Cerebras GLM-4.7 swap, log spam fix (score > 2 only).
+  v9.7.0 — dynamic row-boundary batching, batch logging.
+  v9.6.0 — Cerebras GLM-4.7 swap (now qwen-3-235b), log spam fix.
   v9.5.4 — F11 empty-key promotion, F12 image-only name cells.
-  v9.5.3 — F9 honest [] on JS-required pages, F10 JSON script preservation.
-  v9.5.2 — F7 table isolation, F8 schema consistency check.
-  v9.5.1 — F6 inline tag unwrapping, HTML tag sanitisation in values.
+  v9.5.3 — F9 honest [] on JS pages, F10 JSON script preservation.
+  v9.5.2 — F7 table isolation, F8 schema consistency.
+  v9.5.1 — F6 inline tag unwrapping, HTML sanitisation.
   v9.5.0 — F1–F5 quality gate, JS retry, data-* attrs, empty-key fallback.
-  v9.4.0 — surgical noise removal (blacklist, not readability).
+  v9.4.0 — surgical noise removal.
 ────────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -90,24 +96,29 @@ print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE}  Stealth={_STEALTH_AVAILABLE}  Cereb
 cpu_executor       = concurrent.futures.ProcessPoolExecutor(max_workers=4)
 MAX_PAYLOAD_SIZE   = 10_485_760
 MAX_SAFE_CHARS     = 500_000
-MAX_RECORDS        = 100
+MAX_RECORDS        = 1000           # raised — large calendars need more
 MIN_FIELDS_PER_ROW = 2
 MIN_QUALITY_RATIO  = 0.5
 MIN_SCHEMA_OVERLAP = 0.5
 
-# Batching — ~30k tokens per batch, leaving ~1k for prompt overhead
-# 30k tokens × 4 chars/token = 120k chars capacity
-# minus ~4k chars prompt overhead = 116k usable chars per batch
-MAX_BATCH_CHARS    = 120_000   # total capacity per batch
-BATCH_OVERHEAD     = 4_000     # prompt + header reserved chars
-BATCH_USABLE       = MAX_BATCH_CHARS - BATCH_OVERHEAD   # 116,000 usable chars
-CHARS_PER_TOKEN    = 4         # estimation constant
+# Batching
+MAX_BATCH_CHARS    = 120_000
+BATCH_OVERHEAD     = 4_000
+BATCH_USABLE       = MAX_BATCH_CHARS - BATCH_OVERHEAD   # 116,000
+CHARS_PER_TOKEN    = 4
+
+# FIX P1: delay between batches to respect 64k TPM rate limit
+BATCH_DELAY_SECS      = 62    # wait 62s between batches (~1 token-minute gap)
+
+# FIX P2: retry on 429
+BATCH_MAX_RETRIES     = 3     # max retry attempts per batch
+BATCH_RETRY_WAIT_SECS = 65    # wait 65s before retrying after 429
 
 # ── Cerebras config ───────────────────────────────────────────────────────────
 _CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "").strip()
 if not _CEREBRAS_API_KEY:
     print("[ERROR] CEREBRAS_API_KEY not set — AI extraction will fail.")
-_CEREBRAS_MODEL="qwen-3-235b-a22b-instruct-2507"
+_CEREBRAS_MODEL = "qwen-3-235b-a22b-instruct-2507"
 
 def _get_cerebras_client() -> Optional["Cerebras"]:
     if not _CEREBRAS_AVAILABLE:
@@ -211,6 +222,17 @@ _JSON_DATA_SCRIPT_IDS = re.compile(
     re.IGNORECASE,
 )
 
+# FIX P4: patterns for semantic column name inference
+_TIME_PATTERN    = re.compile(r'^\d{1,2}:\d{2}(:\d{2})?(\s*(AM|PM))?$', re.IGNORECASE)
+_DATE_PATTERN    = re.compile(
+    r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
+    r'january|february|march|april|may|june|july|august|september|'
+    r'october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b',
+    re.IGNORECASE,
+)
+_COUNTRY_PATTERN = re.compile(r'^[A-Z]{2,3}$')
+_NUMBER_PATTERN  = re.compile(r'^[+-]?\d+\.?\d*%?$')
+
 
 def _normalize(text: str) -> str:
     if not text:
@@ -262,6 +284,86 @@ def _extract_json_scripts(soup: BeautifulSoup) -> str:
     return '\n'.join(json_blocks)
 
 
+def _infer_column_names(soup: BeautifulSoup) -> None:
+    """
+    FIX P4: Find <th> cells that are empty or missing and assign semantic names
+    based on the actual data values in that column position.
+
+    Patterns detected:
+      HH:MM or HH:MM AM/PM  → "Time"
+      Day/Month name        → "Date"
+      2-3 uppercase letters → "Country"
+      Number or percentage  → "Value"
+
+    This runs on the soup BEFORE sending to AI so the AI sees real header names
+    instead of empty <th> cells — which it was ignoring or calling col_2/col_3.
+    """
+    tables = soup.find_all('table')
+    for table in tables:
+        rows = table.find_all('tr')
+        if not rows:
+            continue
+
+        # Find header row
+        header_row = None
+        for row in rows:
+            if row.find('th'):
+                header_row = row
+                break
+        if not header_row:
+            continue
+
+        headers = header_row.find_all(['th', 'td'])
+        data_rows = [r for r in rows if r != header_row and r.find('td')]
+        if not data_rows:
+            continue
+
+        inferred = 0
+        for col_idx, th in enumerate(headers):
+            # Only process empty or whitespace-only headers
+            if th.get_text(strip=True):
+                continue
+
+            # Sample up to 10 data rows for this column position
+            samples = []
+            for dr in data_rows[:10]:
+                cells = dr.find_all(['td', 'th'])
+                if col_idx < len(cells):
+                    val = cells[col_idx].get_text(strip=True)
+                    if val:
+                        samples.append(val)
+
+            if not samples:
+                continue
+
+            # Score each pattern across samples
+            time_hits    = sum(1 for s in samples if _TIME_PATTERN.match(s))
+            date_hits    = sum(1 for s in samples if _DATE_PATTERN.search(s))
+            country_hits = sum(1 for s in samples if _COUNTRY_PATTERN.match(s))
+            number_hits  = sum(1 for s in samples if _NUMBER_PATTERN.match(s))
+
+            threshold = len(samples) * 0.5  # majority of samples must match
+
+            if time_hits >= threshold:
+                name = "Time"
+            elif date_hits >= threshold:
+                name = "Date"
+            elif country_hits >= threshold:
+                name = "Country"
+            elif number_hits >= threshold:
+                name = "Value"
+            else:
+                continue  # can't infer — leave empty, prompt fallback handles it
+
+            th.string = name
+            inferred += 1
+            print(f"[INFER] col {col_idx+1} → '{name}' "
+                  f"(samples: {samples[:3]})")
+
+        if inferred:
+            print(f"[INFER] {inferred} column name(s) inferred from data patterns")
+
+
 def _clean_soup(soup: BeautifulSoup) -> Tuple[BeautifulSoup, str]:
     _replace_img_with_alt(soup)
     json_appendix = _extract_json_scripts(soup)
@@ -281,6 +383,10 @@ def _clean_soup(soup: BeautifulSoup) -> Tuple[BeautifulSoup, str]:
         if tag.parent is None:
             continue
         tag.unwrap()
+
+    # FIX P4: infer semantic names for empty header cells
+    _infer_column_names(soup)
+
     for tag in soup.find_all(True):
         tag.attrs = {
             k: v for k, v in tag.attrs.items()
@@ -354,7 +460,6 @@ def _preprocess_html(html_bytes: bytes) -> str:
     isolated_len = len(isolated)
     print(f"[PREPROCESS] {cleaned_len:,} → {isolated_len:,} chars after table isolation")
 
-    # Note: no MAX_SAFE_CHARS truncation here — batching handles oversized tables
     return isolated
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -362,30 +467,15 @@ def _preprocess_html(html_bytes: bytes) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _split_table_into_batches(html: str) -> List[Tuple[str, int, int]]:
-    """
-    Split a table's <tr> rows into batches that fit within BATCH_USABLE chars.
-
-    Rules:
-    - Header row (<tr> containing <th>) is prepended to EVERY batch so the AI
-      always knows column names.
-    - Batch boundaries fall ONLY between </tr> and <tr> — never mid-row.
-    - A single row that exceeds BATCH_USABLE on its own is sent as its own batch
-      rather than being dropped.
-    - Pages that fit in one batch skip splitting entirely.
-
-    Returns list of (batch_html, start_row_idx, end_row_idx) tuples.
-    """
-    soup = BeautifulSoup(html, 'html.parser')
+    soup     = BeautifulSoup(html, 'html.parser')
     all_rows = soup.find_all('tr')
 
     if not all_rows:
-        # Not a table — return full HTML as single "batch"
-        print("[BATCH] No <tr> elements found — treating as single non-table batch")
+        print("[BATCH] No <tr> elements — treating as single non-table batch")
         return [(html, 0, 0)]
 
-    # Identify header row — first <tr> that contains at least one <th>
-    header_row  = None
-    data_rows   = []
+    header_row = None
+    data_rows  = []
     for row in all_rows:
         if header_row is None and row.find('th'):
             header_row = row
@@ -397,73 +487,55 @@ def _split_table_into_batches(html: str) -> List[Tuple[str, int, int]]:
     total_rows   = len(data_rows)
 
     if total_rows == 0:
-        print("[BATCH] No data rows found — sending header only")
+        print("[BATCH] No data rows — sending header only")
         return [(html, 0, 0)]
 
-    # Measure average row size from first 10 data rows (or all if fewer)
-    sample      = data_rows[:min(10, total_rows)]
-    sample_chars = sum(len(str(r)) for r in sample)
+    sample        = data_rows[:min(10, total_rows)]
+    sample_chars  = sum(len(str(r)) for r in sample)
     avg_row_chars = max(sample_chars / len(sample), 1)
 
-    # Dynamic batch size: how many complete rows fit in usable chars
-    # minus header which is included in every batch
     usable_per_batch = BATCH_USABLE - header_chars
     batch_size       = max(int(usable_per_batch / avg_row_chars), 1)
-
-    num_batches = math.ceil(total_rows / batch_size)
-    est_tokens  = int(avg_row_chars / CHARS_PER_TOKEN)
+    num_batches      = math.ceil(total_rows / batch_size)
+    est_tokens       = int(avg_row_chars / CHARS_PER_TOKEN)
 
     print(f"[BATCH] Plan: {total_rows} rows | avg row={avg_row_chars:.0f} chars "
           f"({est_tokens} tokens) | batch_size={batch_size} rows | "
           f"batches={num_batches} | header={header_chars} chars")
 
-    # If everything fits in one batch — no splitting needed
     total_data_chars = sum(len(str(r)) for r in data_rows)
     if total_data_chars + header_chars <= BATCH_USABLE:
         print(f"[BATCH] All {total_rows} rows fit in one batch "
               f"({total_data_chars + header_chars:,} chars) — no splitting")
         return [(html, 0, total_rows - 1)]
 
-    # Build batches by accumulating complete rows
     batches: List[Tuple[str, int, int]] = []
-    current_rows: List[Tag]  = []
-    current_chars: int       = header_chars
-    batch_start_idx: int     = 0
+    current_rows: List[Tag] = []
+    current_chars: int      = header_chars
+    batch_start_idx: int    = 0
 
     for i, row in enumerate(data_rows):
         row_html  = str(row)
         row_chars = len(row_html)
 
-        # Single row exceeds budget on its own — send it alone
         if row_chars > BATCH_USABLE:
-            # Flush current batch first if non-empty
             if current_rows:
                 batch_html = _assemble_batch_html(header_html, current_rows)
                 batches.append((batch_html, batch_start_idx, i - 1))
-                print(f"[BATCH] #{len(batches)}/{num_batches}: "
-                      f"rows {batch_start_idx+1}–{i} | "
-                      f"{len(batch_html):,} chars | "
-                      f"~{len(batch_html) // CHARS_PER_TOKEN:,} tokens")
+                _log_batch_plan(len(batches), num_batches, batch_start_idx, i - 1, batch_html)
                 current_rows  = []
                 current_chars = header_chars
-
-            # Send oversized row alone
             batch_html = _assemble_batch_html(header_html, [row])
             batches.append((batch_html, i, i))
             print(f"[BATCH] #{len(batches)}/{num_batches}: "
-                  f"row {i+1} (OVERSIZED: {row_chars:,} chars) | "
-                  f"~{row_chars // CHARS_PER_TOKEN:,} tokens")
+                  f"row {i+1} (OVERSIZED: {row_chars:,} chars)")
             batch_start_idx = i + 1
             continue
 
-        # Adding this row would overflow — flush current batch first
         if current_chars + row_chars > BATCH_USABLE and current_rows:
             batch_html = _assemble_batch_html(header_html, current_rows)
             batches.append((batch_html, batch_start_idx, i - 1))
-            print(f"[BATCH] #{len(batches)}/{num_batches}: "
-                  f"rows {batch_start_idx+1}–{i} | "
-                  f"{len(batch_html):,} chars | "
-                  f"~{len(batch_html) // CHARS_PER_TOKEN:,} tokens")
+            _log_batch_plan(len(batches), num_batches, batch_start_idx, i - 1, batch_html)
             current_rows    = []
             current_chars   = header_chars
             batch_start_idx = i
@@ -471,21 +543,23 @@ def _split_table_into_batches(html: str) -> List[Tuple[str, int, int]]:
         current_rows.append(row)
         current_chars += row_chars
 
-    # Flush final batch
     if current_rows:
         batch_html = _assemble_batch_html(header_html, current_rows)
         batches.append((batch_html, batch_start_idx, total_rows - 1))
-        print(f"[BATCH] #{len(batches)}/{num_batches}: "
-              f"rows {batch_start_idx+1}–{total_rows} | "
-              f"{len(batch_html):,} chars | "
-              f"~{len(batch_html) // CHARS_PER_TOKEN:,} tokens")
+        _log_batch_plan(len(batches), num_batches, batch_start_idx, total_rows - 1, batch_html)
 
     print(f"[BATCH] Split complete: {len(batches)} batches for {total_rows} rows")
     return batches
 
 
+def _log_batch_plan(batch_num: int, total: int, start: int, end: int, html: str) -> None:
+    chars = len(html)
+    tokens = chars // CHARS_PER_TOKEN
+    print(f"[BATCH] #{batch_num}/{total}: rows {start+1}–{end+1} | "
+          f"{chars:,} chars | ~{tokens:,} tokens")
+
+
 def _assemble_batch_html(header_html: str, rows: List[Tag]) -> str:
-    """Wrap header + data rows in a <table> tag for the AI."""
     rows_html = ''.join(str(r) for r in rows)
     return f"<table>{header_html}{rows_html}</table>"
 
@@ -594,58 +668,96 @@ def _sanitize_row_values(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return _clean_row_keys(stripped)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AI EXTRACTION ENGINE — Cerebras GLM-4.7 with batching
+# AI EXTRACTION ENGINE — Cerebras with batching + delay + retry
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> List[Dict[str, Any]]:
     """
-    Entry point for AI extraction.
-    Splits into batches if needed, calls Cerebras per batch, merges results.
+    Entry point. Splits into batches if needed, sends each with delay and retry,
+    merges all results.
     """
     batches = _split_table_into_batches(html_content)
-    needs_batching = len(batches) > 1
 
-    if not needs_batching:
-        # Single batch — direct call, no merging needed
-        result = _extract_with_cerebras(html_content, url, extract_type)
+    if len(batches) == 1:
+        result = _extract_with_retry(html_content, url, extract_type, batch_num=1, total=1)
         return result if result is not None else []
 
-    # Multi-batch — call AI per batch and merge
     all_rows: List[Dict[str, Any]] = []
+
     for idx, (batch_html, start, end) in enumerate(batches):
         batch_num = idx + 1
+
+        # FIX P1: wait between batches (not before the first one)
+        if idx > 0:
+            print(f"[BATCH] Waiting {BATCH_DELAY_SECS}s before batch {batch_num}/{len(batches)} "
+                  f"to respect TPM rate limit...")
+            time.sleep(BATCH_DELAY_SECS)
+
         print(f"[BATCH] Sending batch {batch_num}/{len(batches)} to AI "
               f"(rows {start+1}–{end+1})")
-        result = _extract_with_cerebras(batch_html, url, extract_type)
+
+        result = _extract_with_retry(batch_html, url, extract_type,
+                                     batch_num=batch_num, total=len(batches))
         if result:
             print(f"[BATCH] #{batch_num} result: {len(result)} records extracted")
             all_rows.extend(result)
         else:
-            print(f"[BATCH] #{batch_num} result: 0 records — batch may have failed or been empty")
+            print(f"[BATCH] #{batch_num} result: 0 records — skipping")
 
     print(f"[BATCH] Merge complete: {len(all_rows)} total records from {len(batches)} batches")
     return all_rows[:MAX_RECORDS]
 
 
-def _extract_with_cerebras(html: str, url: str, extract_type: str) -> Optional[List[Dict[str, Any]]]:
+def _extract_with_retry(
+    html: str,
+    url: str,
+    extract_type: str,
+    batch_num: int = 1,
+    total: int = 1,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    FIX P2: Wraps _extract_with_cerebras with retry logic.
+    On 429: waits BATCH_RETRY_WAIT_SECS then retries up to BATCH_MAX_RETRIES times.
+    On any other error: fails immediately.
+    """
+    for attempt in range(1, BATCH_MAX_RETRIES + 1):
+        try:
+            return _extract_with_cerebras(html, url, extract_type)
+        except Exception as e:
+            err_str = str(e)
+            is_429  = '429' in err_str or 'token_quota_exceeded' in err_str
+
+            if is_429 and attempt < BATCH_MAX_RETRIES:
+                print(f"[BATCH] #{batch_num}/{total} retry {attempt}/{BATCH_MAX_RETRIES} "
+                      f"after 429 — waiting {BATCH_RETRY_WAIT_SECS}s...")
+                time.sleep(BATCH_RETRY_WAIT_SECS)
+                continue
+
+            print(f"[BATCH] #{batch_num}/{total} failed after {attempt} attempt(s): {e}")
+            return None
+
+    return None
+
+
+def _extract_with_cerebras(html: str, url: str, extract_type: str) -> List[Dict[str, Any]]:
+    """
+    Raw Cerebras call — raises on any error so retry logic can catch it.
+    """
     client = _get_cerebras_client()
     if not client:
-        return None
+        return []
     prompt = _build_accuracy_prompt(html, url, extract_type)
-    try:
-        print(f"[AI] Sending to {_CEREBRAS_MODEL} ({len(html):,} chars "
-              f"~{len(html) // CHARS_PER_TOKEN:,} tokens)")
-        response = client.chat.completions.create(
-            model=_CEREBRAS_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-        )
-        content = response.choices[0].message.content
-        print(f"[AI] Response received ({len(content)} chars)")
-        return _parse_ai_response(content)
-    except Exception as e:
-        print(f"[AI] Cerebras extraction failed: {e}")
-        return None
+    print(f"[AI] Sending to {_CEREBRAS_MODEL} ({len(html):,} chars "
+          f"~{len(html) // CHARS_PER_TOKEN:,} tokens)")
+    response = client.chat.completions.create(
+        model=_CEREBRAS_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+    )
+    content = response.choices[0].message.content
+    print(f"[AI] Response received ({len(content)} chars)")
+    parsed = _parse_ai_response(content)
+    return parsed if parsed is not None else []
 
 
 def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
@@ -870,7 +982,7 @@ async def _scrape_url(
 # FASTAPI APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AUDITOR CORE", version="9.7.0")
+app = FastAPI(title="AUDITOR CORE", version="9.7.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -901,25 +1013,27 @@ async def get_api_key():
 @app.get("/api/health")
 async def health():
     return {
-        "status":             "ok",
-        "version":            "9.7.0",
-        "fetcher":            _FETCHER_AVAILABLE,
-        "stealth":            _STEALTH_AVAILABLE,
-        "cerebras":           _CEREBRAS_AVAILABLE,
-        "readability":        False,
-        "ai_model":           _CEREBRAS_MODEL if _CEREBRAS_AVAILABLE else None,
-        "max_safe_chars":     MAX_SAFE_CHARS,
-        "max_batch_chars":    MAX_BATCH_CHARS,
-        "batch_usable":       BATCH_USABLE,
-        "min_fields_per_row": MIN_FIELDS_PER_ROW,
-        "min_quality_ratio":  MIN_QUALITY_RATIO,
-        "min_schema_overlap": MIN_SCHEMA_OVERLAP,
-        "utc":                datetime.now(timezone.utc).isoformat(),
+        "status":               "ok",
+        "version":              "9.7.1",
+        "fetcher":              _FETCHER_AVAILABLE,
+        "stealth":              _STEALTH_AVAILABLE,
+        "cerebras":             _CEREBRAS_AVAILABLE,
+        "readability":          False,
+        "ai_model":             _CEREBRAS_MODEL if _CEREBRAS_AVAILABLE else None,
+        "max_safe_chars":       MAX_SAFE_CHARS,
+        "max_batch_chars":      MAX_BATCH_CHARS,
+        "batch_usable":         BATCH_USABLE,
+        "batch_delay_secs":     BATCH_DELAY_SECS,
+        "batch_max_retries":    BATCH_MAX_RETRIES,
+        "batch_retry_wait":     BATCH_RETRY_WAIT_SECS,
+        "min_fields_per_row":   MIN_FIELDS_PER_ROW,
+        "min_quality_ratio":    MIN_QUALITY_RATIO,
+        "min_schema_overlap":   MIN_SCHEMA_OVERLAP,
+        "utc":                  datetime.now(timezone.utc).isoformat(),
     }
 
 @app.get("/api/debug-fetch")
 async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key)):
-    """Debug without AI: sizes at each stage + batch plan + 3000-char preview."""
     if not _is_safe_url(url):
         raise HTTPException(status_code=403, detail="Forbidden domain")
     loop = asyncio.get_running_loop()
@@ -942,6 +1056,7 @@ async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key
             "isolation_pct":     round(100 * len(isolated) / max(len(cleaned), 1), 1),
             "num_batches":       len(batches),
             "batch_sizes":       [len(b[0]) for b in batches],
+            "est_total_mins":    round((len(batches) - 1) * BATCH_DELAY_SECS / 60, 1),
             "stealth_available": _STEALTH_AVAILABLE,
             "preview":           isolated[:3000],
         }
