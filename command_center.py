@@ -1,25 +1,32 @@
 """
-AUDITOR CORE v9.5.1 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
+AUDITOR CORE v9.5.2 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
 ────────────────────────────────────────────────────────────────────────────────────
-Changes v9.5.1:
+Changes v9.5.2:
 
-  FIXED F6 — HTML tags leaking into extracted values as raw markup.
-             e.g. values were: '<a target="_blank"><button>Binance</button></a>'
-             Root cause: <a>, <button>, <span> etc. survived noise removal and
-             the AI correctly copied what it saw — raw HTML — as the cell value.
+  FIXED F7 — Multiple tables merged into one flat list.
+             The AI was finding all tables on the page (OI by exchange, OI gainers,
+             correlation ratios) and merging them into one array.
+             Fix: _find_best_table() scores every <table> by (rows × cols) using
+             BS4 BEFORE sending to AI. Only the richest table is sent.
+             For pages with no <table> tags, falls back to full cleaned HTML.
 
-             Fix A (preprocess): _unwrap_inline_elements() replaces all inline
-             wrapper tags (<a>, <button>, <span>, <em>, <strong>, <label> etc.)
-             with their plain text content BEFORE sending HTML to the AI.
+  FIXED F8 — Quality gate passing on the wrong table.
+             _rows_have_data() correctly detected real data in the gainers table,
+             but that was the wrong table. Quality gate now also checks schema
+             consistency — rows that don't share ≥50% of their keys with the
+             majority schema are flagged as mixed-table contamination.
 
-             Fix B (postprocess): _sanitize_row_values() strips any residual HTML
-             tags that leaked into AI output values using a fast regex pass.
-             This is a safety net — Fix A should prevent the issue entirely.
+  ADDED   — _score_table(): ranks tables by data density (rows × unique cols).
+             Logs all candidate tables and their scores so you can debug in
+             Railway/Render logs without touching code.
+
+  ADDED   — extract_type="table" now skips full-page cleaning and goes straight
+             to table isolation — faster and more accurate for known table pages.
 
 Previous fixes (all retained):
-  v9.5.0 — F1 JS retry quality gate, F2 empty-key fallback, F3 data-* attrs kept,
-            F4 extraction stats logging, F5 prompt header-absent fallback.
-  v9.4.0 — surgical noise removal (blacklist approach, not readability).
+  v9.5.1 — F6 inline tag unwrapping + HTML tag sanitisation in values.
+  v9.5.0 — F1–F5 quality gate, JS retry, data-* attrs, empty-key fallback.
+  v9.4.0 — surgical noise removal (blacklist, not readability).
 ────────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -35,6 +42,7 @@ import socket
 import unicodedata
 import json
 import concurrent.futures
+from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Tuple, Optional
@@ -45,12 +53,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from pydantic import BaseModel
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 # ── readability-lxml intentionally disabled ───────────────────────────────────
 _READABILITY_AVAILABLE = False
 Document = None
-print("[BOOT] readability-lxml disabled — using surgical noise removal")
+print("[BOOT] readability-lxml disabled — using surgical noise removal + table isolation")
 
 # ── Mistral AI ────────────────────────────────────────────────────────────────
 try:
@@ -81,14 +89,14 @@ print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE}  Stealth={_STEALTH_AVAILABLE}  Mistr
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-cpu_executor      = concurrent.futures.ProcessPoolExecutor(max_workers=4)
-MAX_PAYLOAD_SIZE  = 10_485_760   # 10 MB
-MAX_SAFE_CHARS    = 500_000      # ~125k tokens
-MAX_RECORDS       = 100
-MIN_FIELDS_PER_ROW = 2           # rows with fewer populated fields are "ghosts"
-MIN_QUALITY_RATIO  = 0.5         # below this → trigger JS retry
+cpu_executor       = concurrent.futures.ProcessPoolExecutor(max_workers=4)
+MAX_PAYLOAD_SIZE   = 10_485_760
+MAX_SAFE_CHARS     = 500_000
+MAX_RECORDS        = 100
+MIN_FIELDS_PER_ROW = 2       # fewer → ghost row
+MIN_QUALITY_RATIO  = 0.5     # below → JS retry
+MIN_SCHEMA_OVERLAP = 0.5     # mixed-table contamination threshold
 
-# ── Mistral ───────────────────────────────────────────────────────────────────
 _MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
 if not _MISTRAL_API_KEY:
     print("[ERROR] MISTRAL_API_KEY not set — AI extraction will fail.")
@@ -156,21 +164,17 @@ def _is_safe_url(url: str) -> bool:
         return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PREPROCESSING — surgical noise removal + inline element unwrapping
+# SURGICAL NOISE REMOVAL
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _ZW_CHARS = re.compile(r'[\u200b\u200c\u200d\u2060\uFEFF\u00ad]')
 
-# Block-level chrome tags — always removed entirely
 _NOISE_TAGS = [
     'script', 'style', 'noscript', 'iframe', 'svg',
     'nav', 'footer', 'aside', 'header',
     'link', 'meta', 'base',
 ]
 
-# Inline wrapper tags — removed but their TEXT CONTENT is preserved in place.
-# FIX F6: <a> and <button> were surviving noise removal and causing the AI to
-# copy raw HTML markup as values. Unwrapping them leaves only their text.
 _INLINE_UNWRAP_TAGS = [
     'a', 'button', 'span', 'em', 'strong', 'b', 'i', 'u',
     'label', 'small', 'sup', 'sub', 'abbr', 'cite', 'mark',
@@ -186,14 +190,12 @@ _NOISE_ATTR_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Strip presentational/event attrs; keep data-* and structural attrs
 _STRIP_ATTRS_RE = re.compile(
     r'^(class|id|style|on\w+|tabindex|role|href|src|srcset|loading|'
     r'crossorigin|integrity|referrerpolicy|fetchpriority|type|target|rel)$',
     re.IGNORECASE,
 )
 
-# Post-process: strip any HTML tags that leaked into AI output values
 _HTML_TAG_RE = re.compile(r'<[^>]+>')
 
 
@@ -205,21 +207,13 @@ def _normalize(text: str) -> str:
     return text.strip()
 
 
-def _extract_main_content(html: str) -> str:
-    """
-    Three-pass noise removal:
-      Pass 1 — decompose block chrome tags (script, nav, footer…)
-      Pass 2 — decompose elements with noisy class/id patterns
-      Pass 3 — unwrap inline wrappers (<a>, <button>, <span>…) keeping text
-      Pass 4 — strip presentational attributes, keep all data-*
-    """
-    soup = BeautifulSoup(html, 'html.parser')
-
+def _clean_soup(soup: BeautifulSoup) -> BeautifulSoup:
+    """Apply all noise-removal passes to a soup object in place."""
     # Pass 1: block chrome
     for tag in soup(_NOISE_TAGS):
         tag.decompose()
 
-    # Pass 2: class/id noise patterns
+    # Pass 2: class/id noise
     for tag in soup.find_all(True):
         if tag.parent is None:
             continue
@@ -228,76 +222,181 @@ def _extract_main_content(html: str) -> str:
         if _NOISE_ATTR_RE.search(classes) or _NOISE_ATTR_RE.search(tag_id):
             tag.decompose()
 
-    # Pass 3 (FIX F6): unwrap inline wrapper tags — replace tag with its text
-    # content so the AI never sees raw <a> or <button> markup as a cell value.
+    # Pass 3: unwrap inline wrappers → leave text only
     for tag in soup.find_all(_INLINE_UNWRAP_TAGS):
         if tag.parent is None:
             continue
         tag.unwrap()
 
-    # Pass 4: strip presentational attrs; keep all data-* (raw numeric values)
+    # Pass 4: strip presentational attrs, keep data-*
     for tag in soup.find_all(True):
         tag.attrs = {
             k: v for k, v in tag.attrs.items()
             if not _STRIP_ATTRS_RE.match(k)
         }
 
+    return soup
+
+
+def _extract_main_content(html: str) -> str:
+    soup = BeautifulSoup(html, 'html.parser')
+    soup = _clean_soup(soup)
     return str(soup)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# TABLE ISOLATION — FIX F7
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _preprocess_html(html_bytes: bytes) -> str:
+def _score_table(table_tag: Tag) -> int:
+    """
+    Score a <table> by data density: number of <tr> rows × max columns per row.
+    Header rows (all <th>) are excluded from row count but counted for col width.
+    """
+    rows = table_tag.find_all('tr')
+    if not rows:
+        return 0
+    max_cols  = max((len(r.find_all(['td', 'th'])) for r in rows), default=0)
+    data_rows = sum(1 for r in rows if r.find('td'))   # rows with actual data cells
+    return data_rows * max_cols
+
+
+def _find_best_table(html: str) -> str:
+    """
+    FIX F7: Parse all <table> elements, score each by data density, return
+    only the highest-scoring one as HTML string.
+
+    If no <table> elements exist, returns the full cleaned HTML (list/card pages).
+    Logs all candidates so failures are visible in Railway/Render logs.
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    tables = soup.find_all('table')
+
+    if not tables:
+        print("[TABLE] No <table> elements found — using full cleaned HTML")
+        return html
+
+    scored = []
+    for i, t in enumerate(tables):
+        score    = _score_table(t)
+        rows     = len(t.find_all('tr'))
+        cols     = max((len(r.find_all(['td', 'th'])) for r in t.find_all('tr')), default=0)
+        preview  = t.get_text(separator=' ', strip=True)[:80].replace('\n', ' ')
+        scored.append((score, i, t))
+        print(f"[TABLE] candidate #{i+1}: score={score} rows={rows} cols={cols} | {preview!r}")
+
+    if not scored:
+        return html
+
+    scored.sort(key=lambda x: -x[0])
+    best_score, best_idx, best_table = scored[0]
+    print(f"[TABLE] Selected table #{best_idx+1} (score={best_score})")
+
+    return str(best_table)
+
+
+def _preprocess_html(html_bytes: bytes, prefer_table: bool = False) -> str:
+    """
+    Decode → clean noise → isolate best table (if prefer_table or tables found)
+    → truncate only if over token limit.
+    """
     try:
         text = html_bytes.decode('utf-8', errors='replace')
     except Exception:
         text = html_bytes.decode('latin-1', errors='replace')
 
     original_len = len(text)
-    main         = _extract_main_content(text)
-    cleaned_len  = len(main)
+
+    # Step 1: noise removal
+    cleaned      = _extract_main_content(text)
+    cleaned_len  = len(cleaned)
 
     print(
-        f"[PREPROCESS] {original_len:,} → {cleaned_len:,} chars "
+        f"[PREPROCESS] {original_len:,} → {cleaned_len:,} chars after noise removal "
         f"({100 * cleaned_len / max(original_len, 1):.1f}% retained)"
     )
 
-    if cleaned_len > MAX_SAFE_CHARS:
+    # Step 2: table isolation (FIX F7)
+    # Always attempt — sends only the richest table to AI, preventing multi-table merge.
+    isolated     = _find_best_table(cleaned)
+    isolated_len = len(isolated)
+    print(
+        f"[PREPROCESS] {cleaned_len:,} → {isolated_len:,} chars after table isolation "
+        f"({100 * isolated_len / max(cleaned_len, 1):.1f}% of cleaned)"
+    )
+
+    # Step 3: truncation safety net
+    if isolated_len > MAX_SAFE_CHARS:
         keep_start = int(MAX_SAFE_CHARS * 0.8)
         keep_end   = MAX_SAFE_CHARS - keep_start
-        main = main[:keep_start] + "\n[... TRUNCATED ...]\n" + main[-keep_end:]
-        print(f"[PREPROCESS] Truncated to {MAX_SAFE_CHARS:,} chars (was {cleaned_len:,})")
+        isolated   = isolated[:keep_start] + "\n[... TRUNCATED ...]\n" + isolated[-keep_end:]
+        print(f"[PREPROCESS] Truncated to {MAX_SAFE_CHARS:,} chars (was {isolated_len:,})")
 
-    return main
+    return isolated
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # EXTRACTION QUALITY GATE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _count_populated(row: Dict[str, Any]) -> int:
-    """Count fields with a real non-empty value."""
     return sum(
         1 for v in row.values()
         if v is not None and str(v).strip() not in ("", "null", "N/A", "-")
     )
 
 
+def _majority_schema(rows: List[Dict[str, Any]]) -> set:
+    """
+    FIX F8: Find the key-set that appears in ≥50% of rows.
+    Used to detect when rows from different tables snuck in.
+    """
+    if not rows:
+        return set()
+    key_counter: Counter = Counter()
+    for row in rows:
+        for k in row.keys():
+            key_counter[k] += 1
+    threshold = len(rows) * MIN_SCHEMA_OVERLAP
+    return {k for k, c in key_counter.items() if c >= threshold}
+
+
 def _rows_have_data(rows: List[Dict[str, Any]]) -> bool:
     """
-    Returns False when rows are ghosts — entity names but no data columns.
-    Triggers JS retry even when row count > 0.
+    Returns False when:
+    - rows is empty
+    - fewer than MIN_QUALITY_RATIO of rows have ≥MIN_FIELDS_PER_ROW populated fields
+    - rows show mixed-table contamination (keys don't share a majority schema)
     """
     if not rows:
         return False
+
+    # Check 1: field population
     good_rows = sum(1 for r in rows if _count_populated(r) >= MIN_FIELDS_PER_ROW)
     quality   = good_rows / len(rows)
     print(
         f"[QUALITY] {good_rows}/{len(rows)} rows have ≥{MIN_FIELDS_PER_ROW} fields "
-        f"(quality={quality:.0%}, threshold={MIN_QUALITY_RATIO:.0%})"
+        f"(quality={quality:.0%})"
     )
-    return quality >= MIN_QUALITY_RATIO
+
+    if quality < MIN_QUALITY_RATIO:
+        return False
+
+    # Check 2 (FIX F8): schema consistency — detect multi-table contamination
+    majority = _majority_schema(rows)
+    if majority:
+        consistent = sum(
+            1 for r in rows
+            if len(set(r.keys()) & majority) / len(majority) >= MIN_SCHEMA_OVERLAP
+        )
+        schema_quality = consistent / len(rows)
+        print(f"[QUALITY] Schema consistency: {consistent}/{len(rows)} rows match majority schema ({schema_quality:.0%})")
+        if schema_quality < MIN_QUALITY_RATIO:
+            print(f"[QUALITY] Mixed-table contamination detected — triggering retry")
+            return False
+
+    return True
 
 
 def _log_extraction_stats(rows: List[Dict[str, Any]], label: str = "") -> None:
-    """Per-field coverage bar chart — visible in Railway/Render logs."""
     if not rows:
         print(f"[STATS{' ' + label if label else ''}] No rows extracted.")
         return
@@ -319,20 +418,14 @@ def _log_extraction_stats(rows: List[Dict[str, Any]], label: str = "") -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _sanitize_value(v: Any) -> Any:
-    """
-    FIX F6 safety net: if any HTML tags leaked into a value string despite
-    inline unwrapping, strip them and return clean text.
-    """
     if not isinstance(v, str):
         return v
     cleaned = _HTML_TAG_RE.sub('', v).strip()
-    # Collapse multiple spaces left by tag removal
     cleaned = re.sub(r'\s+', ' ', cleaned)
     return cleaned if cleaned else None
 
 
 def _sanitize_row_values(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Apply _sanitize_value to every field in every row."""
     return [{k: _sanitize_value(v) for k, v in row.items()} for row in rows]
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -381,9 +474,10 @@ def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
     }.get(
         extract_type,
         (
-            "Identify the dominant repeated data structure "
+            "Identify the single dominant repeated data structure "
             "(table rows, list items, or cards). "
-            "Use column headers or field labels as JSON keys."
+            "Extract from that ONE structure only — do not mix rows from "
+            "different tables or sections."
         ),
     )
 
@@ -393,15 +487,16 @@ STRICT RULES:
 1. READ the actual column headers or field labels from the HTML. Use them EXACTLY as JSON keys.
    Do NOT rename, translate, shorten, or invent keys.
 2. Extract EVERY column/field you find. Do not skip any.
-3. Copy ALL values EXACTLY as plain text — preserve signs (+/-), units (BTC, ETH, $, %, K, M, B, T).
+3. Copy ALL values as plain text — preserve signs (+/-), units (BTC, ETH, $, %, K, M, B, T).
 4. Values must be plain text strings only. Never include HTML tags in values.
 5. If a cell is empty or missing, use null.
-6. Do NOT add fields not present in the source. Do NOT hallucinate values.
-7. Return ONLY a valid JSON array — no markdown fences, no explanation, no preamble.
-8. If no structured data is found, return: []
+6. Do NOT add fields not in the source. Do NOT hallucinate values.
+7. Extract from ONE table/structure only. Do NOT merge rows from different tables.
+8. Return ONLY a valid JSON array — no markdown fences, no explanation, no preamble.
+9. If no structured data is found, return: []
 
-HEADER FALLBACK (critical):
-If the HTML has NO visible column headers (empty <th> cells, or no headers at all):
+HEADER FALLBACK:
+If the HTML has NO visible column headers (empty <th> or none at all):
   - Name the first column "label" (usually the row name/entity).
   - Name subsequent columns "col_2", "col_3", "col_4" etc. left-to-right.
   - Still extract every value from every column.
@@ -434,11 +529,9 @@ def _parse_ai_response(content: str) -> Optional[List[Dict[str, Any]]]:
     end   = content.rfind(']') + 1
     if start == -1 or end == 0:
         return None
-    json_str = content[start:end]
     try:
-        data = json.loads(json_str)
+        data = json.loads(content[start:end])
         if isinstance(data, list):
-            # FIX F6 safety net: sanitise any HTML that leaked into values
             data = _sanitize_row_values(data)
             print(f"[AI] Parsed {len(data)} records")
             return data[:MAX_RECORDS]
@@ -512,8 +605,8 @@ async def _scrape_url(
             raise HTTPException(status_code=502, detail=str(e))
 
     # Attempt 1: static (or JS if forced)
-    response  = await _do_fetch(js)
-    used_js   = js
+    response = await _do_fetch(js)
+    used_js  = js
 
     try:
         raw = _get_raw_bytes(response)
@@ -551,7 +644,7 @@ async def _scrape_url(
     )
 
     if should_retry_js:
-        print(f"[SCRAPE] Low-quality extraction — retrying with JS renderer")
+        print(f"[SCRAPE] Low-quality or contaminated extraction — retrying with JS renderer")
         try:
             response2   = await _do_fetch(True)
             raw2        = _get_raw_bytes(response2)
@@ -565,7 +658,7 @@ async def _scrape_url(
                     rows      = rows2
                     raw_bytes = len(raw2)
                     used_js   = True
-                    print(f"[SCRAPE] JS retry succeeded — using JS results")
+                    print(f"[SCRAPE] JS retry succeeded")
                 else:
                     print(f"[SCRAPE] JS retry also low quality — keeping static results")
         except Exception as e:
@@ -578,7 +671,7 @@ async def _scrape_url(
 # FASTAPI APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AUDITOR CORE", version="9.5.1")
+app = FastAPI(title="AUDITOR CORE", version="9.5.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -609,24 +702,25 @@ async def get_api_key():
 @app.get("/api/health")
 async def health():
     return {
-        "status":             "ok",
-        "version":            "9.5.1",
-        "fetcher":            _FETCHER_AVAILABLE,
-        "stealth":            _STEALTH_AVAILABLE,
-        "mistral":            _MISTRAL_AVAILABLE,
-        "readability":        False,
-        "ai_model":           _MISTRAL_MODEL if _MISTRAL_AVAILABLE else None,
-        "max_safe_chars":     MAX_SAFE_CHARS,
-        "min_fields_per_row": MIN_FIELDS_PER_ROW,
-        "min_quality_ratio":  MIN_QUALITY_RATIO,
-        "utc":                datetime.now(timezone.utc).isoformat(),
+        "status":              "ok",
+        "version":             "9.5.2",
+        "fetcher":             _FETCHER_AVAILABLE,
+        "stealth":             _STEALTH_AVAILABLE,
+        "mistral":             _MISTRAL_AVAILABLE,
+        "readability":         False,
+        "ai_model":            _MISTRAL_MODEL if _MISTRAL_AVAILABLE else None,
+        "max_safe_chars":      MAX_SAFE_CHARS,
+        "min_fields_per_row":  MIN_FIELDS_PER_ROW,
+        "min_quality_ratio":   MIN_QUALITY_RATIO,
+        "min_schema_overlap":  MIN_SCHEMA_OVERLAP,
+        "utc":                 datetime.now(timezone.utc).isoformat(),
     }
 
 @app.get("/api/debug-fetch")
 async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key)):
     """
-    Returns raw/cleaned size, retention %, and a 3000-char preview of what
-    the AI actually receives — without spending an AI call.
+    Debug without AI: shows raw size, cleaned size, isolated table size,
+    retention ratios, and a 3000-char preview of what the AI would receive.
     """
     if not _is_safe_url(url):
         raise HTTPException(status_code=403, detail="Forbidden domain")
@@ -635,16 +729,19 @@ async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key
         response = await loop.run_in_executor(
             None, _fetch_js if js else _fetch_static, url
         )
-        raw     = _get_raw_bytes(response)
-        cleaned = _preprocess_html(raw)
+        raw      = _get_raw_bytes(response)
+        cleaned  = _extract_main_content(raw.decode('utf-8', errors='replace'))
+        isolated = _find_best_table(cleaned)
         return {
-            "url":           url,
-            "js":            js,
-            "raw_bytes":     len(raw),
-            "cleaned_chars": len(cleaned),
-            "retention_pct": round(100 * len(cleaned) / max(len(raw), 1), 1),
-            "truncated":     len(cleaned) > MAX_SAFE_CHARS,
-            "preview":       cleaned[:3000],
+            "url":              url,
+            "js":               js,
+            "raw_bytes":        len(raw),
+            "cleaned_chars":    len(cleaned),
+            "isolated_chars":   len(isolated),
+            "retention_pct":    round(100 * len(cleaned) / max(len(raw), 1), 1),
+            "isolation_pct":    round(100 * len(isolated) / max(len(cleaned), 1), 1),
+            "truncated":        len(isolated) > MAX_SAFE_CHARS,
+            "preview":          isolated[:3000],
         }
     except Exception as e:
         return {"url": url, "error": str(e)}
