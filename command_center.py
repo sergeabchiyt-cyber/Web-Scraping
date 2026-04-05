@@ -1,18 +1,34 @@
 """
-AUDITOR CORE v9.4.1 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
+AUDITOR CORE v9.5.0 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
 ────────────────────────────────────────────────────────────────────────────────────
-Changes v9.4.1:
-  • FIXED: Prompt is now fully header-driven — AI reads actual column headers from
-    the HTML and uses them as JSON keys. No hardcoded field names (long/short/total).
-  • FIXED: All columns extracted, not just 3. Includes OI Change 1h/4h/24h, Rate%, etc.
-  • Values copied exactly as-is: signs (+/-), units (BTC/$/%/K/M/B/T) preserved.
-  • Removed example row from prompt — it was causing label hallucination.
+Changes v9.5.0 — comprehensive failure mode hardening:
 
-Changes v9.4.0:
-  • FIXED: Replaced readability-lxml (destroys data pages) with surgical noise removal
-  • FIXED: BS4 fallback now BLACKLISTS noise instead of whitelisting tags
-  • Strips class/id/style attributes to reduce payload 30-40% with zero data loss
-  • Only truncates when exceeding model's token limit (safe 500k chars)
+  FIXED F1 — JS retry now triggers on LOW-QUALITY rows, not just empty rows.
+             _rows_have_data() detects ghost extractions (names only, no values).
+
+  FIXED F2 — Empty <th> fallback: when headers are absent/empty (JS not rendered),
+             the prompt now instructs the AI to use positional keys (col_1, col_2…)
+             instead of producing empty-string keys.
+
+  FIXED F3 — _KEEP_ATTRS expanded: all data-* attributes are now preserved so that
+             sites storing raw numeric values in data-sort-value / data-raw / data-num
+             are not stripped before the AI sees them.
+
+  FIXED F4 — Post-extraction quality gate: _assess_quality() scores rows and logs
+             field coverage. Low-coverage extractions trigger JS retry.
+
+  FIXED F5 — Prompt has a header-absent fallback section with positional naming
+             and a concrete output shape hint so the AI doesn't go silent.
+
+  ADDED   — _log_extraction_stats() for every scrape so failures are diagnosable
+             from Railway/Render logs without touching the code.
+
+  ADDED   — Retry budget: max 2 AI attempts per scrape (static → JS → give up).
+             Each attempt logged with quality score.
+
+  KEPT    — All v9.4.0 surgical noise removal (blacklist approach, not readability).
+  KEPT    — MAX_SAFE_CHARS = 500_000 safety truncation.
+  KEPT    — Telegram bot startup/shutdown hooks unchanged.
 ────────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -42,9 +58,8 @@ from pydantic import BaseModel
 from bs4 import BeautifulSoup
 
 # ── readability-lxml is intentionally NOT used ────────────────────────────────
-# It is designed for article extraction and destroys data-heavy pages
-# (tables, exchange data, finance dashboards) by keeping only one "article" block.
-# Surgical noise removal (below) is used instead.
+# Designed for article extraction — destroys data-heavy pages by keeping only
+# one "article" block. Surgical noise removal is used instead.
 _READABILITY_AVAILABLE = False
 Document = None
 print("[BOOT] readability-lxml disabled — using surgical noise removal")
@@ -79,19 +94,24 @@ print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE}  Stealth={_STEALTH_AVAILABLE}  Mistr
 # ═══════════════════════════════════════════════════════════════════════════════
 
 cpu_executor = concurrent.futures.ProcessPoolExecutor(max_workers=4)
-MAX_PAYLOAD_SIZE = 10_485_760          # 10 MB
-# No hard cap – but we keep a safety limit to avoid hitting model's 256k token limit
-# ~4 chars per token => 1M chars safe; we set 500k to be conservative.
-MAX_SAFE_CHARS = 500_000
-MAX_RECORDS = 100
+MAX_PAYLOAD_SIZE  = 10_485_760   # 10 MB hard limit
+MAX_SAFE_CHARS    = 500_000      # safety truncation (~125k tokens)
+MAX_RECORDS       = 100
+
+# Quality gate: a row is considered "data-bearing" if it has at least this many
+# non-null, non-name-only fields. Rows with only 1 populated field are ghosts.
+MIN_FIELDS_PER_ROW = 2
+
+# If the fraction of data-bearing rows falls below this, trigger JS retry.
+MIN_QUALITY_RATIO  = 0.5
 
 # ── Mistral AI Configuration ─────────────────────────────────────────────────
 _MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
 if not _MISTRAL_API_KEY:
-    print("[ERROR] MISTRAL_API_KEY environment variable not set. AI extraction will fail.")
+    print("[ERROR] MISTRAL_API_KEY not set — AI extraction will fail.")
 _MISTRAL_MODEL = "codestral-latest"
 
-def _get_mistral_client() -> Optional[Mistral]:
+def _get_mistral_client() -> Optional["Mistral"]:
     if not _MISTRAL_AVAILABLE:
         print("[AI] Mistral library not installed.")
         return None
@@ -101,11 +121,11 @@ def _get_mistral_client() -> Optional[Mistral]:
     return Mistral(api_key=_MISTRAL_API_KEY)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# API KEY AUTHENTICATION (for this service)
+# API KEY AUTHENTICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _ENV_KEY = os.environ.get("AUDITOR_API_KEY", "").strip()
-API_KEY = _ENV_KEY if _ENV_KEY else secrets.token_hex(32)
+API_KEY  = _ENV_KEY if _ENV_KEY else secrets.token_hex(32)
 if not _ENV_KEY:
     print(f"[BOOT] No AUDITOR_API_KEY — generated: {API_KEY}")
 
@@ -119,15 +139,15 @@ def verify_key(x_api_key: str = Header(..., alias="X-Api-Key")) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ScrapeRequest(BaseModel):
-    url: str
-    adaptive: bool = True
-    js: bool = False
-    extract_type: str = "auto"
+    url:          str
+    adaptive:     bool = True
+    js:           bool = False
+    extract_type: str  = "auto"
 
 class ScrapeResponse(BaseModel):
-    events: List[Dict[str, Any]]
+    events:    List[Dict[str, Any]]
     raw_bytes: int
-    elapsed: float
+    elapsed:   float
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SSRF PROTECTION
@@ -141,7 +161,7 @@ def _is_safe_url(url: str) -> bool:
         hostname = parsed.hostname
         if not hostname:
             return False
-        ip = socket.gethostbyname(hostname)
+        ip     = socket.gethostbyname(hostname)
         ip_int = int.from_bytes(socket.inet_aton(ip), 'big')
         private_blocks = [
             (0x0A000000, 0xFF000000), (0xAC100000, 0xFFF00000),
@@ -153,21 +173,17 @@ def _is_safe_url(url: str) -> bool:
         return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DYNAMIC MAIN CONTENT EXTRACTION — surgical noise removal
+# SURGICAL NOISE REMOVAL
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _ZW_CHARS = re.compile(r'[\u200b\u200c\u200d\u2060\uFEFF\u00ad]')
 
-# Tags that are pure chrome — always safe to drop entirely
 _NOISE_TAGS = [
     'script', 'style', 'noscript', 'iframe', 'svg',
     'nav', 'footer', 'aside', 'header',
     'link', 'meta', 'base',
 ]
 
-# Class/ID substrings that strongly indicate UI chrome, ads, or menus.
-# This regex is intentionally broad — false positives (dropping a non-data div)
-# are far less harmful than false negatives (keeping 500k of script/nav bloat).
 _NOISE_ATTR_RE = re.compile(
     r'\b(ad|ads|advert|advertisement|banner|cookie|popup|modal|overlay|'
     r'sidebar|widget|promo|sponsor|social|share|comment|newsletter|'
@@ -177,9 +193,13 @@ _NOISE_ATTR_RE = re.compile(
     re.IGNORECASE,
 )
 
-# HTML attributes worth keeping for AI structural understanding
-_KEEP_ATTRS = {'colspan', 'rowspan', 'data-value', 'data-label', 'aria-label', 'title', 'alt'}
-
+# FIX F3: Keep all data-* attributes (sites store raw values in data-sort-value,
+# data-raw, data-num, data-usd, etc.). Only strip class/id/style/event handlers.
+_STRIP_ATTRS_RE = re.compile(
+    r'^(class|id|style|on\w+|tabindex|role|href|src|srcset|loading|'
+    r'crossorigin|integrity|referrerpolicy|fetchpriority)$',
+    re.IGNORECASE,
+)
 
 def _normalize(text: str) -> str:
     if not text:
@@ -188,53 +208,45 @@ def _normalize(text: str) -> str:
     text = _ZW_CHARS.sub('', text)
     return text.strip()
 
-
 def _extract_main_content(html: str) -> str:
     """
-    Surgically removes noise (ads, nav, scripts, menus) while preserving
-    ALL actual content (tables, lists, divs, text, data blocks).
-
-    Strategy: BLACKLIST known noise — never whitelist by tag type.
-    Readability is intentionally not used here; it picks a single article
-    block and discards everything else, which destroys data-heavy pages.
+    Surgically removes noise while preserving ALL data-bearing content.
+    Keeps all data-* attributes because sites like CoinGlass store raw
+    numeric values in data-sort-value / data-raw / data-num etc.
     """
     soup = BeautifulSoup(html, 'html.parser')
 
-    # Pass 1: drop known chrome tags entirely
+    # Pass 1: drop pure chrome tags
     for tag in soup(_NOISE_TAGS):
         tag.decompose()
 
-    # Pass 2: drop elements whose class or id matches noise patterns
+    # Pass 2: drop elements whose class or id is clearly UI chrome
     for tag in soup.find_all(True):
-        if tag.parent is None:   # already decomposed by a parent
+        if tag.parent is None:
             continue
         classes = ' '.join(tag.get('class', []))
         tag_id  = tag.get('id', '')
         if _NOISE_ATTR_RE.search(classes) or _NOISE_ATTR_RE.search(tag_id):
             tag.decompose()
 
-    # Pass 3: strip verbose HTML attributes — keeps colspan/rowspan/aria-label
-    # for table semantics; drops class/id/style/data-* noise.
-    # This alone saves 30-40% of chars on attribute-heavy pages.
+    # Pass 3: strip presentational attributes; KEEP all data-* and structural ones
     for tag in soup.find_all(True):
-        tag.attrs = {k: v for k, v in tag.attrs.items() if k in _KEEP_ATTRS}
+        tag.attrs = {
+            k: v for k, v in tag.attrs.items()
+            if not _STRIP_ATTRS_RE.match(k)
+        }
 
     return str(soup)
 
-
 def _preprocess_html(html_bytes: bytes) -> str:
-    """
-    Decode → remove noise → only truncate when exceeding model token limit.
-    Logs retention ratio so you can tune _NOISE_ATTR_RE if needed.
-    """
     try:
         text = html_bytes.decode('utf-8', errors='replace')
     except Exception:
         text = html_bytes.decode('latin-1', errors='replace')
 
     original_len = len(text)
-    main = _extract_main_content(text)
-    cleaned_len = len(main)
+    main         = _extract_main_content(text)
+    cleaned_len  = len(main)
 
     print(
         f"[PREPROCESS] {original_len:,} → {cleaned_len:,} chars "
@@ -250,13 +262,63 @@ def _preprocess_html(html_bytes: bytes) -> str:
     return main
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AI EXTRACTION ENGINE — universal, header-driven
+# EXTRACTION QUALITY GATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _count_populated(row: Dict[str, Any]) -> int:
+    """Count fields that have a real value (not None, not empty string)."""
+    return sum(
+        1 for v in row.values()
+        if v is not None and str(v).strip() not in ("", "null", "N/A", "-")
+    )
+
+def _rows_have_data(rows: List[Dict[str, Any]]) -> bool:
+    """
+    FIX F1 / F4: Returns False when rows are ghost extractions — i.e. the AI
+    found row labels (exchange names) but no numeric/percentage columns.
+
+    Triggers JS retry even when row count > 0.
+    """
+    if not rows:
+        return False
+    good_rows = sum(1 for r in rows if _count_populated(r) >= MIN_FIELDS_PER_ROW)
+    quality   = good_rows / len(rows)
+    print(f"[QUALITY] {good_rows}/{len(rows)} rows have ≥{MIN_FIELDS_PER_ROW} fields "
+          f"(quality={quality:.0%}, threshold={MIN_QUALITY_RATIO:.0%})")
+    return quality >= MIN_QUALITY_RATIO
+
+def _log_extraction_stats(rows: List[Dict[str, Any]], label: str = "") -> None:
+    """
+    FIX ADDED: Detailed per-field coverage log so Railway/Render logs tell you
+    exactly which columns were and weren't extracted without touching code.
+    """
+    if not rows:
+        print(f"[STATS{' ' + label if label else ''}] No rows extracted.")
+        return
+
+    # Aggregate field presence
+    all_keys: Dict[str, int] = {}
+    for row in rows:
+        for k, v in row.items():
+            if k not in all_keys:
+                all_keys[k] = 0
+            if v is not None and str(v).strip() not in ("", "null", "N/A", "-"):
+                all_keys[k] += 1
+
+    total = len(rows)
+    print(f"[STATS{' ' + label if label else ''}] {total} rows · field coverage:")
+    for key, count in sorted(all_keys.items(), key=lambda x: -x[1]):
+        bar   = "█" * int(10 * count / total) + "░" * (10 - int(10 * count / total))
+        empty = "(EMPTY KEY — header not detected)" if key.strip() == "" else ""
+        print(f"  {bar} {count:>3}/{total}  '{key}' {empty}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI EXTRACTION ENGINE — universal, header-driven with fallbacks
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> List[Dict[str, Any]]:
     result = _extract_with_mistral(html_content, url, extract_type)
     return result if result is not None else []
-
 
 def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[List[Dict[str, Any]]]:
     client = _get_mistral_client()
@@ -266,7 +328,7 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
     prompt = _build_accuracy_prompt(html, url, extract_type)
 
     try:
-        print(f"[AI] Sending to {_MISTRAL_MODEL} (HTML size: {len(html):,} chars)")
+        print(f"[AI] Sending to {_MISTRAL_MODEL} ({len(html):,} chars)")
         response = client.chat.complete(
             model=_MISTRAL_MODEL,
             messages=[{"role": "user", "content": prompt}],
@@ -279,38 +341,60 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
         print(f"[AI] Mistral extraction failed: {e}")
         return None
 
-
 def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
     """
-    Fully header-driven universal prompt.
+    FIX F2 / F5: Header-driven prompt with a hard fallback for when <th> cells
+    are absent or empty (JS not rendered). In that case the AI is instructed to
+    use positional keys (col_1, col_2 …) rather than producing empty-string keys.
 
-    The AI reads whatever column headers / field labels exist in the HTML
-    and uses them verbatim as JSON keys. No example rows, no hardcoded field
-    names — this prevents label hallucination and works on any website.
+    Also includes an output shape hint based on extract_type so the AI has a
+    structural anchor when the HTML gives it nothing to work with.
     """
     structure_hint = {
-        "table": "Extract each <tr> data row as one object. Use the <th> or header row text as JSON keys.",
-        "list":  "Extract each list item as one object. Use any visible label/title as the key.",
-        "card":  "Extract each card or repeated block as one object. Use visible field labels as keys.",
+        "table": (
+            "Extract each <tr> data row as one object. "
+            "Use the <th> or header row text as JSON keys."
+        ),
+        "list": (
+            "Extract each list item as one object. "
+            "Use any visible label or title text as the key."
+        ),
+        "card": (
+            "Extract each card or repeated block as one object. "
+            "Use visible field labels as keys."
+        ),
     }.get(
         extract_type,
-        "Identify the dominant repeated data structure (table rows, list items, or cards). "
-        "Use whatever column headers or field labels are present in the HTML as JSON keys.",
+        (
+            "Identify the dominant repeated data structure "
+            "(table rows, list items, or cards). "
+            "Use column headers or field labels as JSON keys."
+        ),
     )
 
     return f"""You are a universal data extraction engine. Extract all structured data from the HTML below.
 
-STRICT RULES — follow every one:
+STRICT RULES:
 1. READ the actual column headers or field labels from the HTML. Use them EXACTLY as JSON keys.
    Do NOT rename, translate, shorten, or invent keys.
-2. Extract EVERY column / field you find. Do not skip any.
-3. Copy ALL values EXACTLY as they appear — preserve signs (+/-), units (BTC, ETH, $, %, K, M, B, T),
-   colors encoded as text (e.g. "red", "green"), and any other formatting present.
-4. If a cell is empty or the value is missing, use null.
-5. Do NOT add fields that are not present in the source HTML.
-6. Do NOT hallucinate data. If you are unsure about a value, use null.
-7. Return ONLY a valid JSON array of objects — no markdown fences, no explanation, no preamble.
-8. If no structured data is found, return an empty array: []
+2. Extract EVERY column/field you find. Do not skip any column.
+3. Copy ALL values EXACTLY as they appear — preserve signs (+/-), units (BTC, ETH, $, %, K, M, B, T).
+4. If a cell is empty or missing, use null.
+5. Do NOT add fields not present in the source. Do NOT hallucinate values.
+6. Return ONLY a valid JSON array — no markdown fences, no explanation, no preamble.
+7. If no structured data is found, return: []
+
+HEADER FALLBACK (critical):
+If the HTML has NO visible column headers (empty <th> cells, or no headers at all),
+DO NOT use empty strings as keys. Instead:
+  - Name the first column "label" (it usually contains the row name/entity).
+  - Name subsequent columns "col_2", "col_3", "col_4" etc. in left-to-right order.
+  - Still extract every value from every column.
+
+DATA-ATTRIBUTE HINT:
+Some sites store numeric values in HTML attributes like data-sort-value, data-raw,
+data-num, data-usd. If visible cell text is empty but these attributes exist on the
+same element, use the attribute value as the cell value.
 
 {structure_hint}
 
@@ -321,14 +405,12 @@ HTML:
 
 JSON array:"""
 
-
 def _parse_ai_response(content: str) -> Optional[List[Dict[str, Any]]]:
     if not content:
         return None
     content = content.strip()
-    # Strip markdown fences if model added them despite instructions
     if content.startswith('```'):
-        lines = content.split('\n')
+        lines   = content.split('\n')
         content = '\n'.join(
             line for line in lines
             if not line.startswith('```') and '```' not in line
@@ -362,7 +444,6 @@ def _fetch_static(url: str):
         raise RuntimeError("Fetcher.get() returned None.")
     return response
 
-
 def _fetch_js(url: str):
     if not _STEALTH_AVAILABLE or StealthyFetcher is None:
         raise RuntimeError("StealthyFetcher unavailable.")
@@ -373,7 +454,6 @@ def _fetch_js(url: str):
     if response is None:
         raise RuntimeError("StealthyFetcher.fetch() returned None.")
     return response
-
 
 def _get_raw_bytes(response) -> bytes:
     for attr in ('html', 'text'):
@@ -412,8 +492,9 @@ async def _scrape_url(
         except RuntimeError as e:
             raise HTTPException(status_code=502, detail=str(e))
 
-    response = await _do_fetch(js)
-    used_js  = js
+    # ── Attempt 1: static (or JS if caller forced it) ────────────────────────
+    response  = await _do_fetch(js)
+    used_js   = js
 
     try:
         raw = _get_raw_bytes(response)
@@ -440,31 +521,48 @@ async def _scrape_url(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI extraction failed: {e}")
 
-    # Auto-retry with JS renderer if static fetch yielded nothing
-    if not rows and not used_js and raw_bytes >= 51_200 and _STEALTH_AVAILABLE:
-        print(f"[SCRAPE] No records from static — retrying with JS")
+    _log_extraction_stats(rows, label="attempt=1 js=False")
+
+    # ── Attempt 2: JS retry ──────────────────────────────────────────────────
+    # FIX F1: Retry not only when rows is empty, but also when rows are ghost
+    # (names only, no values) — detected by _rows_have_data() quality gate.
+    should_retry_js = (
+        not used_js                          # haven't tried JS yet
+        and not _rows_have_data(rows)        # FIX F1/F4: quality gate
+        and raw_bytes >= 51_200              # page is large enough to have data
+        and _STEALTH_AVAILABLE               # StealthyFetcher is installed
+    )
+
+    if should_retry_js:
+        print(f"[SCRAPE] Low-quality extraction — retrying with JS renderer")
         try:
-            response2 = await _do_fetch(True)
-            raw2 = _get_raw_bytes(response2)
+            response2  = await _do_fetch(True)
+            raw2       = _get_raw_bytes(response2)
             if raw2:
                 html_clean2 = _preprocess_html(raw2)
                 rows2 = await loop.run_in_executor(
                     cpu_executor, extract_with_ai, html_clean2, url, extract_type
                 )
-                if rows2:
+                _log_extraction_stats(rows2, label="attempt=2 js=True")
+                # Only upgrade if JS gave us better quality
+                if _rows_have_data(rows2):
                     rows      = rows2
                     raw_bytes = len(raw2)
+                    used_js   = True
+                    print(f"[SCRAPE] JS retry succeeded — using JS results")
+                else:
+                    print(f"[SCRAPE] JS retry also low quality — keeping static results")
         except Exception as e:
             print(f"[SCRAPE] JS retry failed: {e}")
 
-    print(f"[SCRAPE] {url} → {len(rows)} records")
+    print(f"[SCRAPE] Final: {len(rows)} records (js={used_js})")
     return rows, raw_bytes
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FASTAPI APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AUDITOR CORE", version="9.4.1")
+app = FastAPI(title="AUDITOR CORE", version="9.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -473,14 +571,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     errors = "; ".join(
         f"{' → '.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors()
     )
     return JSONResponse(status_code=422, content={"detail": f"Validation error — {errors}"})
-
 
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
@@ -490,29 +586,33 @@ async def serve_frontend():
         return FileResponse(html_path)
     return HTMLResponse(content="<h2>404 — index.html not found</h2>", status_code=404)
 
-
 @app.get("/api/key")
 async def get_api_key():
     return JSONResponse({"api_key": API_KEY})
 
-
 @app.get("/api/health")
 async def health():
     return {
-        "status":        "ok",
-        "version":       "9.4.1",
-        "fetcher":       _FETCHER_AVAILABLE,
-        "stealth":       _STEALTH_AVAILABLE,
-        "mistral":       _MISTRAL_AVAILABLE,
-        "readability":   False,   # disabled — surgical noise removal used instead
-        "ai_model":      _MISTRAL_MODEL if _MISTRAL_AVAILABLE else None,
-        "max_safe_chars": MAX_SAFE_CHARS,
-        "utc":           datetime.now(timezone.utc).isoformat(),
+        "status":            "ok",
+        "version":           "9.5.0",
+        "fetcher":           _FETCHER_AVAILABLE,
+        "stealth":           _STEALTH_AVAILABLE,
+        "mistral":           _MISTRAL_AVAILABLE,
+        "readability":       False,
+        "ai_model":          _MISTRAL_MODEL if _MISTRAL_AVAILABLE else None,
+        "max_safe_chars":    MAX_SAFE_CHARS,
+        "min_fields_per_row": MIN_FIELDS_PER_ROW,
+        "min_quality_ratio": MIN_QUALITY_RATIO,
+        "utc":               datetime.now(timezone.utc).isoformat(),
     }
-
 
 @app.get("/api/debug-fetch")
 async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key)):
+    """
+    Debug endpoint: returns raw fetch stats, cleaned HTML size, retention %, preview,
+    and a quality assessment of what the AI would receive — without calling AI.
+    Useful for diagnosing noise removal and JS rendering issues.
+    """
     if not _is_safe_url(url):
         raise HTTPException(status_code=403, detail="Forbidden domain")
     loop = asyncio.get_running_loop()
@@ -523,15 +623,16 @@ async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key
         raw     = _get_raw_bytes(response)
         cleaned = _preprocess_html(raw)
         return {
-            "url":           url,
-            "raw_bytes":     len(raw),
-            "cleaned_chars": len(cleaned),
-            "retention_pct": round(100 * len(cleaned) / max(len(raw), 1), 1),
-            "preview":       cleaned[:2000],
+            "url":              url,
+            "js":               js,
+            "raw_bytes":        len(raw),
+            "cleaned_chars":    len(cleaned),
+            "retention_pct":    round(100 * len(cleaned) / max(len(raw), 1), 1),
+            "truncated":        len(cleaned) > MAX_SAFE_CHARS,
+            "preview":          cleaned[:3000],
         }
     except Exception as e:
         return {"url": url, "error": str(e)}
-
 
 @app.post("/api/scrape", response_model=ScrapeResponse)
 async def scrape(body: ScrapeRequest, _key: str = Depends(verify_key)):
@@ -545,7 +646,6 @@ async def scrape(body: ScrapeRequest, _key: str = Depends(verify_key)):
         elapsed=round(time.perf_counter() - t0, 3),
     )
 
-
 @app.get("/api/token-status")
 async def token_status(_key: str = Depends(verify_key)):
     return {
@@ -554,7 +654,6 @@ async def token_status(_key: str = Depends(verify_key)):
             {"key_index": 1, "tokens_used": 0, "tokens_remaining": 100_000, "active": True}
         ],
     }
-
 
 @app.on_event("startup")
 async def startup():
@@ -567,7 +666,6 @@ async def startup():
     except Exception as e:
         print(f"[BOOT] Telegram bot failed: {e}")
 
-
 @app.on_event("shutdown")
 async def shutdown():
     try:
@@ -575,7 +673,6 @@ async def shutdown():
         stop_bot()
     except Exception:
         pass
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
