@@ -7,5 +7,5 @@ httpx
 beautifulsoup4
 lxml
 tinycss2
-cerebras_cloud_sdk
+mistralai
 readability-lxml
