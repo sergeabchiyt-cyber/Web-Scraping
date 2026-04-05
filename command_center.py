@@ -89,7 +89,7 @@ MIN_SCHEMA_OVERLAP = 0.5
 _CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "").strip()
 if not _CEREBRAS_API_KEY:
     print("[ERROR] CEREBRAS_API_KEY not set — AI extraction will fail.")
-_CEREBRAS_MODEL = "zai-glm-4.7"
+_CEREBRAS_MODEL = "qwen-3-235b-a22b-instruct-2507"
 
 def _get_cerebras_client() -> Optional["Cerebras"]:
     if not _CEREBRAS_AVAILABLE:
@@ -495,7 +495,7 @@ def _extract_with_cerebras(html: str, url: str, extract_type: str) -> Optional[L
 def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
     structure_hint = {
         "table": (
-            "Extract each <tr> data row as one object. "
+            "Extract each <td> data row as one object. "
             "Use the <th> or header row text as JSON keys."
         ),
         "list": (
