@@ -2,14 +2,13 @@ import asyncio
 import logging
 import os
 import re
-import signal
 import threading
 import time
 import traceback
 from datetime import datetime, timezone
 
-# ── Token sanitisation ───────────────────────────────────
-_raw_token = os.environ.get("TELEGRAM_TOKEN", "").strip()
+# ── Token sanitisation ───────────────────────────────────────────────────────
+_raw_token   = os.environ.get("TELEGRAM_TOKEN", "").strip()
 _clean_token = _raw_token.lstrip("=").strip().strip("'\"")
 TELEGRAM_TOKEN = None
 if re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{30,}", _clean_token):
@@ -22,49 +21,76 @@ MAX_CHARS = 4096
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
-# ── Formatting helpers ──────────────────────────────────
+# ── Formatting helpers ───────────────────────────────────────────────────────
+
+# FIX P3: col_N keys (positional fallback names) must never be used as the
+# item title — they are structural placeholders, not meaningful names.
+_POSITIONAL_KEY_RE = re.compile(r'^col_\d+$', re.IGNORECASE)
+
 def _fmt_item(idx: int, item: dict) -> str:
-    NAME_FIELDS = ('indicator','title','name','event','headline','product',
-                   'label','item','description','exchange','symbol','pair',
-                   'asset','coin','company','ticker','token','market')
-    name = None
+    # Priority order for picking the display name of a row
+    NAME_FIELDS = (
+        'indicator', 'title', 'name', 'event', 'headline', 'product',
+        'label', 'item', 'description', 'exchange', 'symbol', 'pair',
+        'asset', 'coin', 'company', 'ticker', 'token', 'market',
+    )
+
+    name     = None
     name_key = None
+
+    # 1. Try known semantic name fields first
     for f in NAME_FIELDS:
         if item.get(f):
-            name = str(item[f]).strip()
+            name     = str(item[f]).strip()
             name_key = f
             break
+
+    # 2. Fall back to any non-positional string field
+    # FIX P3: skip col_N keys entirely when looking for a name
     if not name:
         for k, v in item.items():
+            if _POSITIONAL_KEY_RE.match(str(k)):
+                continue   # ← skip col_2, col_3, col_4 etc.
             if isinstance(v, str) and len(v.strip()) >= 2:
-                name = v.strip()
+                name     = v.strip()
                 name_key = k
                 break
+
+    # 3. Last resort
     if not name:
         name = f"Item {idx}"
+
     lines = [f"*{idx}. {name}*"]
+
     SKIP = {'is_past'}
     if name_key:
         SKIP.add(name_key)
+
     for k, v in item.items():
         if k in SKIP or v is None or str(v).strip() == '':
             continue
         label = k.replace('_', ' ').title()
         lines.append(f"  {label}: {v}")
+
     return '\n'.join(lines)
 
+
 def _build_batches(items: list, url: str) -> list[str]:
-    messages = []
-    total = len(items)
-    current = ""
+    messages  = []
+    total     = len(items)
     batch_num = 1
     first_idx = 1
+
     def make_header(start_idx: int) -> str:
         short_url = url[:55] + '…' if len(url) > 55 else url
-        return (f"📊 *AUDITOR* — `{short_url}`\n"
-                f"Msg {batch_num} · items from #{start_idx} · {total} total\n"
-                f"{'─' * 28}\n")
+        return (
+            f"📊 *AUDITOR* — `{short_url}`\n"
+            f"Msg {batch_num} · items from #{start_idx} · {total} total\n"
+            f"{'─' * 28}\n"
+        )
+
     current = make_header(1)
+
     for i, item in enumerate(items, start=1):
         block = _fmt_item(i, item) + '\n\n'
         if len(block) > MAX_CHARS - 100:
@@ -72,15 +98,18 @@ def _build_batches(items: list, url: str) -> list[str]:
         if len(current) + len(block) > MAX_CHARS:
             messages.append(current.rstrip())
             batch_num += 1
-            first_idx = i
-            current = make_header(i) + block
+            first_idx  = i
+            current    = make_header(i) + block
         else:
             current += block
+
     if current.strip():
         messages.append(current.rstrip())
+
     return messages
 
-# ── Command handlers ─────────────────────────────────────
+# ── Command handlers ─────────────────────────────────────────────────────────
+
 async def _handle_start(update, context):
     await update.message.reply_text(
         "👋 *Welcome to AUDITOR Bot*\n\n"
@@ -105,19 +134,21 @@ async def _handle_help(update, context):
         "*Scrape usage:*\n"
         "`/scrape https://tradingeconomics.com/calendar`\n"
         "`/scrape https://coinglass.com/open-interest/BTC js`\n\n"
-        "The bot extracts all tables from the page and sends them in batched messages.",
+        "The bot extracts all tables from the page and sends them in batched messages.\n"
+        "⚠️ Large pages (500+ rows) may take 3–5 minutes due to rate limits.",
         parse_mode='Markdown'
     )
 
 async def _handle_ping(update, context):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    text = ("✅ *AUDITOR is online*\n"
-            f"🕐 `{now}`\n"
-            "🤖 Scraping engine ready")
+    now  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    text = (
+        "✅ *AUDITOR is online*\n"
+        f"🕐 `{now}`\n"
+        "🤖 Scraping engine ready"
+    )
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def _handle_scrape(update, context):
-    # Import the correct scraping function from command_center
     from command_center import _scrape_url
 
     args = context.args
@@ -130,35 +161,34 @@ async def _handle_scrape(update, context):
         )
         return
 
-    url = args[0]
+    url    = args[0]
     use_js = len(args) > 1 and args[1].lower() == 'js'
 
-    # Normalise URL – add https if missing
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
 
     await update.message.reply_text(
         f"⏳ Scraping `{url}`...\n"
         f"{'🌐 JS rendering ON' if use_js else '⚡ Fast mode (no JS)'}\n"
-        "This may take 20–40s — the scraping engine is reading the page.",
+        "Large pages may take several minutes — batching across rate limit windows.",
         parse_mode='Markdown'
     )
 
     try:
-        # _scrape_url returns (rows, raw_bytes)
         items, raw_bytes = await _scrape_url(url, js=use_js)
 
         if not items:
             await update.message.reply_text(
                 f"⚠️ No items extracted from `{url}`\n"
-                f"Raw bytes received: {raw_bytes}\n"
+                f"Raw bytes received: {raw_bytes:,}\n"
                 "Try adding `js` if the page is JavaScript-rendered.",
                 parse_mode='Markdown'
             )
             return
 
         batches = _build_batches(items, url)
-        n_msgs = len(batches)
+        n_msgs  = len(batches)
+
         for msg in batches:
             await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -172,8 +202,7 @@ async def _handle_scrape(update, context):
         )
 
     except Exception as e:
-        # _scrape_url may raise HTTPException or other errors
-        tb = traceback.format_exc()
+        tb    = traceback.format_exc()
         print(f"[TELEGRAM] /scrape error:\n{tb}")
         short = str(e)[:300] if str(e) else repr(e)[:300]
         await update.message.reply_text(
@@ -190,17 +219,13 @@ async def _handle_message(update, context):
 async def _handle_unknown_command(update, context):
     await update.message.reply_text(
         "❓ Unknown command.\n"
-        "Available commands:\n"
-        "  /start — welcome\n"
-        "  /ping — check status\n"
-        "  /scrape <url> [js] — scrape a URL\n"
-        "  /help — show help",
-        parse_mode='Markdown'
+        "Available: /start  /ping  /scrape <url> [js]  /help"
     )
 
-# ── Bot startup with graceful shutdown ──────────────────
-_bot_started = False
-_bot_lock = threading.Lock()
+# ── Bot startup ───────────────────────────────────────────────────────────────
+
+_bot_started    = False
+_bot_lock       = threading.Lock()
 _shutdown_event = threading.Event()
 
 def start_bot():
@@ -217,7 +242,6 @@ def start_bot():
         )
     except ImportError:
         print("[TELEGRAM] python-telegram-bot not installed.")
-        print("[TELEGRAM] Run: pip install python-telegram-bot")
         return
 
     async def _run():
@@ -237,7 +261,6 @@ def start_bot():
             allowed_updates=["message"],
         )
 
-        # Wait for shutdown signal
         while not _shutdown_event.is_set():
             await asyncio.sleep(1)
 
