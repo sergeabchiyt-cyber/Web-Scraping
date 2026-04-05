@@ -1,36 +1,30 @@
 """
-AUDITOR CORE v9.7.1 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
+AUDITOR CORE v9.8.0 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
 ────────────────────────────────────────────────────────────────────────────────────
-Changes v9.7.1:
-
-  FIXED P1 — No delay between batches hitting rate limit.
-             Added BATCH_DELAY_SECS = 62 second sleep between each batch call.
-             Logged as [BATCH] waiting Xs before next batch.
-
-  FIXED P2 — No retry on 429. Failed batches were silently skipped (0 records).
-             Added retry loop: up to BATCH_MAX_RETRIES=3 attempts per batch.
-             On 429: waits BATCH_RETRY_WAIT_SECS=65s then retries.
-             On other errors: fails immediately, no retry.
-             Logged as [BATCH] #N retry A/3 after 429 — waiting Xs.
-
-  FIXED P4 — Time/date columns missing because they had no <th> header.
-             Added _infer_column_names(): scans headerless columns and assigns
-             semantic names based on content patterns:
-               - HH:MM pattern       → "Time"
-               - date/month words    → "Date"
-               - 2-letter uppercase  → "Country"
-               - % or decimal number → "Value"
-             Replaces col_2/col_3/col_4 with meaningful names before AI sees HTML.
+Changes v9.8.0:
+  • SWITCHED AI backend: Cerebras → Mistral La Plateforme (mistral-small-2603)
+    - Model:   Mistral Small 4 (mistral-small-2603)
+    - SDK:     mistralai
+    - TPM:     500,000 (vs Cerebras 60,000 — 8x headroom)
+    - TPS:     ~148 t/s
+    - Context: 256k tokens
+    - Free tier: 1B tokens/month per model, data training opt-in required
+  • REMOVED batch delays — 500k TPM means no waiting between batches
+  • REMOVED retry-on-429 logic — no longer needed at 5.8% TPM usage per batch
+  • ADDED reasoning_effort="none" — disables chain-of-thought for pure extraction
+    speed (JSON output does not benefit from reasoning, only adds latency/tokens)
+  • ENV var: MISTRAL_API_KEY (replaces CEREBRAS_API_KEY)
 
 Previous fixes (all retained):
+  v9.7.1 — P1 batch delay, P2 retry on 429, P4 semantic column name inference.
   v9.7.0 — dynamic row-boundary batching, batch logging.
-  v9.6.0 — Cerebras GLM-4.7 swap (now qwen-3-235b), log spam fix.
+  v9.6.0 — log spam fix (score > 2 only).
   v9.5.4 — F11 empty-key promotion, F12 image-only name cells.
   v9.5.3 — F9 honest [] on JS pages, F10 JSON script preservation.
   v9.5.2 — F7 table isolation, F8 schema consistency.
-  v9.5.1 — F6 inline tag unwrapping, HTML sanitisation.
+  v9.5.1 — F6 inline tag unwrapping, HTML tag sanitisation.
   v9.5.0 — F1–F5 quality gate, JS retry, data-* attrs, empty-key fallback.
-  v9.4.0 — surgical noise removal.
+  v9.4.0 — surgical noise removal (blacklist, not readability).
 ────────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -64,13 +58,13 @@ _READABILITY_AVAILABLE = False
 Document = None
 print("[BOOT] readability-lxml disabled — using surgical noise removal + table isolation")
 
-# ── Cerebras AI ───────────────────────────────────────────────────────────────
+# ── Mistral AI ────────────────────────────────────────────────────────────────
 try:
-    from cerebras.cloud.sdk import Cerebras
-    _CEREBRAS_AVAILABLE = True
+    from mistralai import Mistral
+    _MISTRAL_AVAILABLE = True
 except ImportError:
-    Cerebras = None
-    _CEREBRAS_AVAILABLE = False
+    Mistral = None
+    _MISTRAL_AVAILABLE = False
 
 # ── Scrapling ─────────────────────────────────────────────────────────────────
 try:
@@ -87,7 +81,7 @@ except ImportError:
     StealthyFetcher = None
     _STEALTH_AVAILABLE = False
 
-print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE}  Stealth={_STEALTH_AVAILABLE}  Cerebras={_CEREBRAS_AVAILABLE}")
+print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE}  Stealth={_STEALTH_AVAILABLE}  Mistral={_MISTRAL_AVAILABLE}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -96,38 +90,34 @@ print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE}  Stealth={_STEALTH_AVAILABLE}  Cereb
 cpu_executor       = concurrent.futures.ProcessPoolExecutor(max_workers=4)
 MAX_PAYLOAD_SIZE   = 10_485_760
 MAX_SAFE_CHARS     = 500_000
-MAX_RECORDS        = 1000           # raised — large calendars need more
+MAX_RECORDS        = 1000
 MIN_FIELDS_PER_ROW = 2
 MIN_QUALITY_RATIO  = 0.5
 MIN_SCHEMA_OVERLAP = 0.5
 
-# Batching
-MAX_BATCH_CHARS    = 120_000
-BATCH_OVERHEAD     = 4_000
-BATCH_USABLE       = MAX_BATCH_CHARS - BATCH_OVERHEAD   # 116,000
+# Batching — 500k TPM means no delays needed between batches
+# Keep batch size conservative to stay well within 256k context window
+MAX_BATCH_CHARS    = 120_000   # ~30k tokens per batch
+BATCH_OVERHEAD     = 4_000     # prompt + header reserved
+BATCH_USABLE       = MAX_BATCH_CHARS - BATCH_OVERHEAD   # 116,000 usable
 CHARS_PER_TOKEN    = 4
 
-# FIX P1: delay between batches to respect 64k TPM rate limit
-BATCH_DELAY_SECS      = 62    # wait 62s between batches (~1 token-minute gap)
+# ── Mistral config ────────────────────────────────────────────────────────────
+_MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
+if not _MISTRAL_API_KEY:
+    print("[ERROR] MISTRAL_API_KEY not set — AI extraction will fail.")
 
-# FIX P2: retry on 429
-BATCH_MAX_RETRIES     = 3     # max retry attempts per batch
-BATCH_RETRY_WAIT_SECS = 65    # wait 65s before retrying after 429
+# Mistral Small 4 — 119B MoE (6.5B active), 256k context, 148 t/s, 500k TPM free
+_MISTRAL_MODEL = "mistral-small-2603"
 
-# ── Cerebras config ───────────────────────────────────────────────────────────
-_CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "").strip()
-if not _CEREBRAS_API_KEY:
-    print("[ERROR] CEREBRAS_API_KEY not set — AI extraction will fail.")
-_CEREBRAS_MODEL = "qwen-3-235b-a22b-instruct-2507"
-
-def _get_cerebras_client() -> Optional["Cerebras"]:
-    if not _CEREBRAS_AVAILABLE:
-        print("[AI] cerebras_cloud_sdk not installed.")
+def _get_mistral_client() -> Optional["Mistral"]:
+    if not _MISTRAL_AVAILABLE:
+        print("[AI] mistralai SDK not installed. Run: pip install mistralai")
         return None
-    if not _CEREBRAS_API_KEY:
-        print("[AI] No Cerebras API key provided.")
+    if not _MISTRAL_API_KEY:
+        print("[AI] No Mistral API key provided.")
         return None
-    return Cerebras(api_key=_CEREBRAS_API_KEY)
+    return Mistral(api_key=_MISTRAL_API_KEY)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # API KEY AUTH
@@ -222,7 +212,7 @@ _JSON_DATA_SCRIPT_IDS = re.compile(
     re.IGNORECASE,
 )
 
-# FIX P4: patterns for semantic column name inference
+# Semantic column name inference patterns
 _TIME_PATTERN    = re.compile(r'^\d{1,2}:\d{2}(:\d{2})?(\s*(AM|PM))?$', re.IGNORECASE)
 _DATE_PATTERN    = re.compile(
     r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
@@ -285,26 +275,11 @@ def _extract_json_scripts(soup: BeautifulSoup) -> str:
 
 
 def _infer_column_names(soup: BeautifulSoup) -> None:
-    """
-    FIX P4: Find <th> cells that are empty or missing and assign semantic names
-    based on the actual data values in that column position.
-
-    Patterns detected:
-      HH:MM or HH:MM AM/PM  → "Time"
-      Day/Month name        → "Date"
-      2-3 uppercase letters → "Country"
-      Number or percentage  → "Value"
-
-    This runs on the soup BEFORE sending to AI so the AI sees real header names
-    instead of empty <th> cells — which it was ignoring or calling col_2/col_3.
-    """
-    tables = soup.find_all('table')
-    for table in tables:
+    """Assign semantic names to empty <th> cells based on data patterns."""
+    for table in soup.find_all('table'):
         rows = table.find_all('tr')
         if not rows:
             continue
-
-        # Find header row
         header_row = None
         for row in rows:
             if row.find('th'):
@@ -312,19 +287,14 @@ def _infer_column_names(soup: BeautifulSoup) -> None:
                 break
         if not header_row:
             continue
-
-        headers = header_row.find_all(['th', 'td'])
+        headers   = header_row.find_all(['th', 'td'])
         data_rows = [r for r in rows if r != header_row and r.find('td')]
         if not data_rows:
             continue
-
         inferred = 0
         for col_idx, th in enumerate(headers):
-            # Only process empty or whitespace-only headers
             if th.get_text(strip=True):
                 continue
-
-            # Sample up to 10 data rows for this column position
             samples = []
             for dr in data_rows[:10]:
                 cells = dr.find_all(['td', 'th'])
@@ -332,18 +302,13 @@ def _infer_column_names(soup: BeautifulSoup) -> None:
                     val = cells[col_idx].get_text(strip=True)
                     if val:
                         samples.append(val)
-
             if not samples:
                 continue
-
-            # Score each pattern across samples
+            threshold    = len(samples) * 0.5
             time_hits    = sum(1 for s in samples if _TIME_PATTERN.match(s))
             date_hits    = sum(1 for s in samples if _DATE_PATTERN.search(s))
             country_hits = sum(1 for s in samples if _COUNTRY_PATTERN.match(s))
             number_hits  = sum(1 for s in samples if _NUMBER_PATTERN.match(s))
-
-            threshold = len(samples) * 0.5  # majority of samples must match
-
             if time_hits >= threshold:
                 name = "Time"
             elif date_hits >= threshold:
@@ -353,13 +318,10 @@ def _infer_column_names(soup: BeautifulSoup) -> None:
             elif number_hits >= threshold:
                 name = "Value"
             else:
-                continue  # can't infer — leave empty, prompt fallback handles it
-
+                continue
             th.string = name
             inferred += 1
-            print(f"[INFER] col {col_idx+1} → '{name}' "
-                  f"(samples: {samples[:3]})")
-
+            print(f"[INFER] col {col_idx+1} → '{name}' (samples: {samples[:3]})")
         if inferred:
             print(f"[INFER] {inferred} column name(s) inferred from data patterns")
 
@@ -384,7 +346,6 @@ def _clean_soup(soup: BeautifulSoup) -> Tuple[BeautifulSoup, str]:
             continue
         tag.unwrap()
 
-    # FIX P4: infer semantic names for empty header cells
     _infer_column_names(soup)
 
     for tag in soup.find_all(True):
@@ -553,7 +514,7 @@ def _split_table_into_batches(html: str) -> List[Tuple[str, int, int]]:
 
 
 def _log_batch_plan(batch_num: int, total: int, start: int, end: int, html: str) -> None:
-    chars = len(html)
+    chars  = len(html)
     tokens = chars // CHARS_PER_TOKEN
     print(f"[BATCH] #{batch_num}/{total}: rows {start+1}–{end+1} | "
           f"{chars:,} chars | ~{tokens:,} tokens")
@@ -668,96 +629,58 @@ def _sanitize_row_values(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return _clean_row_keys(stripped)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AI EXTRACTION ENGINE — Cerebras with batching + delay + retry
+# AI EXTRACTION ENGINE — Mistral Small 4
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> List[Dict[str, Any]]:
     """
-    Entry point. Splits into batches if needed, sends each with delay and retry,
-    merges all results.
+    Entry point. Splits large tables into row-boundary batches, calls Mistral
+    per batch, merges results. No delays needed — 500k TPM gives ample headroom.
     """
     batches = _split_table_into_batches(html_content)
 
     if len(batches) == 1:
-        result = _extract_with_retry(html_content, url, extract_type, batch_num=1, total=1)
+        result = _extract_with_mistral(html_content, url, extract_type)
         return result if result is not None else []
 
     all_rows: List[Dict[str, Any]] = []
-
     for idx, (batch_html, start, end) in enumerate(batches):
         batch_num = idx + 1
-
-        # FIX P1: wait between batches (not before the first one)
-        if idx > 0:
-            print(f"[BATCH] Waiting {BATCH_DELAY_SECS}s before batch {batch_num}/{len(batches)} "
-                  f"to respect TPM rate limit...")
-            time.sleep(BATCH_DELAY_SECS)
-
         print(f"[BATCH] Sending batch {batch_num}/{len(batches)} to AI "
               f"(rows {start+1}–{end+1})")
-
-        result = _extract_with_retry(batch_html, url, extract_type,
-                                     batch_num=batch_num, total=len(batches))
+        result = _extract_with_mistral(batch_html, url, extract_type)
         if result:
             print(f"[BATCH] #{batch_num} result: {len(result)} records extracted")
             all_rows.extend(result)
         else:
-            print(f"[BATCH] #{batch_num} result: 0 records — skipping")
+            print(f"[BATCH] #{batch_num} result: 0 records — batch may have failed")
 
     print(f"[BATCH] Merge complete: {len(all_rows)} total records from {len(batches)} batches")
     return all_rows[:MAX_RECORDS]
 
 
-def _extract_with_retry(
-    html: str,
-    url: str,
-    extract_type: str,
-    batch_num: int = 1,
-    total: int = 1,
-) -> Optional[List[Dict[str, Any]]]:
-    """
-    FIX P2: Wraps _extract_with_cerebras with retry logic.
-    On 429: waits BATCH_RETRY_WAIT_SECS then retries up to BATCH_MAX_RETRIES times.
-    On any other error: fails immediately.
-    """
-    for attempt in range(1, BATCH_MAX_RETRIES + 1):
-        try:
-            return _extract_with_cerebras(html, url, extract_type)
-        except Exception as e:
-            err_str = str(e)
-            is_429  = '429' in err_str or 'token_quota_exceeded' in err_str
-
-            if is_429 and attempt < BATCH_MAX_RETRIES:
-                print(f"[BATCH] #{batch_num}/{total} retry {attempt}/{BATCH_MAX_RETRIES} "
-                      f"after 429 — waiting {BATCH_RETRY_WAIT_SECS}s...")
-                time.sleep(BATCH_RETRY_WAIT_SECS)
-                continue
-
-            print(f"[BATCH] #{batch_num}/{total} failed after {attempt} attempt(s): {e}")
-            return None
-
-    return None
-
-
-def _extract_with_cerebras(html: str, url: str, extract_type: str) -> List[Dict[str, Any]]:
-    """
-    Raw Cerebras call — raises on any error so retry logic can catch it.
-    """
-    client = _get_cerebras_client()
+def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[List[Dict[str, Any]]]:
+    client = _get_mistral_client()
     if not client:
-        return []
+        return None
     prompt = _build_accuracy_prompt(html, url, extract_type)
-    print(f"[AI] Sending to {_CEREBRAS_MODEL} ({len(html):,} chars "
-          f"~{len(html) // CHARS_PER_TOKEN:,} tokens)")
-    response = client.chat.completions.create(
-        model=_CEREBRAS_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
-    )
-    content = response.choices[0].message.content
-    print(f"[AI] Response received ({len(content)} chars)")
-    parsed = _parse_ai_response(content)
-    return parsed if parsed is not None else []
+    try:
+        print(f"[AI] Sending to {_MISTRAL_MODEL} ({len(html):,} chars "
+              f"~{len(html) // CHARS_PER_TOKEN:,} tokens)")
+        response = client.chat.complete(
+            model=_MISTRAL_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            # reasoning_effort="none" disables chain-of-thought — pure extraction
+            # is faster and cheaper without it (no reasoning tokens billed)
+            extra_body={"reasoning_effort": "none"},
+        )
+        content = response.choices[0].message.content
+        print(f"[AI] Response received ({len(content)} chars)")
+        return _parse_ai_response(content)
+    except Exception as e:
+        print(f"[AI] Mistral extraction failed: {e}")
+        return None
 
 
 def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
@@ -982,7 +905,7 @@ async def _scrape_url(
 # FASTAPI APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="AUDITOR CORE", version="9.7.1")
+app = FastAPI(title="AUDITOR CORE", version="9.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1013,27 +936,25 @@ async def get_api_key():
 @app.get("/api/health")
 async def health():
     return {
-        "status":               "ok",
-        "version":              "9.7.1",
-        "fetcher":              _FETCHER_AVAILABLE,
-        "stealth":              _STEALTH_AVAILABLE,
-        "cerebras":             _CEREBRAS_AVAILABLE,
-        "readability":          False,
-        "ai_model":             _CEREBRAS_MODEL if _CEREBRAS_AVAILABLE else None,
-        "max_safe_chars":       MAX_SAFE_CHARS,
-        "max_batch_chars":      MAX_BATCH_CHARS,
-        "batch_usable":         BATCH_USABLE,
-        "batch_delay_secs":     BATCH_DELAY_SECS,
-        "batch_max_retries":    BATCH_MAX_RETRIES,
-        "batch_retry_wait":     BATCH_RETRY_WAIT_SECS,
-        "min_fields_per_row":   MIN_FIELDS_PER_ROW,
-        "min_quality_ratio":    MIN_QUALITY_RATIO,
-        "min_schema_overlap":   MIN_SCHEMA_OVERLAP,
-        "utc":                  datetime.now(timezone.utc).isoformat(),
+        "status":             "ok",
+        "version":            "9.8.0",
+        "fetcher":            _FETCHER_AVAILABLE,
+        "stealth":            _STEALTH_AVAILABLE,
+        "mistral":            _MISTRAL_AVAILABLE,
+        "readability":        False,
+        "ai_model":           _MISTRAL_MODEL if _MISTRAL_AVAILABLE else None,
+        "max_safe_chars":     MAX_SAFE_CHARS,
+        "max_batch_chars":    MAX_BATCH_CHARS,
+        "batch_usable":       BATCH_USABLE,
+        "min_fields_per_row": MIN_FIELDS_PER_ROW,
+        "min_quality_ratio":  MIN_QUALITY_RATIO,
+        "min_schema_overlap": MIN_SCHEMA_OVERLAP,
+        "utc":                datetime.now(timezone.utc).isoformat(),
     }
 
 @app.get("/api/debug-fetch")
 async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key)):
+    """Debug without AI: sizes at each processing stage + batch plan + preview."""
     if not _is_safe_url(url):
         raise HTTPException(status_code=403, detail="Forbidden domain")
     loop = asyncio.get_running_loop()
@@ -1056,7 +977,6 @@ async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key
             "isolation_pct":     round(100 * len(isolated) / max(len(cleaned), 1), 1),
             "num_batches":       len(batches),
             "batch_sizes":       [len(b[0]) for b in batches],
-            "est_total_mins":    round((len(batches) - 1) * BATCH_DELAY_SECS / 60, 1),
             "stealth_available": _STEALTH_AVAILABLE,
             "preview":           isolated[:3000],
         }
@@ -1078,9 +998,11 @@ async def scrape(body: ScrapeRequest, _key: str = Depends(verify_key)):
 @app.get("/api/token-status")
 async def token_status(_key: str = Depends(verify_key)):
     return {
-        "limit_per_key": 1_000_000,
+        "limit_per_model":     "1B tokens/month",
+        "tpm":                 500_000,
+        "model":               _MISTRAL_MODEL,
         "keys": [
-            {"key_index": 1, "tokens_used": 0, "tokens_remaining": 1_000_000, "active": True}
+            {"key_index": 1, "active": True}
         ],
     }
 
