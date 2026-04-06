@@ -1,31 +1,31 @@
 """
 AUDITOR CORE v9.8.0 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
-\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+────────────────────────────────────────────────────────────────────────────────────
 Changes v9.8.0:
-  \u2022 SWITCHED AI backend: Cerebras \u2192 Mistral La Plateforme (mistral-small-2603)
+  • SWITCHED AI backend: Cerebras → Mistral La Plateforme (mistral-small-2603)
     - Model:   Mistral Small 4 (mistral-small-2603)
     - SDK:     mistralai
-    - TPM:     500,000 (vs Cerebras 60,000 \u2014 8x headroom)
+    - TPM:     500,000 (vs Cerebras 60,000 — 8x headroom)
     - TPS:     ~148 t/s
     - Context: 256k tokens
     - Free tier: 1B tokens/month per model, data training opt-in required
-  \u2022 REMOVED batch delays \u2014 500k TPM means no waiting between batches
-  \u2022 REMOVED retry-on-429 logic \u2014 no longer needed at 5.8% TPM usage per batch
-  \u2022 ADDED reasoning_effort="none" \u2014 disables chain-of-thought for pure extraction
+  • REMOVED batch delays — 500k TPM means no waiting between batches
+  • REMOVED retry-on-429 logic — no longer needed at 5.8% TPM usage per batch
+  • ADDED reasoning_effort="none" — disables chain-of-thought for pure extraction
     speed (JSON output does not benefit from reasoning, only adds latency/tokens)
-  \u2022 ENV var: MISTRAL_API_KEY (replaces CEREBRAS_API_KEY)
+  • ENV var: MISTRAL_API_KEY (replaces CEREBRAS_API_KEY)
 
 Previous fixes (all retained):
-  v9.7.1 \u2014 P1 batch delay, P2 retry on 429, P4 semantic column name inference.
-  v9.7.0 \u2014 dynamic row-boundary batching, batch logging.
-  v9.6.0 \u2014 log spam fix (score > 2 only).
-  v9.5.4 \u2014 F11 empty-key promotion, F12 image-only name cells.
-  v9.5.3 \u2014 F9 honest [] on JS pages, F10 JSON script preservation.
-  v9.5.2 \u2014 F7 table isolation, F8 schema consistency.
-  v9.5.1 \u2014 F6 inline tag unwrapping, HTML tag sanitisation.
-  v9.5.0 \u2014 F1\u2013F5 quality gate, JS retry, data-* attrs, empty-key fallback.
-  v9.4.0 \u2014 surgical noise removal (blacklist, not readability).
-\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+  v9.7.1 — P1 batch delay, P2 retry on 429, P4 semantic column name inference.
+  v9.7.0 — dynamic row-boundary batching, batch logging.
+  v9.6.0 — log spam fix (score > 2 only).
+  v9.5.4 — F11 empty-key promotion, F12 image-only name cells.
+  v9.5.3 — F9 honest [] on JS pages, F10 JSON script preservation.
+  v9.5.2 — F7 table isolation, F8 schema consistency.
+  v9.5.1 — F6 inline tag unwrapping, HTML tag sanitisation.
+  v9.5.0 — F1–F5 quality gate, JS retry, data-* attrs, empty-key fallback.
+  v9.4.0 — surgical noise removal (blacklist, not readability).
+────────────────────────────────────────────────────────────────────────────────────
 """
 
 from dotenv import load_dotenv
@@ -56,9 +56,9 @@ from bs4 import BeautifulSoup, Tag
 
 _READABILITY_AVAILABLE = False
 Document = None
-print("[BOOT] readability-lxml disabled \u2014 using surgical noise removal + table isolation")
+print("[BOOT] readability-lxml disabled — using surgical noise removal + table isolation")
 
-# \u2500\u2500 Mistral AI \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Mistral AI ────────────────────────────────────────────────────────────────
 try:
     from mistralai.client import Mistral
     _MISTRAL_AVAILABLE = True
@@ -66,7 +66,7 @@ except ImportError:
     Mistral = None
     _MISTRAL_AVAILABLE = False
 
-# \u2500\u2500 Scrapling \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Scrapling ─────────────────────────────────────────────────────────────────
 try:
     from scrapling.fetchers import Fetcher, StealthyFetcher
     _STEALTH_AVAILABLE = True
@@ -83,9 +83,9 @@ except ImportError:
 
 print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE}  Stealth={_STEALTH_AVAILABLE}  Mistral={_MISTRAL_AVAILABLE}")
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 
 cpu_executor       = concurrent.futures.ProcessPoolExecutor(max_workers=4)
 MAX_PAYLOAD_SIZE   = 10_485_760
@@ -95,21 +95,21 @@ MIN_FIELDS_PER_ROW = 2
 MIN_QUALITY_RATIO  = 0.5
 MIN_SCHEMA_OVERLAP = 0.5
 
-# Batching \u2014 500k TPM means no delays needed between batches
+# Batching — 500k TPM means no delays needed between batches
 # Keep batch size conservative to stay well within 256k context window
 MAX_BATCH_CHARS    = 120_000   # ~30k tokens per batch
 BATCH_OVERHEAD     = 4_000     # prompt + header reserved
 BATCH_USABLE       = MAX_BATCH_CHARS - BATCH_OVERHEAD   # 116,000 usable
 CHARS_PER_TOKEN    = 4
 
-# \u2500\u2500 Mistral config \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Mistral config ────────────────────────────────────────────────────────────
 _MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
 if not _MISTRAL_API_KEY:
-    print("[ERROR] MISTRAL_API_KEY not set \u2014 AI extraction will fail.")
+    print("[ERROR] MISTRAL_API_KEY not set — AI extraction will fail.")
 else:
     print(f"[BOOT] MISTRAL_API_KEY loaded: prefix={_MISTRAL_API_KEY[:8]}... length={len(_MISTRAL_API_KEY)}")
 
-# Mistral Small 4 \u2014 119B MoE (6.5B active), 256k context, 148 t/s, 500k TPM free
+# Mistral Small 4 — 119B MoE (6.5B active), 256k context, 148 t/s, 500k TPM free
 _MISTRAL_MODEL = "mistral-small-2603"
 
 def _get_mistral_client() -> Optional["Mistral"]:
@@ -122,23 +122,23 @@ def _get_mistral_client() -> Optional["Mistral"]:
     print(f"[AI] Creating Mistral client with key prefix={_MISTRAL_API_KEY[:8]}... length={len(_MISTRAL_API_KEY)}")
     return Mistral(api_key=_MISTRAL_API_KEY)
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 # API KEY AUTH
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 
 _ENV_KEY = os.environ.get("AUDITOR_API_KEY", "").strip()
 API_KEY  = _ENV_KEY if _ENV_KEY else secrets.token_hex(32)
 if not _ENV_KEY:
-    print(f"[BOOT] No AUDITOR_API_KEY \u2014 generated: {API_KEY}")
+    print(f"[BOOT] No AUDITOR_API_KEY — generated: {API_KEY}")
 
 def verify_key(x_api_key: str = Header(..., alias="X-Api-Key")) -> str:
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
     return x_api_key
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 # MODELS
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class ScrapeRequest(BaseModel):
     url:          str
@@ -151,9 +151,9 @@ class ScrapeResponse(BaseModel):
     raw_bytes: int
     elapsed:   float
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 # SSRF PROTECTION
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _is_safe_url(url: str) -> bool:
     try:
@@ -174,9 +174,9 @@ def _is_safe_url(url: str) -> bool:
     except Exception:
         return False
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 # PREPROCESSING
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 
 _ZW_CHARS = re.compile(r'[\u200b\u200c\u200d\u2060\uFEFF\u00ad]')
 
@@ -324,7 +324,7 @@ def _infer_column_names(soup: BeautifulSoup) -> None:
                 continue
             th.string = name
             inferred += 1
-            print(f"[INFER] col {col_idx+1} \u2192 '{name}' (samples: {samples[:3]})")
+            print(f"[INFER] col {col_idx+1} → '{name}' (samples: {samples[:3]})")
         if inferred:
             print(f"[INFER] {inferred} column name(s) inferred from data patterns")
 
@@ -368,9 +368,9 @@ def _extract_main_content(html: str) -> str:
         print(f"[PREPROCESS] Appending {len(json_appendix):,} chars of JSON initial-state data")
     return body + json_appendix
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 # TABLE ISOLATION
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _score_table(table_tag: Tag) -> int:
     rows      = table_tag.find_all('tr')
@@ -386,7 +386,7 @@ def _find_best_table(html: str) -> str:
     tables = soup.find_all('table')
 
     if not tables:
-        print("[TABLE] No <table> elements found \u2014 using full cleaned HTML")
+        print("[TABLE] No <table> elements found — using full cleaned HTML")
         return html
 
     scored = []
@@ -417,25 +417,25 @@ def _preprocess_html(html_bytes: bytes) -> str:
     original_len = len(text)
     cleaned      = _extract_main_content(text)
     cleaned_len  = len(cleaned)
-    print(f"[PREPROCESS] {original_len:,} \u2192 {cleaned_len:,} chars after noise removal "
+    print(f"[PREPROCESS] {original_len:,} → {cleaned_len:,} chars after noise removal "
           f"({100 * cleaned_len / max(original_len, 1):.1f}% retained)")
 
     isolated     = _find_best_table(cleaned)
     isolated_len = len(isolated)
-    print(f"[PREPROCESS] {cleaned_len:,} \u2192 {isolated_len:,} chars after table isolation")
+    print(f"[PREPROCESS] {cleaned_len:,} → {isolated_len:,} chars after table isolation")
 
     return isolated
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 # DYNAMIC ROW-BOUNDARY BATCHING
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _split_table_into_batches(html: str) -> List[Tuple[str, int, int]]:
     soup     = BeautifulSoup(html, 'html.parser')
     all_rows = soup.find_all('tr')
 
     if not all_rows:
-        print("[BATCH] No <tr> elements \u2014 treating as single non-table batch")
+        print("[BATCH] No <tr> elements — treating as single non-table batch")
         return [(html, 0, 0)]
 
     header_row = None
@@ -451,7 +451,7 @@ def _split_table_into_batches(html: str) -> List[Tuple[str, int, int]]:
     total_rows   = len(data_rows)
 
     if total_rows == 0:
-        print("[BATCH] No data rows \u2014 sending header only")
+        print("[BATCH] No data rows — sending header only")
         return [(html, 0, 0)]
 
     sample        = data_rows[:min(10, total_rows)]
@@ -470,7 +470,7 @@ def _split_table_into_batches(html: str) -> List[Tuple[str, int, int]]:
     total_data_chars = sum(len(str(r)) for r in data_rows)
     if total_data_chars + header_chars <= BATCH_USABLE:
         print(f"[BATCH] All {total_rows} rows fit in one batch "
-              f"({total_data_chars + header_chars:,} chars) \u2014 no splitting")
+              f"({total_data_chars + header_chars:,} chars) — no splitting")
         return [(html, 0, total_rows - 1)]
 
     batches: List[Tuple[str, int, int]] = []
@@ -519,7 +519,7 @@ def _split_table_into_batches(html: str) -> List[Tuple[str, int, int]]:
 def _log_batch_plan(batch_num: int, total: int, start: int, end: int, html: str) -> None:
     chars  = len(html)
     tokens = chars // CHARS_PER_TOKEN
-    print(f"[BATCH] #{batch_num}/{total}: rows {start+1}\u2013{end+1} | "
+    print(f"[BATCH] #{batch_num}/{total}: rows {start+1}–{end+1} | "
           f"{chars:,} chars | ~{tokens:,} tokens")
 
 
@@ -527,9 +527,9 @@ def _assemble_batch_html(header_html: str, rows: List[Tag]) -> str:
     rows_html = ''.join(str(r) for r in rows)
     return f"<table>{header_html}{rows_html}</table>"
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 # EXTRACTION QUALITY GATE
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _count_populated(row: Dict[str, Any]) -> int:
     return sum(
@@ -555,7 +555,7 @@ def _rows_have_data(rows: List[Dict[str, Any]]) -> bool:
 
     good_rows = sum(1 for r in rows if _count_populated(r) >= MIN_FIELDS_PER_ROW)
     quality   = good_rows / len(rows)
-    print(f"[QUALITY] {good_rows}/{len(rows)} rows have \u2265{MIN_FIELDS_PER_ROW} fields "
+    print(f"[QUALITY] {good_rows}/{len(rows)} rows have ≥{MIN_FIELDS_PER_ROW} fields "
           f"(quality={quality:.0%})")
 
     if quality < MIN_QUALITY_RATIO:
@@ -570,7 +570,7 @@ def _rows_have_data(rows: List[Dict[str, Any]]) -> bool:
         schema_quality = consistent / len(rows)
         print(f"[QUALITY] Schema consistency: {consistent}/{len(rows)} ({schema_quality:.0%})")
         if schema_quality < MIN_QUALITY_RATIO:
-            print(f"[QUALITY] Mixed-table contamination \u2014 triggering retry")
+            print(f"[QUALITY] Mixed-table contamination — triggering retry")
             return False
 
     return True
@@ -587,15 +587,15 @@ def _log_extraction_stats(rows: List[Dict[str, Any]], label: str = "") -> None:
             if v is not None and str(v).strip() not in ("", "null", "N/A", "-"):
                 all_keys[k] += 1
     total = len(rows)
-    print(f"[STATS{' ' + label if label else ''}] {total} rows \u00b7 field coverage:")
+    print(f"[STATS{' ' + label if label else ''}] {total} rows · field coverage:")
     for key, count in sorted(all_keys.items(), key=lambda x: -x[1]):
-        bar   = "\u2588" * int(10 * count / total) + "\u2591" * (10 - int(10 * count / total))
-        empty = "  \u2190 EMPTY KEY" if str(key).strip() == "" else ""
+        bar   = "█" * int(10 * count / total) + "░" * (10 - int(10 * count / total))
+        empty = "  ← EMPTY KEY" if str(key).strip() == "" else ""
         print(f"  {bar} {count:>3}/{total}  '{key}'{empty}")
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 # POST-PROCESSING
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _sanitize_value(v: Any) -> Any:
     if not isinstance(v, str):
@@ -631,14 +631,14 @@ def _sanitize_row_values(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     stripped = [{k: _sanitize_value(v) for k, v in row.items()} for row in rows]
     return _clean_row_keys(stripped)
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-# AI EXTRACTION ENGINE \u2014 Mistral Small 4
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI EXTRACTION ENGINE — Mistral Small 4
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> List[Dict[str, Any]]:
     """
     Entry point. Splits large tables into row-boundary batches, calls Mistral
-    per batch, merges results. No delays needed \u2014 500k TPM gives ample headroom.
+    per batch, merges results. No delays needed — 500k TPM gives ample headroom.
     """
     batches = _split_table_into_batches(html_content)
 
@@ -650,13 +650,13 @@ def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> 
     for idx, (batch_html, start, end) in enumerate(batches):
         batch_num = idx + 1
         print(f"[BATCH] Sending batch {batch_num}/{len(batches)} to AI "
-              f"(rows {start+1}\u2013{end+1})")
+              f"(rows {start+1}–{end+1})")
         result = _extract_with_mistral(batch_html, url, extract_type)
         if result:
             print(f"[BATCH] #{batch_num} result: {len(result)} records extracted")
             all_rows.extend(result)
         else:
-            print(f"[BATCH] #{batch_num} result: 0 records \u2014 batch may have failed")
+            print(f"[BATCH] #{batch_num} result: 0 records — batch may have failed")
 
     print(f"[BATCH] Merge complete: {len(all_rows)} total records from {len(batches)} batches")
     return all_rows[:MAX_RECORDS]
@@ -674,7 +674,7 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
             model=_MISTRAL_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            # reasoning_effort="none" disables chain-of-thought \u2014 pure extraction
+            # reasoning_effort="none" disables chain-of-thought — pure extraction
             # is faster and cheaper without it (no reasoning tokens billed)
             extra_body={"reasoning_effort": "none"},
         )
@@ -715,12 +715,12 @@ STRICT RULES:
 1. READ the actual column headers or field labels from the HTML. Use them EXACTLY as JSON keys.
    Do NOT rename, translate, shorten, or invent keys.
 2. Extract EVERY column/field you find. Do not skip any.
-3. Copy ALL values as plain text \u2014 preserve signs (+/-), units (BTC, ETH, $, %, K, M, B, T).
+3. Copy ALL values as plain text — preserve signs (+/-), units (BTC, ETH, $, %, K, M, B, T).
 4. Values must be plain text strings only. Never include HTML tags in values.
 5. If a cell is empty or missing, use null.
 6. Do NOT add fields not in the source. Do NOT hallucinate values.
 7. Extract from ONE table/structure only. Do NOT merge rows from different tables.
-8. Return ONLY a valid JSON array \u2014 no markdown fences, no explanation, no preamble.
+8. Return ONLY a valid JSON array — no markdown fences, no explanation, no preamble.
 9. If no structured data is found, return: []
 
 HEADER FALLBACK:
@@ -775,9 +775,9 @@ def _parse_ai_response(content: str) -> Optional[List[Dict[str, Any]]]:
         print(f"[AI] JSON parse error: {e}")
     return None
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 # FETCHING LAYER
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _fetch_static(url: str):
     if Fetcher is None:
@@ -817,9 +817,9 @@ def _get_raw_bytes(response) -> bytes:
                 return val.encode('utf-8', errors='replace')
     raise ValueError("Scrapling response has no usable content.")
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN SCRAPE PIPELINE
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 
 async def _scrape_url(
     url: str,
@@ -849,7 +849,7 @@ async def _scrape_url(
         raise HTTPException(status_code=502, detail=str(e))
 
     raw_bytes = len(raw)
-    print(f"[SCRAPE] {url} \u2192 {raw_bytes:,} bytes (js={used_js})")
+    print(f"[SCRAPE] {url} → {raw_bytes:,} bytes (js={used_js})")
 
     if raw_bytes == 0:
         raise HTTPException(status_code=502, detail="Empty body.")
@@ -874,7 +874,7 @@ async def _scrape_url(
 
     if needs_better:
         if _STEALTH_AVAILABLE:
-            print(f"[SCRAPE] Low-quality extraction \u2014 retrying with JS renderer")
+            print(f"[SCRAPE] Low-quality extraction — retrying with JS renderer")
             try:
                 response2   = await _do_fetch(True)
                 raw2        = _get_raw_bytes(response2)
@@ -890,23 +890,23 @@ async def _scrape_url(
                         used_js   = True
                         print(f"[SCRAPE] JS retry succeeded")
                     else:
-                        print(f"[SCRAPE] JS retry also low quality \u2014 returning []")
+                        print(f"[SCRAPE] JS retry also low quality — returning []")
                         rows = []
             except Exception as e:
                 print(f"[SCRAPE] JS retry failed: {e}")
         else:
             print(
                 f"[SCRAPE] Page appears JS-rendered (ghost rows) but StealthyFetcher "
-                f"unavailable \u2014 returning [] to avoid ghost rows."
+                f"unavailable — returning [] to avoid ghost rows."
             )
             rows = []
 
     print(f"[SCRAPE] Final: {len(rows)} records (js={used_js})")
     return rows, raw_bytes
 
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 # FASTAPI APPLICATION
-# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+# ═══════════════════════════════════════════════════════════════════════════════
 
 app = FastAPI(title="AUDITOR CORE", version="9.8.0")
 
@@ -920,9 +920,9 @@ app.add_middleware(
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
     errors = "; ".join(
-        f"{' \u2192 '.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors()
+        f"{' → '.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors()
     )
-    return JSONResponse(status_code=422, content={"detail": f"Validation error \u2014 {errors}"})
+    return JSONResponse(status_code=422, content={"detail": f"Validation error — {errors}"})
 
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
@@ -930,7 +930,7 @@ async def serve_frontend():
     html_path = os.path.join(base_dir, "index.html")
     if os.path.exists(html_path):
         return FileResponse(html_path)
-    return HTMLResponse(content="<h2>404 \u2014 index.html not found</h2>", status_code=404)
+    return HTMLResponse(content="<h2>404 — index.html not found</h2>", status_code=404)
 
 @app.get("/api/key")
 async def get_api_key():
@@ -967,4 +967,66 @@ async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key
         )
         raw      = _get_raw_bytes(response)
         text     = raw.decode('utf-8', errors='replace')
-        cleaned
+        cleaned  = _extract_main_content(text)
+        isolated = _find_best_table(cleaned)
+        batches  = _split_table_into_batches(isolated)
+        return {
+            "url":               url,
+            "js":                js,
+            "raw_bytes":         len(raw),
+            "cleaned_chars":     len(cleaned),
+            "isolated_chars":    len(isolated),
+            "retention_pct":     round(100 * len(cleaned) / max(len(raw), 1), 1),
+            "isolation_pct":     round(100 * len(isolated) / max(len(cleaned), 1), 1),
+            "num_batches":       len(batches),
+            "batch_sizes":       [len(b[0]) for b in batches],
+            "stealth_available": _STEALTH_AVAILABLE,
+            "preview":           isolated[:3000],
+        }
+    except Exception as e:
+        return {"url": url, "error": str(e)}
+
+@app.post("/api/scrape", response_model=ScrapeResponse)
+async def scrape(body: ScrapeRequest, _key: str = Depends(verify_key)):
+    t0 = time.perf_counter()
+    rows, raw_bytes = await _scrape_url(
+        body.url, js=body.js, extract_type=body.extract_type
+    )
+    return ScrapeResponse(
+        events=rows,
+        raw_bytes=raw_bytes,
+        elapsed=round(time.perf_counter() - t0, 3),
+    )
+
+@app.get("/api/token-status")
+async def token_status(_key: str = Depends(verify_key)):
+    return {
+        "limit_per_model":     "1B tokens/month",
+        "tpm":                 500_000,
+        "model":               _MISTRAL_MODEL,
+        "keys": [
+            {"key_index": 1, "active": True}
+        ],
+    }
+
+@app.on_event("startup")
+async def startup():
+    try:
+        from telegram_bot import start_bot
+        start_bot()
+        print("[BOOT] Telegram bot started.")
+    except ImportError:
+        print("[BOOT] telegram_bot.py not found – skipping.")
+    except Exception as e:
+        print(f"[BOOT] Telegram bot failed: {e}")
+
+@app.on_event("shutdown")
+async def shutdown():
+    try:
+        from telegram_bot import stop_bot
+        stop_bot()
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
