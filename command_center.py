@@ -60,7 +60,7 @@ print("[BOOT] readability-lxml disabled — using surgical noise removal + table
 
 # ── Mistral AI ────────────────────────────────────────────────────────────────
 try:
-    from mistralai import Mistral
+    from mistralai.client import Mistral
     _MISTRAL_AVAILABLE = True
 except ImportError:
     Mistral = None
