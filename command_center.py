@@ -1,4 +1,4 @@
-"""
+."""
 AUDITOR CORE v9.8.0 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
 ────────────────────────────────────────────────────────────────────────────────────
 Changes v9.8.0:
@@ -674,9 +674,6 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
             model=_MISTRAL_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            # reasoning_effort="none" disables chain-of-thought — pure extraction
-            # is faster and cheaper without it (no reasoning tokens billed)
-            extra_body={"reasoning_effort": "none"},
         )
         content = response.choices[0].message.content
         print(f"[AI] Response received ({len(content)} chars)")
