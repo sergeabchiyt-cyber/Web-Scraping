@@ -675,6 +675,7 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
     try:
         print(f"[AI] Sending to {_MISTRAL_MODEL} ({len(html):,} chars "
               f"~{len(html) // CHARS_PER_TOKEN:,} tokens)")
+        print(f"[AI] Auth header: Bearer {_MISTRAL_API_KEY[:8]}...{_MISTRAL_API_KEY[-4:]} (len={len(_MISTRAL_API_KEY)})")
         with httpx.Client(timeout=120.0) as client:
             response = client.post(_MISTRAL_API_URL, json=payload, headers=headers)
         print(f"[AI] HTTP {response.status_code}")
