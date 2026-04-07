@@ -60,10 +60,10 @@ print("[BOOT] readability-lxml disabled — using surgical noise removal + table
 
 # ── Mistral AI ────────────────────────────────────────────────────────────────
 try:
-    from mistralai.client import Mistral
+    import httpx
     _MISTRAL_AVAILABLE = True
 except ImportError:
-    Mistral = None
+    httpx = None
     _MISTRAL_AVAILABLE = False
 
 # ── Scrapling ─────────────────────────────────────────────────────────────────
@@ -112,15 +112,7 @@ else:
 # Mistral Small 4 — 119B MoE (6.5B active), 256k context, 148 t/s, 500k TPM free
 _MISTRAL_MODEL = "mistral-small-2603"
 
-def _get_mistral_client() -> Optional["Mistral"]:
-    if not _MISTRAL_AVAILABLE:
-        print("[AI] mistralai SDK not installed. Run: pip install mistralai")
-        return None
-    if not _MISTRAL_API_KEY:
-        print("[AI] No Mistral API key provided.")
-        return None
-    print(f"[AI] Creating Mistral client with key prefix={_MISTRAL_API_KEY[:8]}... length={len(_MISTRAL_API_KEY)}")
-    return Mistral(api_key=_MISTRAL_API_KEY)
+_MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # API KEY AUTH
@@ -663,19 +655,34 @@ def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> 
 
 
 def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[List[Dict[str, Any]]]:
-    client = _get_mistral_client()
-    if not client:
+    if not _MISTRAL_AVAILABLE:
+        print("[AI] httpx not installed. Run: pip install httpx")
+        return None
+    if not _MISTRAL_API_KEY:
+        print("[AI] No Mistral API key provided.")
         return None
     prompt = _build_accuracy_prompt(html, url, extract_type)
+    payload = {
+        "model": _MISTRAL_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {_MISTRAL_API_KEY}",
+    }
     try:
         print(f"[AI] Sending to {_MISTRAL_MODEL} ({len(html):,} chars "
               f"~{len(html) // CHARS_PER_TOKEN:,} tokens)")
-        response = client.chat.complete(
-            model=_MISTRAL_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-        )
-        content = response.choices[0].message.content
+        with httpx.Client(timeout=120.0) as client:
+            response = client.post(_MISTRAL_API_URL, json=payload, headers=headers)
+        print(f"[AI] HTTP {response.status_code}")
+        if response.status_code != 200:
+            print(f"[AI] Mistral error: {response.text[:300]}")
+            return None
+        data    = response.json()
+        content = data["choices"][0]["message"]["content"]
         print(f"[AI] Response received ({len(content)} chars)")
         return _parse_ai_response(content)
     except Exception as e:
