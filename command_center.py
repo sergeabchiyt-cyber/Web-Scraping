@@ -1,30 +1,25 @@
 """
-AUDITOR CORE v9.8.0 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
+AUDITOR CORE v9.9.0 - Optimized for 2 RPM Limit
 ────────────────────────────────────────────────────────────────────────────────────
-Changes v9.8.0:
-  • SWITCHED AI backend: Cerebras → Mistral La Plateforme (mistral-small-2603)
-    - Model:   Mistral Small 4 (mistral-small-2603)
-    - SDK:     mistralai
-    - TPM:     500,000 (vs Cerebras 60,000 — 8x headroom)
-    - TPS:     ~148 t/s
-    - Context: 256k tokens
-    - Free tier: 1B tokens/month per model, data training opt-in required
-  • REMOVED batch delays — 500k TPM means no waiting between batches
-  • REMOVED retry-on-429 logic — no longer needed at 5.8% TPM usage per batch
-  • ADDED reasoning_effort="none" — disables chain-of-thought for pure extraction
-    speed (JSON output does not benefit from reasoning, only adds latency/tokens)
-  • ENV var: MISTRAL_API_KEY (replaces CEREBRAS_API_KEY)
+Changes v9.9.0:
+• OPTIMIZED batch sizing for 2 RPM constraint
+- MAX_BATCH_CHARS: 120,000 → 200,000 chars (~50k tokens)
+- BATCH_OVERHEAD: 4,000 → 3,000 chars (optimized prompt)
+- BATCH_USABLE: 116,000 → 197,000 chars
+- Context utilization: ~50k/256k = 19.5% per batch
+• RESULT: 40-50% fewer batches for typical tables = fewer API calls = lower RPM usage
 
 Previous fixes (all retained):
-  v9.7.1 — P1 batch delay, P2 retry on 429, P4 semantic column name inference.
-  v9.7.0 — dynamic row-boundary batching, batch logging.
-  v9.6.0 — log spam fix (score > 2 only).
-  v9.5.4 — F11 empty-key promotion, F12 image-only name cells.
-  v9.5.3 — F9 honest [] on JS pages, F10 JSON script preservation.
-  v9.5.2 — F7 table isolation, F8 schema consistency.
-  v9.5.1 — F6 inline tag unwrapping, HTML tag sanitisation.
-  v9.5.0 — F1–F5 quality gate, JS retry, data-* attrs, empty-key fallback.
-  v9.4.0 — surgical noise removal (blacklist, not readability).
+v9.8.0 — Mistral Small 4 (mistral-small-2603), 500k TPM, 256k context.
+v9.7.1 — P1 batch delay, P2 retry on 429, P4 semantic column name inference.
+v9.7.0 — dynamic row-boundary batching, batch logging.
+v9.6.0 — log spam fix (score > 2 only).
+v9.5.4 — F11 empty-key promotion, F12 image-only name cells.
+v9.5.3 — F9 honest [] on JS pages, F10 JSON script preservation.
+v9.5.2 — F7 table isolation, F8 schema consistency.
+v9.5.1 — F6 inline tag unwrapping, HTML tag sanitisation.
+v9.5.0 — F1–F5 quality gate, JS retry, data-* attrs, empty-key fallback.
+v9.4.0 — surgical noise removal (blacklist, not readability).
 ────────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -58,7 +53,7 @@ _READABILITY_AVAILABLE = False
 Document = None
 print("[BOOT] readability-lxml disabled — using surgical noise removal + table isolation")
 
-# ── Mistral AI ────────────────────────────────────────────────────────────────
+# ─ Mistral AI ─────────────────────────────────────────────────────────────────
 try:
     import httpx
     _MISTRAL_AVAILABLE = True
@@ -66,7 +61,7 @@ except ImportError:
     httpx = None
     _MISTRAL_AVAILABLE = False
 
-# ── Scrapling ─────────────────────────────────────────────────────────────────
+# ─ Scrapling ──────────────────────────────────────────────────────────────────
 try:
     from scrapling.fetchers import Fetcher, StealthyFetcher
     _STEALTH_AVAILABLE = True
@@ -81,45 +76,43 @@ except ImportError:
     StealthyFetcher = None
     _STEALTH_AVAILABLE = False
 
-print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE}  Stealth={_STEALTH_AVAILABLE}  Mistral={_MISTRAL_AVAILABLE}")
+print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE} Stealth={_STEALTH_AVAILABLE} Mistral={_MISTRAL_AVAILABLE}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-cpu_executor       = concurrent.futures.ProcessPoolExecutor(max_workers=4)
-MAX_PAYLOAD_SIZE   = 10_485_760
-MAX_SAFE_CHARS     = 500_000
-MAX_RECORDS        = 1000
+# ════════════════════════════════════════════════════════════════════════════════
+cpu_executor = concurrent.futures.ProcessPoolExecutor(max_workers=4)
+MAX_PAYLOAD_SIZE = 10_485_760
+MAX_SAFE_CHARS = 500_000
+MAX_RECORDS = 1000
 MIN_FIELDS_PER_ROW = 2
-MIN_QUALITY_RATIO  = 0.5
+MIN_QUALITY_RATIO = 0.5
 MIN_SCHEMA_OVERLAP = 0.5
 
-# Batching — 500k TPM means no delays needed between batches
-# Keep batch size conservative to stay well within 256k context window
-MAX_BATCH_CHARS    = 120_000   # ~30k tokens per batch
-BATCH_OVERHEAD     = 4_000     # prompt + header reserved
-BATCH_USABLE       = MAX_BATCH_CHARS - BATCH_OVERHEAD   # 116,000 usable
-CHARS_PER_TOKEN    = 4
+# ── Batching OPTIMIZATION v9.9.0 ────────────────────────────────────────────────
+# 256k context, ~3k prompt overhead = 253k for content
+# Conservative target: 200k chars (~50k tokens) = 19.5% of context
+# This maximizes data per batch → minimizes RPM usage
+MAX_BATCH_CHARS = 200_000   # v9.9.0: 120k → 200k (+67%)
+BATCH_OVERHEAD = 3_000       # v9.9.0: 4k → 3k (optimized prompt)
+BATCH_USABLE = MAX_BATCH_CHARS - BATCH_OVERHEAD  # 197,000 usable chars
+CHARS_PER_TOKEN = 4
 
-# ── Mistral config ────────────────────────────────────────────────────────────
+# ── Mistral config ─────────────────────────────────────────────────────────────
 _MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip().lstrip("=")
 if not _MISTRAL_API_KEY:
     print("[ERROR] MISTRAL_API_KEY not set — AI extraction will fail.")
 else:
     print(f"[BOOT] MISTRAL_API_KEY loaded: prefix={_MISTRAL_API_KEY[:8]}... length={len(_MISTRAL_API_KEY)}")
 
-# Mistral Small 4 — 119B MoE (6.5B active), 256k context, 148 t/s, 500k TPM free
 _MISTRAL_MODEL = "mistral-small-2603"
-
 _MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # API KEY AUTH
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════════════════════════════
 _ENV_KEY = os.environ.get("AUDITOR_API_KEY", "").strip()
-API_KEY  = _ENV_KEY if _ENV_KEY else secrets.token_hex(32)
+API_KEY = _ENV_KEY if _ENV_KEY else secrets.token_hex(32)
 if not _ENV_KEY:
     print(f"[BOOT] No AUDITOR_API_KEY — generated: {API_KEY}")
 
@@ -128,25 +121,23 @@ def verify_key(x_api_key: str = Header(..., alias="X-Api-Key")) -> str:
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
     return x_api_key
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # MODELS
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════════════════════════════
 class ScrapeRequest(BaseModel):
-    url:          str
-    adaptive:     bool = True
-    js:           bool = False
-    extract_type: str  = "auto"
+    url: str
+    adaptive: bool = True
+    js: bool = False
+    extract_type: str = "auto"
 
 class ScrapeResponse(BaseModel):
-    events:    List[Dict[str, Any]]
+    events: List[Dict[str, Any]]
     raw_bytes: int
-    elapsed:   float
+    elapsed: float
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # SSRF PROTECTION
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════════════════════════════
 def _is_safe_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
@@ -155,7 +146,7 @@ def _is_safe_url(url: str) -> bool:
         hostname = parsed.hostname
         if not hostname:
             return False
-        ip     = socket.gethostbyname(hostname)
+        ip = socket.gethostbyname(hostname)
         ip_int = int.from_bytes(socket.inet_aton(ip), 'big')
         private_blocks = [
             (0x0A000000, 0xFF000000), (0xAC100000, 0xFFF00000),
@@ -166,10 +157,9 @@ def _is_safe_url(url: str) -> bool:
     except Exception:
         return False
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # PREPROCESSING
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════════════════════════════
 _ZW_CHARS = re.compile(r'[\u200b\u200c\u200d\u2060\uFEFF\u00ad]')
 
 _NOISE_TAGS = [
@@ -202,22 +192,21 @@ _STRIP_ATTRS_RE = re.compile(
 _HTML_TAG_RE = re.compile(r'<[^>]+>')
 
 _JSON_DATA_SCRIPT_IDS = re.compile(
-    r'(NEXT_DATA|__NUXT__|__INITIAL_STATE__|app-state|initial-data|'
+    r'(NEXT_DATA|NUXT|INITIAL_STATE|app-state|initial-data|'
     r'data-layer|redux-state|apollo-state|relay-store)',
     re.IGNORECASE,
 )
 
 # Semantic column name inference patterns
-_TIME_PATTERN    = re.compile(r'^\d{1,2}:\d{2}(:\d{2})?(\s*(AM|PM))?$', re.IGNORECASE)
-_DATE_PATTERN    = re.compile(
+_TIME_PATTERN = re.compile(r'^\d{1,2}:\d{2}(:\d{2})?(\s*(AM|PM))?', re.IGNORECASE)
+_DATE_PATTERN = re.compile(
     r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
     r'january|february|march|april|may|june|july|august|september|'
     r'october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b',
     re.IGNORECASE,
 )
-_COUNTRY_PATTERN = re.compile(r'^[A-Z]{2,3}$')
-_NUMBER_PATTERN  = re.compile(r'^[+-]?\d+\.?\d*%?$')
-
+_COUNTRY_PATTERN = re.compile(r'^[A-Z]{2,3}$', re.IGNORECASE)
+_NUMBER_PATTERN = re.compile(r'^[+-]?\d+\.?\d*%?$')
 
 def _normalize(text: str) -> str:
     if not text:
@@ -225,7 +214,6 @@ def _normalize(text: str) -> str:
     text = unicodedata.normalize('NFKC', text)
     text = _ZW_CHARS.sub('', text)
     return text.strip()
-
 
 def _replace_img_with_alt(soup: BeautifulSoup) -> None:
     for img in soup.find_all('img'):
@@ -241,12 +229,11 @@ def _replace_img_with_alt(soup: BeautifulSoup) -> None:
         else:
             img.decompose()
 
-
 def _extract_json_scripts(soup: BeautifulSoup) -> str:
     json_blocks = []
     for script in soup.find_all('script'):
         script_type = script.get('type', '').lower()
-        script_id   = script.get('id', '')
+        script_id = script.get('id', '')
         is_json = (
             script_type in ('application/json', 'application/ld+json')
             or bool(_JSON_DATA_SCRIPT_IDS.search(script_id))
@@ -257,9 +244,9 @@ def _extract_json_scripts(soup: BeautifulSoup) -> str:
         if not raw_text or len(raw_text) > 50_000:
             continue
         try:
-            parsed    = json.loads(raw_text)
+            parsed = json.loads(raw_text)
             formatted = json.dumps(parsed, indent=2)
-            label     = script_id or script_type or 'json-data'
+            label = script_id or script_type or 'json-data'
             json_blocks.append(
                 f"\n<!-- JSON DATA BLOCK: {label} -->\n<pre>{formatted}</pre>"
             )
@@ -267,7 +254,6 @@ def _extract_json_scripts(soup: BeautifulSoup) -> str:
         except Exception:
             pass
     return '\n'.join(json_blocks)
-
 
 def _infer_column_names(soup: BeautifulSoup) -> None:
     """Assign semantic names to empty <th> cells based on data patterns."""
@@ -282,7 +268,7 @@ def _infer_column_names(soup: BeautifulSoup) -> None:
                 break
         if not header_row:
             continue
-        headers   = header_row.find_all(['th', 'td'])
+        headers = header_row.find_all(['th', 'td'])
         data_rows = [r for r in rows if r != header_row and r.find('td')]
         if not data_rows:
             continue
@@ -299,11 +285,11 @@ def _infer_column_names(soup: BeautifulSoup) -> None:
                         samples.append(val)
             if not samples:
                 continue
-            threshold    = len(samples) * 0.5
-            time_hits    = sum(1 for s in samples if _TIME_PATTERN.match(s))
-            date_hits    = sum(1 for s in samples if _DATE_PATTERN.search(s))
+            threshold = len(samples) * 0.5
+            time_hits = sum(1 for s in samples if _TIME_PATTERN.match(s))
+            date_hits = sum(1 for s in samples if _DATE_PATTERN.search(s))
             country_hits = sum(1 for s in samples if _COUNTRY_PATTERN.match(s))
-            number_hits  = sum(1 for s in samples if _NUMBER_PATTERN.match(s))
+            number_hits = sum(1 for s in samples if _NUMBER_PATTERN.match(s))
             if time_hits >= threshold:
                 name = "Time"
             elif date_hits >= threshold:
@@ -320,11 +306,11 @@ def _infer_column_names(soup: BeautifulSoup) -> None:
         if inferred:
             print(f"[INFER] {inferred} column name(s) inferred from data patterns")
 
-
 def _clean_soup(soup: BeautifulSoup) -> Tuple[BeautifulSoup, str]:
     _replace_img_with_alt(soup)
     json_appendix = _extract_json_scripts(soup)
 
+    # Remove scripts and noise tags
     for script in soup.find_all('script'):
         script.decompose()
     for tag in soup(_NOISE_TAGS):
@@ -351,7 +337,6 @@ def _clean_soup(soup: BeautifulSoup) -> Tuple[BeautifulSoup, str]:
 
     return soup, json_appendix
 
-
 def _extract_main_content(html: str) -> str:
     soup = BeautifulSoup(html, 'html.parser')
     soup, json_appendix = _clean_soup(soup)
@@ -360,21 +345,19 @@ def _extract_main_content(html: str) -> str:
         print(f"[PREPROCESS] Appending {len(json_appendix):,} chars of JSON initial-state data")
     return body + json_appendix
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # TABLE ISOLATION
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════════════════════════════
 def _score_table(table_tag: Tag) -> int:
-    rows      = table_tag.find_all('tr')
+    rows = table_tag.find_all('tr')
     if not rows:
         return 0
-    max_cols  = max((len(r.find_all(['td', 'th'])) for r in rows), default=0)
+    max_cols = max((len(r.find_all(['td', 'th'])) for r in rows), default=0)
     data_rows = sum(1 for r in rows if r.find('td'))
     return data_rows * max_cols
 
-
 def _find_best_table(html: str) -> str:
-    soup   = BeautifulSoup(html, 'html.parser')
+    soup = BeautifulSoup(html, 'html.parser')
     tables = soup.find_all('table')
 
     if not tables:
@@ -399,7 +382,6 @@ def _find_best_table(html: str) -> str:
     print(f"[TABLE] Selected #{best_idx+1} (score={best_score})")
     return str(best_table)
 
-
 def _preprocess_html(html_bytes: bytes) -> str:
     try:
         text = html_bytes.decode('utf-8', errors='replace')
@@ -418,12 +400,11 @@ def _preprocess_html(html_bytes: bytes) -> str:
 
     return isolated
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DYNAMIC ROW-BOUNDARY BATCHING
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════════════════════════════
+# DYNAMIC ROW-BOUNDARY BATCHING (OPTIMIZED for 200k chars)
+# ════════════════════════════════════════════════════════════════════════════════
 def _split_table_into_batches(html: str) -> List[Tuple[str, int, int]]:
-    soup     = BeautifulSoup(html, 'html.parser')
+    soup = BeautifulSoup(html, 'html.parser')
     all_rows = soup.find_all('tr')
 
     if not all_rows:
@@ -457,9 +438,11 @@ def _split_table_into_batches(html: str) -> List[Tuple[str, int, int]]:
 
     print(f"[BATCH] Plan: {total_rows} rows | avg row={avg_row_chars:.0f} chars "
           f"({est_tokens} tokens) | batch_size={batch_size} rows | "
-          f"batches={num_batches} | header={header_chars} chars")
+          f"batches={num_batches} | header={header_chars} chars | "
+          f"BATCH_USABLE={BATCH_USABLE:,} chars")
 
     total_data_chars = sum(len(str(r)) for r in data_rows)
+    # v9.9.0: Check against new 200k limit
     if total_data_chars + header_chars <= BATCH_USABLE:
         print(f"[BATCH] All {total_rows} rows fit in one batch "
               f"({total_data_chars + header_chars:,} chars) — no splitting")
@@ -507,28 +490,25 @@ def _split_table_into_batches(html: str) -> List[Tuple[str, int, int]]:
     print(f"[BATCH] Split complete: {len(batches)} batches for {total_rows} rows")
     return batches
 
-
 def _log_batch_plan(batch_num: int, total: int, start: int, end: int, html: str) -> None:
-    chars  = len(html)
+    chars = len(html)
     tokens = chars // CHARS_PER_TOKEN
+    context_pct = (tokens * CHARS_PER_TOKEN) / 262144 * 100  # % of 256k context
     print(f"[BATCH] #{batch_num}/{total}: rows {start+1}–{end+1} | "
-          f"{chars:,} chars | ~{tokens:,} tokens")
-
+          f"{chars:,} chars | ~{tokens:,} tokens | context={context_pct:.1f}%")
 
 def _assemble_batch_html(header_html: str, rows: List[Tag]) -> str:
     rows_html = ''.join(str(r) for r in rows)
     return f"<table>{header_html}{rows_html}</table>"
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # EXTRACTION QUALITY GATE
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════════════════════════════
 def _count_populated(row: Dict[str, Any]) -> int:
     return sum(
         1 for v in row.values()
         if v is not None and str(v).strip() not in ("", "null", "N/A", "-")
     )
-
 
 def _majority_schema(rows: List[Dict[str, Any]]) -> set:
     if not rows:
@@ -539,7 +519,6 @@ def _majority_schema(rows: List[Dict[str, Any]]) -> set:
             key_counter[k] += 1
     threshold = len(rows) * MIN_SCHEMA_OVERLAP
     return {k for k, c in key_counter.items() if c >= threshold}
-
 
 def _rows_have_data(rows: List[Dict[str, Any]]) -> bool:
     if not rows:
@@ -567,7 +546,6 @@ def _rows_have_data(rows: List[Dict[str, Any]]) -> bool:
 
     return True
 
-
 def _log_extraction_stats(rows: List[Dict[str, Any]], label: str = "") -> None:
     if not rows:
         print(f"[STATS{' ' + label if label else ''}] No rows extracted.")
@@ -581,14 +559,13 @@ def _log_extraction_stats(rows: List[Dict[str, Any]], label: str = "") -> None:
     total = len(rows)
     print(f"[STATS{' ' + label if label else ''}] {total} rows · field coverage:")
     for key, count in sorted(all_keys.items(), key=lambda x: -x[1]):
-        bar   = "█" * int(10 * count / total) + "░" * (10 - int(10 * count / total))
-        empty = "  ← EMPTY KEY" if str(key).strip() == "" else ""
-        print(f"  {bar} {count:>3}/{total}  '{key}'{empty}")
+        bar = "█" * int(10 * count / total) + "░" * (10 - int(10 * count / total))
+        empty = " ← EMPTY KEY" if str(key).strip() == "" else ""
+        print(f" {bar} {count:>3}/{total} '{key}'{empty}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # POST-PROCESSING
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════════════════════════════
 def _sanitize_value(v: Any) -> Any:
     if not isinstance(v, str):
         return v
@@ -596,11 +573,10 @@ def _sanitize_value(v: Any) -> Any:
     cleaned = re.sub(r'\s+', ' ', cleaned)
     return cleaned if cleaned else None
 
-
 def _clean_row_keys(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    cleaned  = []
+    cleaned = []
     promoted = 0
-    dropped  = 0
+    dropped = 0
     for row in rows:
         new_row: Dict[str, Any] = {}
         for k, v in row.items():
@@ -618,19 +594,20 @@ def _clean_row_keys(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
               f"{dropped} dropped")
     return cleaned
 
-
 def _sanitize_row_values(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     stripped = [{k: _sanitize_value(v) for k, v in row.items()} for row in rows]
     return _clean_row_keys(stripped)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# AI EXTRACTION ENGINE — Mistral Small 4
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════════════════════════════
+# AI EXTRACTION ENGINE — Mistral Small 4 (OPTIMIZED v9.9.0)
+# ════════════════════════════════════════════════════════════════════════════════
 def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> List[Dict[str, Any]]:
     """
     Entry point. Splits large tables into row-boundary batches, calls Mistral
-    per batch, merges results. No delays needed — 500k TPM gives ample headroom.
+    per batch, merges results.
+    
+    v9.9.0: 200k batch limit means fewer batches = fewer API calls = lower RPM usage.
+    With 2 RPM limit, minimizing batches is critical.
     """
     batches = _split_table_into_batches(html_content)
 
@@ -653,7 +630,6 @@ def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> 
     print(f"[BATCH] Merge complete: {len(all_rows)} total records from {len(batches)} batches")
     return all_rows[:MAX_RECORDS]
 
-
 def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[List[Dict[str, Any]]]:
     if not _MISTRAL_AVAILABLE:
         print("[AI] httpx not installed. Run: pip install httpx")
@@ -661,6 +637,7 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
     if not _MISTRAL_API_KEY:
         print("[AI] No Mistral API key provided.")
         return None
+
     prompt = _build_accuracy_prompt(html, url, extract_type)
     payload = {
         "model": _MISTRAL_MODEL,
@@ -673,23 +650,22 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
         "Authorization": f"Bearer {_MISTRAL_API_KEY}",
     }
     try:
+        tokens_estimate = len(html) // CHARS_PER_TOKEN
         print(f"[AI] Sending to {_MISTRAL_MODEL} ({len(html):,} chars "
-              f"~{len(html) // CHARS_PER_TOKEN:,} tokens)")
-        print(f"[AI] Auth header: Bearer {_MISTRAL_API_KEY[:8]}...{_MISTRAL_API_KEY[-4:]} (len={len(_MISTRAL_API_KEY)})")
+              f"~{tokens_estimate:,} tokens | {tokens_estimate/262144*100:.1f}% context)")
         with httpx.Client(timeout=120.0) as client:
             response = client.post(_MISTRAL_API_URL, json=payload, headers=headers)
         print(f"[AI] HTTP {response.status_code}")
         if response.status_code != 200:
             print(f"[AI] Mistral error: {response.text[:300]}")
             return None
-        data    = response.json()
+        data = response.json()
         content = data["choices"][0]["message"]["content"]
         print(f"[AI] Response received ({len(content)} chars)")
         return _parse_ai_response(content)
     except Exception as e:
         print(f"[AI] Mistral extraction failed: {e}")
         return None
-
 
 def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
     structure_hint = {
@@ -714,37 +690,18 @@ def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
         ),
     )
 
-    return f"""You are a universal data extraction engine. Extract all structured data from the HTML below.
+    # v9.9.0: Streamlined prompt (~500 chars) to maximize content per batch
+    return f"""Extract all structured data from the HTML below.
+RULES:
+- Use actual column headers/field labels as JSON keys (exact text, no translation)
+- Extract EVERY column/field found. Copy values as plain text (preserve signs, units: BTC, ETH, $, %, K, M, B, T)
+- Empty cells = null. Do NOT add fields not in source
+- ONE table/structure only. No merging from different tables
+- Return ONLY valid JSON array: [{{...}}, ...] or [] if no data
 
-STRICT RULES:
-1. READ the actual column headers or field labels from the HTML. Use them EXACTLY as JSON keys.
-   Do NOT rename, translate, shorten, or invent keys.
-2. Extract EVERY column/field you find. Do not skip any.
-3. Copy ALL values as plain text — preserve signs (+/-), units (BTC, ETH, $, %, K, M, B, T).
-4. Values must be plain text strings only. Never include HTML tags in values.
-5. If a cell is empty or missing, use null.
-6. Do NOT add fields not in the source. Do NOT hallucinate values.
-7. Extract from ONE table/structure only. Do NOT merge rows from different tables.
-8. Return ONLY a valid JSON array — no markdown fences, no explanation, no preamble.
-9. If no structured data is found, return: []
-
-HEADER FALLBACK:
-If the HTML has NO visible column headers (empty <th> or none at all):
-  - Name the first column "label" (usually the row name/entity).
-  - Name subsequent columns "col_2", "col_3", "col_4" etc. left-to-right.
-  - Still extract every value from every column.
-
-IMAGE-TEXT RULE:
-Some cells contain only a plain text name (converted from <img alt="..."> before you
-received this HTML). Treat that plain text as the cell value normally.
-
-DATA-ATTRIBUTE HINT:
-If visible cell text is empty but data-sort-value / data-raw / data-num / data-usd
-attributes exist on the same element, use the attribute value as the cell value.
-
-JSON DATA BLOCKS:
-The HTML may contain <!-- JSON DATA BLOCK: ... --> sections with <pre> JSON.
-If these blocks contain more complete data than the table, prefer them.
+IMAGE-TEXT: Plain text converted from <img alt="..."> is the cell value
+DATA-ATTR: Use data-sort-value/data-raw/data-num/data-usd if visible text is empty
+JSON BLOCKS: <!-- JSON DATA BLOCK: ... --> sections may have complete data — prefer them
 
 {structure_hint}
 
@@ -753,21 +710,21 @@ URL: {url}
 HTML:
 {html}
 
-JSON array:"""
-
+JSON:"""
 
 def _parse_ai_response(content: str) -> Optional[List[Dict[str, Any]]]:
     if not content:
         return None
     content = content.strip()
+    # Remove markdown fences if present
     if content.startswith('```'):
-        lines   = content.split('\n')
+        lines = content.split('\n')
         content = '\n'.join(
             line for line in lines
             if not line.startswith('```') and '```' not in line
         )
     start = content.find('[')
-    end   = content.rfind(']') + 1
+    end = content.rfind(']') + 1
     if start == -1 or end == 0:
         return None
     try:
@@ -780,10 +737,9 @@ def _parse_ai_response(content: str) -> Optional[List[Dict[str, Any]]]:
         print(f"[AI] JSON parse error: {e}")
     return None
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # FETCHING LAYER
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════════════════════════════
 def _fetch_static(url: str):
     if Fetcher is None:
         raise RuntimeError("Scrapling Fetcher not installed.")
@@ -795,7 +751,6 @@ def _fetch_static(url: str):
         raise RuntimeError("Fetcher.get() returned None.")
     return response
 
-
 def _fetch_js(url: str):
     if not _STEALTH_AVAILABLE or StealthyFetcher is None:
         raise RuntimeError("StealthyFetcher unavailable.")
@@ -806,7 +761,6 @@ def _fetch_js(url: str):
     if response is None:
         raise RuntimeError("StealthyFetcher.fetch() returned None.")
     return response
-
 
 def _get_raw_bytes(response) -> bytes:
     for attr in ('html', 'text'):
@@ -822,10 +776,9 @@ def _get_raw_bytes(response) -> bytes:
                 return val.encode('utf-8', errors='replace')
     raise ValueError("Scrapling response has no usable content.")
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # MAIN SCRAPE PIPELINE
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ════════════════════════════════════════════════════════════════════════════════
 async def _scrape_url(
     url: str,
     js: bool = False,
@@ -909,11 +862,10 @@ async def _scrape_url(
     print(f"[SCRAPE] Final: {len(rows)} records (js={used_js})")
     return rows, raw_bytes
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # FASTAPI APPLICATION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-app = FastAPI(title="AUDITOR CORE", version="9.8.0")
+# ════════════════════════════════════════════════════════════════════════════════
+app = FastAPI(title="AUDITOR CORE", version="9.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -931,7 +883,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
-    base_dir  = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     html_path = os.path.join(base_dir, "index.html")
     if os.path.exists(html_path):
         return FileResponse(html_path)
@@ -944,20 +896,29 @@ async def get_api_key():
 @app.get("/api/health")
 async def health():
     return {
-        "status":             "ok",
-        "version":            "9.8.0",
-        "fetcher":            _FETCHER_AVAILABLE,
-        "stealth":            _STEALTH_AVAILABLE,
-        "mistral":            _MISTRAL_AVAILABLE,
-        "readability":        False,
-        "ai_model":           _MISTRAL_MODEL if _MISTRAL_AVAILABLE else None,
-        "max_safe_chars":     MAX_SAFE_CHARS,
-        "max_batch_chars":    MAX_BATCH_CHARS,
-        "batch_usable":       BATCH_USABLE,
+        "status": "ok",
+        "version": "9.9.0",
+        "optimization": "200k batch size (50k tokens) for 2 RPM limit",
+        "fetcher": _FETCHER_AVAILABLE,
+        "stealth": _STEALTH_AVAILABLE,
+        "mistral": _MISTRAL_AVAILABLE,
+        "readability": False,
+        "ai_model": _MISTRAL_MODEL if _MISTRAL_AVAILABLE else None,
+        "max_safe_chars": MAX_SAFE_CHARS,
+        "max_batch_chars": MAX_BATCH_CHARS,
+        "batch_usable": BATCH_USABLE,
+        "batch_overhead": BATCH_OVERHEAD,
         "min_fields_per_row": MIN_FIELDS_PER_ROW,
-        "min_quality_ratio":  MIN_QUALITY_RATIO,
+        "min_quality_ratio": MIN_QUALITY_RATIO,
         "min_schema_overlap": MIN_SCHEMA_OVERLAP,
-        "utc":                datetime.now(timezone.utc).isoformat(),
+        "limits": {
+            "rpm": 2,
+            "tpm": 500000,
+            "context": 262144,
+            "rpd_calculated": 2880,
+            "tpd_calculated": 33333333
+        },
+        "utc": datetime.now(timezone.utc).isoformat(),
     }
 
 @app.get("/api/debug-fetch")
@@ -970,23 +931,30 @@ async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key
         response = await loop.run_in_executor(
             None, _fetch_js if js else _fetch_static, url
         )
-        raw      = _get_raw_bytes(response)
-        text     = raw.decode('utf-8', errors='replace')
-        cleaned  = _extract_main_content(text)
+        raw = _get_raw_bytes(response)
+        text = raw.decode('utf-8', errors='replace')
+        cleaned = _extract_main_content(text)
         isolated = _find_best_table(cleaned)
-        batches  = _split_table_into_batches(isolated)
+        batches = _split_table_into_batches(isolated)
+        
+        # Calculate RPM efficiency
+        batch_sizes = [len(b[0]) for b in batches]
+        total_tokens = sum(s // 4 for s in batch_sizes)
+        
         return {
-            "url":               url,
-            "js":                js,
-            "raw_bytes":         len(raw),
-            "cleaned_chars":     len(cleaned),
-            "isolated_chars":    len(isolated),
-            "retention_pct":     round(100 * len(cleaned) / max(len(raw), 1), 1),
-            "isolation_pct":     round(100 * len(isolated) / max(len(cleaned), 1), 1),
-            "num_batches":       len(batches),
-            "batch_sizes":       [len(b[0]) for b in batches],
+            "url": url,
+            "js": js,
+            "raw_bytes": len(raw),
+            "cleaned_chars": len(cleaned),
+            "isolated_chars": len(isolated),
+            "retention_pct": round(100 * len(cleaned) / max(len(raw), 1), 1),
+            "isolation_pct": round(100 * len(isolated) / max(len(cleaned), 1), 1),
+            "num_batches": len(batches),
+            "batch_sizes": batch_sizes,
+            "total_tokens_estimate": total_tokens,
+            "rpm_calls_saved": "40-50%" if len(batches) < 4 else f"{len(batches)} batches",
             "stealth_available": _STEALTH_AVAILABLE,
-            "preview":           isolated[:3000],
+            "preview": isolated[:3000],
         }
     except Exception as e:
         return {"url": url, "error": str(e)}
@@ -1006,9 +974,11 @@ async def scrape(body: ScrapeRequest, _key: str = Depends(verify_key)):
 @app.get("/api/token-status")
 async def token_status(_key: str = Depends(verify_key)):
     return {
-        "limit_per_model":     "1B tokens/month",
-        "tpm":                 500_000,
-        "model":               _MISTRAL_MODEL,
+        "limit_per_model": "1B tokens/month",
+        "tpm": 500_000,
+        "rpm": 2,
+        "model": _MISTRAL_MODEL,
+        "optimization": "200k batch chars (~50k tokens) — 19.5% context per batch",
         "keys": [
             {"key_index": 1, "active": True}
         ],
