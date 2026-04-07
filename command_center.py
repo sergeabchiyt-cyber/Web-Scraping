@@ -1,4 +1,4 @@
-."""
+"""
 AUDITOR CORE v9.8.0 - AI-Powered Universal Web Scraper (Dynamic Content Extraction)
 ────────────────────────────────────────────────────────────────────────────────────
 Changes v9.8.0:
