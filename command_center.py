@@ -103,7 +103,7 @@ BATCH_USABLE       = MAX_BATCH_CHARS - BATCH_OVERHEAD   # 116,000 usable
 CHARS_PER_TOKEN    = 4
 
 # ── Mistral config ────────────────────────────────────────────────────────────
-_MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
+_MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip().lstrip("=")
 if not _MISTRAL_API_KEY:
     print("[ERROR] MISTRAL_API_KEY not set — AI extraction will fail.")
 else:
