@@ -348,22 +348,57 @@ def _infer_column_names(soup: BeautifulSoup) -> None:
         if inferred:
             print(f"[INFER] {inferred} column name(s) inferred from data patterns")
 
+_DATA_CONTENT_THRESHOLD = 200  # chars — elements with more text content are kept even if noisy
+
+def _has_substantial_content(tag: Tag) -> bool:
+    """Check if an element contains enough real data to be worth keeping."""
+    # Contains tables or data structures → definitely keep
+    if tag.find(['table', 'dl', 'pre']):
+        return True
+    # Has many child elements with text → likely data
+    text_len = len(tag.get_text(separator=' ', strip=True))
+    if text_len > _DATA_CONTENT_THRESHOLD:
+        return True
+    return False
+
 def _clean_soup(soup: BeautifulSoup) -> Tuple[BeautifulSoup, str]:
     _replace_img_with_alt(soup)
     json_appendix = _extract_json_scripts(soup)
 
-    # Remove scripts and noise tags
+    # Remove scripts (always safe)
     for script in soup.find_all('script'):
         script.decompose()
+
+    # Smart noise tag removal — check content before decomposing
+    kept_noise = 0
+    removed_noise = 0
     for tag in soup(_NOISE_TAGS):
-        tag.decompose()
+        if _has_substantial_content(tag):
+            kept_noise += 1
+        else:
+            tag.decompose()
+            removed_noise += 1
+
+    # Smart class/id noise removal — check content before decomposing
+    kept_attr = 0
+    removed_attr = 0
     for tag in soup.find_all(True):
         if tag.parent is None:
             continue
         classes = ' '.join(tag.get('class', []))
         tag_id  = tag.get('id', '')
         if _NOISE_ATTR_RE.search(classes) or _NOISE_ATTR_RE.search(tag_id):
-            tag.decompose()
+            if _has_substantial_content(tag):
+                kept_attr += 1
+            else:
+                tag.decompose()
+                removed_attr += 1
+
+    if kept_noise or kept_attr:
+        print(f"[NOISE] Smart filter: kept {kept_noise + kept_attr} data-rich elements "
+              f"(noise_tags={kept_noise} attr_match={kept_attr}), "
+              f"removed {removed_noise + removed_attr}")
+
     for tag in soup.find_all(_INLINE_UNWRAP_TAGS):
         if tag.parent is None:
             continue
