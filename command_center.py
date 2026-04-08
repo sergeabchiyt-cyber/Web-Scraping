@@ -227,7 +227,7 @@ _NOISE_ATTR_RE = re.compile(
 
 # Attributes to PRESERVE (everything else gets stripped)
 _PRESERVE_ATTRS_RE = re.compile(
-    r'^(data-|aria-label|colspan|rowspan|scope|headers|title|alt)',
+    r'^(data-|aria-label|colspan|rowspan|scope|headers|title|alt|class)',
     re.IGNORECASE,
 )
 
@@ -433,12 +433,81 @@ def _score_table(table_tag: Tag) -> int:
     data_rows = sum(1 for r in rows if r.find('td'))
     return data_rows * max_cols
 
+def _get_structural_signature(tag: Tag) -> str:
+    """Get a structural fingerprint for an element (tag name + class list)."""
+    if not isinstance(tag, Tag):
+        return ""
+    classes = sorted(tag.get('class', []))
+    return f"{tag.name}:{'.'.join(classes)}" if classes else tag.name
+
+def _find_repeated_structures(soup: BeautifulSoup) -> Optional[str]:
+    """
+    Find data regions in div-based SPAs by detecting groups of sibling elements
+    with identical structural signatures. Repeated structure = data rows.
+    """
+    candidates: List[Tuple[int, float, str, list]] = []  # (count, density, sig, elements)
+
+    # Scan all container elements for children with repeated structure
+    for container in soup.find_all(['div', 'section', 'main', 'article', 'ul', 'ol']):
+        children = [c for c in container.children if isinstance(c, Tag)]
+        if len(children) < 3:  # need at least 3 siblings to be "repeated"
+            continue
+
+        # Count structural signatures among direct children
+        sig_groups: Dict[str, list] = {}
+        for child in children:
+            sig = _get_structural_signature(child)
+            if sig:
+                sig_groups.setdefault(sig, []).append(child)
+
+        for sig, elements in sig_groups.items():
+            count = len(elements)
+            if count < 3:
+                continue
+
+            # Calculate content density: text_chars / total_chars
+            total_text = sum(len(el.get_text(strip=True)) for el in elements)
+            total_html = sum(len(str(el)) for el in elements)
+            density = total_text / max(total_html, 1)
+
+            # Score: more repetitions + higher density = more likely data
+            if total_text < 50:  # skip near-empty groups
+                continue
+
+            candidates.append((count, density, sig, elements))
+
+    if not candidates:
+        return None
+
+    # Sort by count (more reps = more likely data), then density
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    best_count, best_density, best_sig, best_elements = candidates[0]
+    total_chars = sum(len(str(el)) for el in best_elements)
+
+    print(f"[DENSITY] Found {len(candidates)} repeated structures")
+    for count, density, sig, elements in candidates[:5]:
+        chars = sum(len(str(el)) for el in elements)
+        preview = elements[0].get_text(separator=' ', strip=True)[:60]
+        print(f"[DENSITY]   {count}× '{sig}' density={density:.2f} "
+              f"chars={chars:,} | {preview!r}")
+
+    print(f"[DENSITY] Selected: {best_count}× '{best_sig}' "
+          f"({total_chars:,} chars, density={best_density:.2f})")
+
+    return '\n'.join(str(el) for el in best_elements)
+
 def _find_best_table(html: str) -> str:
     soup = BeautifulSoup(html, 'html.parser')
     tables = soup.find_all('table')
 
     if not tables:
-        print("[TABLE] No <table> elements found — using full cleaned HTML")
+        # No HTML tables — try to find repeated div structures (SPA data grids)
+        print("[TABLE] No <table> elements found — scanning for repeated structures")
+        region = _find_repeated_structures(soup)
+        if region:
+            return region
+        print("[TABLE] No repeated structures found — using full cleaned HTML")
         return html
 
     scored = []
@@ -807,7 +876,8 @@ def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
         extract_type,
         (
             "Identify the single dominant repeated data structure "
-            "(table rows, list items, or cards). "
+            "(table rows, list items, cards, or repeated div elements). "
+            "Div-based grids: repeated sibling divs with the same class = data rows. "
             "Extract from that ONE structure only."
         ),
     )
