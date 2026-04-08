@@ -109,27 +109,46 @@ else:
 _MISTRAL_MODEL = "mistral-small-2603"
 _MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
-# ── Mistral Rate Limiter ───────────────────────────────────────────────────────
-# 2 RPM = 1 call per 30s minimum. Dynamic cooldown: if last call took 32s,
-# we only wait 30-32 = 0s. If it took 5s, we wait 25s.
-_MISTRAL_MIN_INTERVAL: float = 31.0   # 31s to give 1s safety margin over 30s
-_last_mistral_call_ts: float  = 0.0   # epoch timestamp of last Mistral POST
+# ── Mistral Rate Limiter (Sliding Window) ──────────────────────────────────────
+# 2 RPM = max 2 calls per rolling 60-second window.
+# Logic: track timestamps of recent calls. Before each call, purge timestamps
+# older than 60s. If 2 calls remain in the window, sleep until the oldest
+# one expires (falls outside the 60s window), then proceed.
+_RPM_LIMIT: int = 2
+_RPM_WINDOW: float = 60.0              # 60 seconds = 1 minute
+_RPM_SAFETY: float = 1.0               # 1s safety buffer
+_mistral_call_log: list = []            # list of epoch timestamps
 
 def _mistral_rate_gate() -> None:
-    """Block until it is safe to fire the next Mistral request."""
-    global _last_mistral_call_ts
-    now     = time.time()
-    elapsed = now - _last_mistral_call_ts          # seconds since last call
-    wait    = _MISTRAL_MIN_INTERVAL - elapsed
+    """Block until it is safe to fire the next Mistral request (2 RPM sliding window)."""
+    global _mistral_call_log
+    now = time.time()
 
-    if wait > 0:
-        print(f"[RATE] Cooldown {wait:.1f}s "
-              f"(last call {elapsed:.1f}s ago — 2 RPM cap)")
-        time.sleep(wait)
+    # Purge timestamps older than the window
+    _mistral_call_log = [ts for ts in _mistral_call_log if now - ts < _RPM_WINDOW]
+
+    calls_in_window = len(_mistral_call_log)
+    remaining_slots = _RPM_LIMIT - calls_in_window
+
+    if remaining_slots > 0:
+        # Safe to call — we have room in this minute
+        print(f"[RATE] {calls_in_window}/{_RPM_LIMIT} calls in last 60s — "
+              f"{remaining_slots} slot(s) free, proceeding immediately")
     else:
-        print(f"[RATE] No wait needed (last call {elapsed:.1f}s ago ≥ {_MISTRAL_MIN_INTERVAL}s)")
+        # Window is full — wait until the oldest call expires out of the window
+        oldest_ts = _mistral_call_log[0]
+        wait = (oldest_ts + _RPM_WINDOW + _RPM_SAFETY) - now
+        if wait > 0:
+            print(f"[RATE] {calls_in_window}/{_RPM_LIMIT} calls in last 60s — "
+                  f"window full, waiting {wait:.1f}s for next minute")
+            time.sleep(wait)
+        # After sleeping, purge again
+        now = time.time()
+        _mistral_call_log = [ts for ts in _mistral_call_log if now - ts < _RPM_WINDOW]
+        print(f"[RATE] Window cleared — now {len(_mistral_call_log)}/{_RPM_LIMIT}, proceeding")
 
-    _last_mistral_call_ts = time.time()   # stamp AFTER sleeping, before POST
+    # Stamp this call
+    _mistral_call_log.append(time.time())
 
 # ════════════════════════════════════════════════════════════════════════════════
 # API KEY AUTH
