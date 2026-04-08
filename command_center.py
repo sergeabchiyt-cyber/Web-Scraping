@@ -350,15 +350,26 @@ def _infer_column_names(soup: BeautifulSoup) -> None:
 
 _DATA_CONTENT_THRESHOLD = 200  # chars — elements with more text content are kept even if noisy
 
+def _calc_data_density(text: str) -> float:
+    """Calculate the proportion of text that consists of numbers or data symbols ($%+-.,)."""
+    if not text:
+        return 0.0
+    data_chars = sum(1 for c in text if c.isdigit() or c in '$%+-.,')
+    return data_chars / len(text)
+
 def _has_substantial_content(tag: Tag) -> bool:
     """Check if an element contains enough real data to be worth keeping."""
     # Contains tables or data structures → definitely keep
     if tag.find(['table', 'dl', 'pre']):
         return True
-    # Has many child elements with text → likely data
-    text_len = len(tag.get_text(separator=' ', strip=True))
-    if text_len > _DATA_CONTENT_THRESHOLD:
-        return True
+    
+    # Check text volume and data-likeness
+    text = tag.get_text(separator=' ', strip=True)
+    if len(text) > _DATA_CONTENT_THRESHOLD:
+        # Require at least 5% of text to be data-like (numbers, symbols)
+        # to distinguish data grids from heavy text nav menus/paragraphs
+        if _calc_data_density(text) > 0.05:
+            return True
     return False
 
 def _clean_soup(soup: BeautifulSoup) -> Tuple[BeautifulSoup, str]:
@@ -465,35 +476,46 @@ def _find_repeated_structures(soup: BeautifulSoup) -> Optional[str]:
             if count < 3:
                 continue
 
-            # Calculate content density: text_chars / total_chars
-            total_text = sum(len(el.get_text(strip=True)) for el in elements)
+            text_blocks = [el.get_text(separator=' ', strip=True) for el in elements]
+            full_text = ' '.join(text_blocks)
+            total_text = len(full_text)
+            
             total_html = sum(len(str(el)) for el in elements)
-            density = total_text / max(total_html, 1)
+            html_density = total_text / max(total_html, 1)
 
-            # Score: more repetitions + higher density = more likely data
-            if total_text < 50:  # skip near-empty groups
+            if total_text < 50:
                 continue
 
-            candidates.append((count, density, sig, elements))
+            # Calculate data-likeness to distinguish data from nav menus
+            data_density = _calc_data_density(full_text)
+            
+            # Require at least SOME numbers/symbols (filters out pure text navs)
+            if data_density < 0.05:
+                continue
+                
+            # Score favors elements with high repetition AND high data density
+            score = count * (data_density + 0.1) * html_density
+
+            candidates.append((score, count, data_density, sig, elements))
 
     if not candidates:
         return None
 
-    # Sort by count (more reps = more likely data), then density
-    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    # Sort by score desc
+    candidates.sort(key=lambda x: x[0], reverse=True)
 
-    best_count, best_density, best_sig, best_elements = candidates[0]
+    best_score, best_count, best_data_density, best_sig, best_elements = candidates[0]
     total_chars = sum(len(str(el)) for el in best_elements)
 
-    print(f"[DENSITY] Found {len(candidates)} repeated structures")
-    for count, density, sig, elements in candidates[:5]:
+    print(f"[DENSITY] Found {len(candidates)} valid data structures")
+    for score, count, data_density, sig, elements in candidates[:5]:
         chars = sum(len(str(el)) for el in elements)
         preview = elements[0].get_text(separator=' ', strip=True)[:60]
-        print(f"[DENSITY]   {count}× '{sig}' density={density:.2f} "
+        print(f"[DENSITY]   {count}× '{sig}' data_density={data_density:.2f} score={score:.2f} "
               f"chars={chars:,} | {preview!r}")
 
     print(f"[DENSITY] Selected: {best_count}× '{best_sig}' "
-          f"({total_chars:,} chars, density={best_density:.2f})")
+          f"({total_chars:,} chars, data_density={best_data_density:.2f}, score={best_score:.2f})")
 
     return '\n'.join(str(el) for el in best_elements)
 
