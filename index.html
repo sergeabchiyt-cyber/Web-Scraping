@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AUDITOR — Extraction Command</title>
+<title>AUDITOR — Extraction Command Center</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Barlow+Condensed:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -22,6 +22,7 @@
   --red:          #c04040;
   --orange:       #c87820;
   --blue:         #4878c0;
+  --purple:       #8858c0;
   --text:         #b87a38;
   --text-dim:     #5a4020;
   --text-muted:   #2e2418;
@@ -70,54 +71,78 @@ body::before{
 .pip.live{background:var(--green);box-shadow:0 0 7px var(--green);animation:blink 2.8s ease-in-out infinite}
 .pip.warn{background:var(--orange);box-shadow:0 0 7px var(--orange)}
 .pip.dead{background:var(--red);box-shadow:0 0 7px var(--red);animation:blink .7s ease-in-out infinite}
+.pip.ai{background:var(--purple);box-shadow:0 0 7px var(--purple);animation:blink 2s ease-in-out infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}
 .metrics{display:flex;border-left:1px solid var(--border)}
-.metric{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 16px;height:48px;min-width:70px;border-right:1px solid var(--border);gap:2px}
+.metric{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 14px;height:48px;min-width:64px;border-right:1px solid var(--border);gap:2px}
 .metric-k{font-family:var(--f-mono);font-size:8px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-muted)}
-.metric-v{font-family:var(--f-mono);font-size:13px;font-weight:700;color:var(--amber)}
+.metric-v{font-family:var(--f-mono);font-size:12px;font-weight:700;color:var(--amber)}
+.metric-v.small{font-size:9px}
 .tab-nav{display:flex;height:48px;border-left:1px solid var(--border)}
-.tab-btn{padding:0 18px;background:transparent;border:none;border-bottom:2px solid transparent;font-family:var(--f-ui);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);cursor:pointer;transition:color .15s,border-color .15s}
+.tab-btn{padding:0 16px;background:transparent;border:none;border-bottom:2px solid transparent;font-family:var(--f-ui);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);cursor:pointer;transition:color .15s,border-color .15s;white-space:nowrap}
 .tab-btn:hover{color:var(--text)}
 .tab-btn.active{color:var(--amber-bright);border-bottom-color:var(--amber)}
 
 /* ── SIDEBAR ── */
 .sidebar{grid-column:1;grid-row:2;background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;position:relative;z-index:50}
-.s-head{padding:12px 14px 9px;flex-shrink:0;font-family:var(--f-mono);font-size:9px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--amber-dim);border-bottom:1px solid var(--border)}
+.s-head{padding:10px 14px 8px;flex-shrink:0;font-family:var(--f-mono);font-size:9px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--amber-dim);border-bottom:1px solid var(--border)}
 .s-head::before{content:'// ';opacity:.55}
-.ctrl-body{padding:14px;display:flex;flex-direction:column;gap:14px;flex:1;min-height:0;overflow-y:auto}
+.ctrl-body{padding:12px 14px;display:flex;flex-direction:column;gap:12px;flex:1;min-height:0;overflow-y:auto}
 .field{display:flex;flex-direction:column;gap:5px}
 .field-lbl{font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
-.f-input{background:var(--input);border:1px solid var(--border);color:var(--amber);padding:8px 10px;font-family:var(--f-mono);font-size:11px;outline:none;width:100%;transition:border-color .15s,box-shadow .15s;caret-color:var(--amber-bright)}
+.f-input{background:var(--input);border:1px solid var(--border);color:var(--amber);padding:7px 10px;font-family:var(--f-mono);font-size:11px;outline:none;width:100%;transition:border-color .15s,box-shadow .15s;caret-color:var(--amber-bright)}
 .f-input:focus{border-color:var(--amber-dim);box-shadow:0 0 0 1px var(--amber-dim) inset,0 0 10px var(--amber-glow)}
 .f-input::placeholder{color:var(--text-muted)}
+.f-select{background:var(--input);border:1px solid var(--border);color:var(--amber);padding:7px 10px;font-family:var(--f-mono);font-size:11px;outline:none;width:100%;transition:border-color .15s;cursor:pointer;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236a4c18'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center}
+.f-select:focus{border-color:var(--amber-dim)}
+.f-select option{background:var(--panel);color:var(--amber)}
 .key-row{display:flex;align-items:center;gap:8px}
 .key-row .f-input{flex:1;min-width:0}
 .k-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;background:var(--text-muted);transition:background .3s,box-shadow .3s}
 .k-dot.ok{background:var(--green);box-shadow:0 0 7px var(--green)}
 .k-dot.err{background:var(--red);box-shadow:0 0 7px var(--red)}
 .ctrl-div{height:1px;background:var(--border)}
-.tog-row{display:flex;align-items:center;justify-content:space-between;padding:5px 0;cursor:pointer;user-select:none}
+.tog-row{display:flex;align-items:center;justify-content:space-between;padding:4px 0;cursor:pointer;user-select:none}
 .tog-lbl{font-size:12px;font-weight:600;letter-spacing:.03em;color:var(--text)}
 .tog-track{width:30px;height:16px;background:var(--input);border:1px solid var(--border);position:relative;transition:background .2s,border-color .2s;flex-shrink:0}
 .tog-track::after{content:'';position:absolute;top:2px;left:2px;width:10px;height:10px;background:var(--text-dim);transition:transform .2s,background .2s}
 .tog-row.on .tog-track{background:var(--amber-glow);border-color:var(--amber-dim)}
 .tog-row.on .tog-track::after{transform:translateX(14px);background:var(--amber)}
-.ctrl-foot{padding:14px;display:flex;flex-direction:column;gap:8px;border-top:1px solid var(--border);flex-shrink:0}
-.btn{padding:10px 14px;font-family:var(--f-ui);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;border:1px solid var(--border);background:var(--input);color:var(--text);cursor:pointer;transition:all .15s;text-align:center;position:relative;overflow:hidden}
+
+/* AI status card in sidebar */
+.ai-card{background:var(--surface);border:1px solid var(--border);padding:10px 12px;display:flex;flex-direction:column;gap:6px}
+.ai-card-row{display:flex;align-items:center;justify-content:space-between}
+.ai-card-lbl{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-muted)}
+.ai-card-val{font-family:var(--f-mono);font-size:10px;color:var(--amber)}
+.ai-card-val.ok{color:var(--green)}
+.ai-card-val.err{color:var(--red)}
+
+/* token bar */
+.tok-bar-wrap{margin-top:4px}
+.tok-bar-bg{height:3px;background:var(--border);width:100%}
+.tok-bar-fill{height:3px;background:var(--amber);transition:width .4s;max-width:100%}
+
+.ctrl-foot{padding:12px 14px;display:flex;flex-direction:column;gap:7px;border-top:1px solid var(--border);flex-shrink:0}
+.btn{padding:9px 14px;font-family:var(--f-ui);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;border:1px solid var(--border);background:var(--input);color:var(--text);cursor:pointer;transition:all .15s;text-align:center;position:relative;overflow:hidden}
 .btn-exec{background:rgba(200,144,58,.1);border-color:var(--amber-dim);color:var(--amber-bright)}
 .btn-exec:hover:not(:disabled){background:rgba(200,144,58,.18);border-color:var(--amber);box-shadow:0 0 14px var(--amber-glow),inset 0 0 14px var(--amber-glow)}
 .btn-exec:disabled{opacity:.4;cursor:not-allowed}
 .btn-exec.running{color:var(--amber-dim)}
 .btn-exec.running::after{content:'▮';position:absolute;right:12px;top:50%;transform:translateY(-50%);animation:cur .7s step-end infinite}
 @keyframes cur{0%,100%{opacity:1}50%{opacity:0}}
+.btn-sec{color:var(--blue);border-color:rgba(72,120,192,.2);background:rgba(72,120,192,.05)}
+.btn-sec:hover:not(:disabled){border-color:rgba(72,120,192,.5);background:rgba(72,120,192,.1)}
+.btn-sec:disabled{opacity:.25;cursor:not-allowed}
 .btn-exp{color:var(--text-dim)}
 .btn-exp:hover:not(:disabled){border-color:var(--text-dim);color:var(--text)}
 .btn-exp:disabled{opacity:.25;cursor:not-allowed}
+.btn-row{display:flex;gap:7px}
+.btn-row .btn{flex:1}
 
 /* ── MAIN PANEL ── */
 .main-panel{grid-column:2;grid-row:2;display:flex;flex-direction:column;overflow:hidden;position:relative;z-index:10;background:var(--void)}
-.m-toolbar{padding:9px 14px;border-bottom:1px solid var(--border);background:var(--panel);display:flex;align-items:center;gap:10px;flex-shrink:0}
-.search-wrap{flex:1;display:flex;align-items:center;gap:8px;background:var(--input);border:1px solid var(--border);padding:6px 10px;transition:border-color .15s}
+.m-toolbar{padding:8px 14px;border-bottom:1px solid var(--border);background:var(--panel);display:flex;align-items:center;gap:10px;flex-shrink:0}
+.search-wrap{flex:1;display:flex;align-items:center;gap:8px;background:var(--input);border:1px solid var(--border);padding:5px 10px;transition:border-color .15s}
 .search-wrap:focus-within{border-color:var(--amber-dim)}
 .search-ico{font-size:9px;color:var(--text-muted);flex-shrink:0;font-family:var(--f-mono)}
 .search-in{background:transparent;border:none;outline:none;color:var(--amber);font-family:var(--f-mono);font-size:11px;width:100%;caret-color:var(--amber-bright)}
@@ -129,7 +154,7 @@ body::before{
 @keyframes spin{to{transform:rotate(360deg)}}
 .dtable{width:100%;border-collapse:collapse;text-align:left}
 .dtable thead th{position:sticky;top:0;padding:8px 14px;background:var(--panel);border-bottom:1px solid var(--border);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);white-space:nowrap}
-.dtable tbody td{padding:9px 14px;border-bottom:1px solid var(--border);font-family:var(--f-mono);font-size:11px;white-space:nowrap;color:var(--text)}
+.dtable tbody td{padding:8px 14px;border-bottom:1px solid var(--border);font-family:var(--f-mono);font-size:11px;white-space:nowrap;color:var(--text)}
 .dtable tbody tr:hover td{background:rgba(200,144,58,.04)}
 .c-name{font-family:var(--f-ui)!important;font-size:13px!important;font-weight:700!important;color:var(--amber-bright)!important;white-space:normal!important;max-width:260px}
 .c-g{color:var(--green)!important;font-weight:700!important}
@@ -138,6 +163,22 @@ body::before{
 .badge{display:inline-block;padding:1px 6px;font-size:9px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
 .b-past{background:rgba(44,36,20,.6);color:var(--text-dim);border:1px solid var(--border)}
 .b-pend{background:rgba(78,184,106,.1);color:var(--green);border:1px solid rgba(78,184,106,.3)}
+
+/* ── DEBUG VIEW ── */
+.debug-grid{padding:16px;display:flex;flex-direction:column;gap:12px;height:100%;overflow-y:auto}
+.dbg-card{background:var(--panel);border:1px solid var(--border);padding:14px}
+.dbg-card-title{font-family:var(--f-mono);font-size:9px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--amber-dim);margin-bottom:12px}
+.dbg-card-title::before{content:'// '}
+.dbg-rows{display:flex;flex-direction:column;gap:6px}
+.dbg-row{display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--surface)}
+.dbg-row-lbl{font-size:11px;font-weight:600;letter-spacing:.04em;color:var(--text-dim)}
+.dbg-row-val{font-family:var(--f-mono);font-size:11px;color:var(--amber)}
+.dbg-row-val.ok{color:var(--green)}
+.dbg-row-val.warn{color:var(--orange)}
+.dbg-row-val.err{color:var(--red)}
+.dbg-batch-list{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.dbg-batch-pill{font-family:var(--f-mono);font-size:9px;padding:2px 7px;background:rgba(200,144,58,.08);border:1px solid var(--border-hot);color:var(--amber-dim)}
+.dbg-preview{background:var(--surface);border:1px solid var(--border);padding:12px;font-family:var(--f-mono);font-size:10px;color:var(--text-dim);white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto;line-height:1.6;margin-top:8px}
 
 /* ── LOG PANEL ── */
 .log-panel{grid-column:3;grid-row:2;background:var(--panel);border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;position:relative;z-index:50}
@@ -148,11 +189,15 @@ body::before{
 .l-e.success{color:var(--green)}
 .l-e.error{color:var(--red)}
 .l-e.warn{color:var(--orange)}
+.l-e.ai{color:var(--purple)}
+.log-foot{padding:8px 10px;border-top:1px solid var(--border);flex-shrink:0}
+.log-clear{width:100%;background:transparent;border:1px solid var(--border);color:var(--text-muted);font-family:var(--f-mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;padding:5px;cursor:pointer;transition:all .15s}
+.log-clear:hover{border-color:var(--amber-dim);color:var(--amber-dim)}
 
-/* ── API DOCS ── */
-#api-view{display:none;grid-column:2/4;grid-row:2;overflow:auto;padding:32px 40px;background:var(--void);position:relative;z-index:20}
-#api-view.vis{display:block}
-.d-sec{max-width:800px;margin-bottom:40px}
+/* ── FULL-SPAN VIEWS (API docs, token status) ── */
+.full-view{display:none;grid-column:2/4;grid-row:2;overflow:auto;padding:32px 40px;background:var(--void);position:relative;z-index:20}
+.full-view.vis{display:block}
+.d-sec{max-width:820px;margin-bottom:40px}
 .d-ttl{font-family:var(--f-mono);font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--amber);margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border)}
 .d-ttl::before{content:'// ';opacity:.5}
 .d-txt{color:var(--text-dim);line-height:1.75;margin-bottom:12px;font-size:13px}
@@ -170,6 +215,15 @@ body::before{
 .ptbl th{color:var(--text-dim);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase}
 .ptbl td:first-child{font-family:var(--f-mono);font-size:11px;color:var(--amber)}
 .p-req{color:var(--red);font-size:9px;font-weight:700;margin-left:5px}
+
+/* token status grid */
+.tok-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px}
+.tok-card{background:var(--panel);border:1px solid var(--border);padding:16px}
+.tok-card-k{font-family:var(--f-mono);font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px}
+.tok-card-v{font-family:var(--f-mono);font-size:18px;font-weight:700;color:var(--amber-bright)}
+.tok-card-v.ok{color:var(--green)}
+.tok-bar2{height:4px;background:var(--border);margin-top:10px;width:100%}
+.tok-bar2-fill{height:4px;background:linear-gradient(90deg,var(--amber-dim),var(--amber-bright));transition:width .4s}
 </style>
 </head>
 <body>
@@ -177,20 +231,24 @@ body::before{
 <!-- TOP BAR -->
 <header class="topbar">
   <span class="brand">AUDITOR</span>
-  <span class="ver">v7.5.0</span>
+  <span class="ver">v9.8.0</span>
   <div class="tsep"></div>
   <div class="sys-strip">
     <div class="pip-grp"><div class="pip" id="conn-pip"></div><span id="conn-lbl">STANDBY</span></div>
     <div class="pip-grp"><div class="pip" id="js-pip"></div><span id="js-lbl">JS OFF</span></div>
+    <div class="pip-grp"><div class="pip" id="ai-pip"></div><span id="ai-lbl">AI —</span></div>
   </div>
   <div class="metrics">
-    <div class="metric"><span class="metric-k">Vol</span><span class="metric-v" id="stat-vol">0</span></div>
-    <div class="metric"><span class="metric-k">Pending</span><span class="metric-v" id="stat-pend">0</span></div>
+    <div class="metric"><span class="metric-k">Records</span><span class="metric-v" id="stat-vol">0</span></div>
+    <div class="metric"><span class="metric-k">Batches</span><span class="metric-v" id="stat-batch">—</span></div>
     <div class="metric"><span class="metric-k">Latency</span><span class="metric-v" id="stat-lat">—</span></div>
+    <div class="metric"><span class="metric-k">Raw KB</span><span class="metric-v" id="stat-kb">—</span></div>
   </div>
   <nav class="tab-nav">
-    <button class="tab-btn active" data-tab="data" onclick="switchTab('data')">Data Output</button>
-    <button class="tab-btn"        data-tab="api"  onclick="switchTab('api')">API Reference</button>
+    <button class="tab-btn active" data-tab="data"   onclick="switchTab('data')">Data</button>
+    <button class="tab-btn"        data-tab="debug"  onclick="switchTab('debug')">Debug</button>
+    <button class="tab-btn"        data-tab="tokens" onclick="switchTab('tokens')">Tokens</button>
+    <button class="tab-btn"        data-tab="api"    onclick="switchTab('api')">API Ref</button>
   </nav>
 </header>
 
@@ -213,25 +271,52 @@ body::before{
         <div class="k-dot" id="k-dot"></div>
       </div>
     </div>
+    <div class="field">
+      <label class="field-lbl">Extract Type</label>
+      <select class="f-select" id="extract-type">
+        <option value="auto">Auto (detect)</option>
+        <option value="table">Table</option>
+        <option value="list">List</option>
+        <option value="card">Card</option>
+      </select>
+    </div>
     <div class="ctrl-div"></div>
     <div class="tog-row" id="js-tog" onclick="toggleJS()">
       <span class="tog-lbl">JS Execution Context</span>
       <div class="tog-track"></div>
     </div>
+    <div class="ctrl-div"></div>
+    <div class="ai-card" id="ai-card">
+      <div class="ai-card-row">
+        <span class="ai-card-lbl">Model</span>
+        <span class="ai-card-val" id="ai-model-val">—</span>
+      </div>
+      <div class="ai-card-row">
+        <span class="ai-card-lbl">Mistral</span>
+        <span class="ai-card-val" id="ai-status-val">—</span>
+      </div>
+      <div class="ai-card-row">
+        <span class="ai-card-lbl">TPM</span>
+        <span class="ai-card-val" id="ai-tpm-val">—</span>
+      </div>
+    </div>
   </div>
   <div class="ctrl-foot">
     <button class="btn btn-exec" id="run-btn" onclick="runExtraction()">Execute Extraction</button>
-    <button class="btn btn-exp"  id="dl-btn"  disabled onclick="exportPayload()">Export Payload (JSON)</button>
+    <div class="btn-row">
+      <button class="btn btn-sec" id="debug-btn" onclick="runDebug()">Debug Fetch</button>
+      <button class="btn btn-exp" id="dl-btn" disabled onclick="exportPayload()">Export JSON</button>
+    </div>
   </div>
 </aside>
 
-<!-- MAIN PANEL -->
+<!-- MAIN PANEL (data view) -->
 <main class="main-panel" id="main-panel">
   <div class="m-toolbar">
     <div class="search-wrap">
       <span class="search-ico">▸</span>
       <input class="search-in" id="search-in" type="text"
-             placeholder="Filter by indicator, country, value…"
+             placeholder="Filter by any field…"
              oninput="applyFilter()">
     </div>
     <span class="row-count" id="row-count">—</span>
@@ -247,372 +332,510 @@ body::before{
   <div class="log-body" id="log-body">
     <div class="l-e"><span class="ts">--:--:--</span>System initialized.</div>
   </div>
+  <div class="log-foot">
+    <button class="log-clear" onclick="clearLog()">Clear Log</button>
+  </div>
 </aside>
 
-<!-- API DOCS -->
-<div id="api-view"></div>
+<!-- DEBUG VIEW -->
+<div class="full-view" id="debug-view">
+  <div class="d-sec" style="max-width:700px">
+    <div class="d-ttl">Debug Fetch — Pipeline Inspector</div>
+    <div class="d-txt">Runs the full fetch + preprocessing pipeline <em>without</em> AI extraction.
+      Shows raw bytes, noise reduction, table isolation, and batch plan.
+      Enter a URL and click <code>Debug Fetch</code> in the sidebar.</div>
+    <div id="debug-output">
+      <div class="debug-grid" style="padding:0">
+        <div style="color:var(--text-muted);font-family:var(--f-mono);font-size:11px">No debug run yet — trigger from sidebar.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- TOKEN STATUS VIEW -->
+<div class="full-view" id="tokens-view">
+  <div class="d-sec">
+    <div class="d-ttl">Token Usage & Rate Limits</div>
+    <div id="tok-output" style="color:var(--text-muted);font-family:var(--f-mono);font-size:11px">Loading token status…</div>
+  </div>
+</div>
+
+<!-- API DOCS VIEW -->
+<div class="full-view" id="api-view"></div>
 
 <script>
-/* ── CONFIG ──────────────────────────────────────────────────────────────────
-   FIX: original code had `? BASE_URL` — self-reference → ReferenceError on localhost.
-──────────────────────────────────────────────────────────────────────────── */
-const BASE_URL = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
-  ? 'http://localhost:8000'
-  : location.origin;
+/* ── CONFIG ─────────────────────────────────────────────────────────────── */
+const BASE_URL = (location.hostname==='localhost'||location.hostname==='127.0.0.1')
+  ? 'http://localhost:8000' : location.origin;
 
-const state = { events: [], view: 'data', jsOn: false };
+const state = { events:[], view:'data', jsOn:false };
 const $   = id => document.getElementById(id);
-const esc = s  => String(s ?? '').replace(/[&<>"']/g, c =>
-  ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+const esc = s  => String(s??'').replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-/* ── LOG ─────────────────────────────────────────────────────────────────── */
-function log(msg, type = '') {
-  const body = $('log-body');
-  const d = document.createElement('div');
-  d.className = 'l-e' + (type ? ' ' + type : '');
-  d.innerHTML = `<span class="ts">${new Date().toISOString().slice(11,19)}</span>${esc(msg)}`;
+/* ── LOG ──────────────────────────────────────────────────────────────── */
+function log(msg, type='') {
+  const body=$('log-body');
+  const d=document.createElement('div');
+  d.className='l-e'+(type?' '+type:'');
+  d.innerHTML=`<span class="ts">${new Date().toISOString().slice(11,19)}</span>${esc(msg)}`;
   body.prepend(d);
-  while (body.children.length > 200) body.removeChild(body.lastChild);
+  while(body.children.length>300) body.removeChild(body.lastChild);
+}
+function clearLog(){
+  $('log-body').innerHTML='<div class="l-e"><span class="ts">--:--:--</span>Log cleared.</div>';
 }
 
-/* ── CONNECTION STATUS ───────────────────────────────────────────────────── */
+/* ── CONNECTION / HEALTH ─────────────────────────────────────────────── */
 function setConn(s) {
-  $('conn-pip').className = 'pip' + (s ? ' '+s : '');
-  $('conn-lbl').textContent = ({live:'ONLINE',warn:'DEGRADED',dead:'OFFLINE'}[s]??'STANDBY');
+  $('conn-pip').className='pip'+(s?' '+s:'');
+  $('conn-lbl').textContent=({live:'ONLINE',warn:'DEGRADED',dead:'OFFLINE'}[s]??'STANDBY');
 }
 
-/* ── API KEY ─────────────────────────────────────────────────────────────── */
-function getKey() { return $('api-key').value.trim(); }
-function setKeyDot(ok) { $('k-dot').className = 'k-dot '+(ok?'ok':'err'); }
-
-async function loadKey() {
+async function loadHealth() {
   try {
-    const r = await fetch(BASE_URL + '/api/key', { signal: AbortSignal.timeout(5000) });
-    if (r.ok) {
-      const d = await r.json();
-      if (d.api_key) {
-        $('api-key').value = d.api_key;
-        setKeyDot(true); setConn('live');
-        log('Server online — API key loaded.', 'success');
-      } else {
-        setKeyDot(false); setConn('warn');
-        log('Server up but returned empty key.', 'warn');
-      }
-    } else {
-      setKeyDot(false); setConn('warn');
-      log(`/api/key → HTTP ${r.status}. Enter key manually.`, 'warn');
-    }
-  } catch {
+    const r=await fetch(BASE_URL+'/api/health',{signal:AbortSignal.timeout(5000)});
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d=await r.json();
+    setConn('live');
+    // AI status
+    const aiOk=d.mistral===true;
+    $('ai-pip').className='pip'+(aiOk?' ai':'');
+    $('ai-lbl').textContent=aiOk?'AI LIVE':'AI OFF';
+    $('ai-model-val').textContent=d.ai_model||'—';
+    $('ai-model-val').className='ai-card-val small';
+    $('ai-status-val').textContent=aiOk?'READY':'OFFLINE';
+    $('ai-status-val').className='ai-card-val '+(aiOk?'ok':'err');
+    log(`Server v${d.version} online | Mistral=${d.mistral}`, 'success');
+  } catch(e) {
     setConn('dead');
-    log('Server unreachable — enter API key manually.', 'error');
+    $('ai-pip').className='pip dead';
+    $('ai-lbl').textContent='AI ERR';
+    log(`Server unreachable: ${e.message}`, 'error');
   }
 }
 
-$('api-key').addEventListener('input', () => setKeyDot($('api-key').value.trim().length > 0));
-
-/* ── JS TOGGLE ───────────────────────────────────────────────────────────── */
-function toggleJS() {
-  state.jsOn = !state.jsOn;
-  $('js-tog').classList.toggle('on', state.jsOn);
-  $('js-pip').className   = 'pip'+(state.jsOn?' live':'');
-  $('js-lbl').textContent = state.jsOn ? 'JS ON' : 'JS OFF';
-  log(`JS context ${state.jsOn ? 'ENABLED' : 'DISABLED'}`, state.jsOn ? 'info' : '');
+async function loadKey() {
+  try {
+    const r=await fetch(BASE_URL+'/api/key',{signal:AbortSignal.timeout(5000)});
+    if(r.ok){
+      const d=await r.json();
+      if(d.api_key){$('api-key').value=d.api_key;setKeyDot(true);log('API key loaded.','success');}
+      else{setKeyDot(false);log('Empty key returned.','warn');}
+    } else {setKeyDot(false);log(`/api/key → ${r.status}. Enter manually.`,'warn');}
+  } catch {log('Could not auto-load API key.','warn');}
 }
 
-/* ── TAB SWITCH ──────────────────────────────────────────────────────────── */
+/* ── API KEY ─────────────────────────────────────────────────────────── */
+function getKey(){return $('api-key').value.trim();}
+function setKeyDot(ok){$('k-dot').className='k-dot '+(ok?'ok':'err');}
+$('api-key').addEventListener('input',()=>setKeyDot($('api-key').value.trim().length>0));
+
+/* ── JS TOGGLE ───────────────────────────────────────────────────────── */
+function toggleJS(){
+  state.jsOn=!state.jsOn;
+  $('js-tog').classList.toggle('on',state.jsOn);
+  $('js-pip').className='pip'+(state.jsOn?' live':'');
+  $('js-lbl').textContent=state.jsOn?'JS ON':'JS OFF';
+  log(`JS context ${state.jsOn?'ENABLED':'DISABLED'}`,state.jsOn?'info':'');
+}
+
+/* ── TAB SWITCH ──────────────────────────────────────────────────────── */
 function switchTab(tab) {
-  state.view = tab;
-  document.querySelectorAll('.tab-btn').forEach(b =>
-    b.classList.toggle('active', b.dataset.tab === tab));
-  const isApi = tab === 'api';
-  $('main-panel').style.display = isApi ? 'none' : 'flex';
-  $('log-panel').style.display  = isApi ? 'none' : 'flex';
-  $('api-view').classList.toggle('vis', isApi);
-  if (isApi) renderApiDocs();
+  state.view=tab;
+  document.querySelectorAll('.tab-btn').forEach(b=>
+    b.classList.toggle('active',b.dataset.tab===tab));
+  $('main-panel').style.display     = tab==='data'   ? 'flex'  : 'none';
+  $('log-panel').style.display      = (tab==='data'||tab==='debug') ? 'flex' : 'none';
+  $('debug-view').classList.toggle('vis',  tab==='debug');
+  $('tokens-view').classList.toggle('vis', tab==='tokens');
+  $('api-view').classList.toggle('vis',    tab==='api');
+  if(tab==='tokens') loadTokenStatus();
+  if(tab==='api')    renderApiDocs();
 }
 
-/* ── TABLE RENDER ────────────────────────────────────────────────────────── */
-/* ── NAME COLUMN DETECTION ───────────────────────────────────────────────────
-   Universal: works on any extracted dataset without hardcoding site names.
-   Pass 1 — exact known-key match.
-   Pass 2 — score every column by "name-likeness":
-            high uniqueness × longer average text × high non-numeric fraction.
-   This correctly identifies "Release", "Currency", "Exchange", or any unnamed
-   event column on any site whose header doesn't match known keys.
-──────────────────────────────────────────────────────────────────────────── */
+/* ── NAME COLUMN DETECTION ───────────────────────────────────────────── */
 const KNOWN_NAME_KEYS = new Set([
   'indicator','title','name','event','headline','product','label',
   'description','event_name','currency','release','report','item',
-  'category','market','instrument','asset','exchange'
+  'category','market','instrument','asset','exchange','symbol','pair',
+  'coin','company','ticker','token'
 ]);
 
 function _detectNameCol(events) {
-  if (!events.length) return null;
-  const allKeys = [...new Set(events.flatMap(e => Object.keys(e)))];
-  // Pass 1: exact known key
-  for (const k of allKeys)
-    if (KNOWN_NAME_KEYS.has(k)) return k;
-  // Pass 2: score columns
-  let best = null, bestScore = 0;
-  for (const k of allKeys) {
-    const vals    = events.map(e => String(e[k] ?? '')).filter(v => v.trim());
-    if (!vals.length) continue;
-    const unique  = new Set(vals).size / vals.length;
-    const avgLen  = vals.reduce((s,v) => s + v.length, 0) / vals.length;
-    const txtFrac = vals.filter(v => isNaN(Number(v)) && v.length > 1).length / vals.length;
-    const score   = unique * Math.min(avgLen, 40) * txtFrac;
-    if (score > bestScore) { bestScore = score; best = k; }
+  if(!events.length) return null;
+  const allKeys=[...new Set(events.flatMap(e=>Object.keys(e)))];
+  for(const k of allKeys) if(KNOWN_NAME_KEYS.has(k.toLowerCase())) return k;
+  let best=null,bestScore=0;
+  for(const k of allKeys){
+    const vals=events.map(e=>String(e[k]??'')).filter(v=>v.trim());
+    if(!vals.length) continue;
+    const unique=new Set(vals).size/vals.length;
+    const avgLen=vals.reduce((s,v)=>s+v.length,0)/vals.length;
+    const txtFrac=vals.filter(v=>isNaN(Number(v))&&v.length>1).length/vals.length;
+    const score=unique*Math.min(avgLen,40)*txtFrac;
+    if(score>bestScore){bestScore=score;best=k;}
   }
   return best;
 }
 
-function getName(ev, nameCol) {
-  if (nameCol && ev[nameCol] != null && ev[nameCol] !== '') return String(ev[nameCol]);
-  for (const f of KNOWN_NAME_KEYS) if (ev[f]) return String(ev[f]);
+function getName(ev,nameCol){
+  if(nameCol&&ev[nameCol]!=null&&ev[nameCol]!=='') return String(ev[nameCol]);
+  for(const f of KNOWN_NAME_KEYS) if(ev[f]) return String(ev[f]);
   return '—';
 }
 
+/* ── TABLE RENDER ────────────────────────────────────────────────────── */
 function renderTable(events) {
-  const area = $('data-area');
-  $('row-count').textContent = events.length
-    ? `${events.length} ROW${events.length!==1?'S':''}`
-    : '—';
-
-  if (!events.length) {
-    area.innerHTML = `<div class="state-c"><div>No data matches filter.</div></div>`;
+  const area=$('data-area');
+  $('row-count').textContent=events.length
+    ? `${events.length} ROW${events.length!==1?'S':''}`:'—';
+  if(!events.length){
+    area.innerHTML=`<div class="state-c"><div>No data matches filter.</div></div>`;
     return;
   }
+  const nameCol=_detectNameCol(events);
+  const nameKeys=new Set([...KNOWN_NAME_KEYS,...(nameCol?[nameCol.toLowerCase()]:[]),(nameCol||'')]);
+  const fixedCols=['time','event_time','event_datetime_utc','country','date','event_date','period','actual','value','forecast','consensus','previous','is_past'];
+  const fixedSet=new Set(fixedCols);
+  const extra=new Set();
+  for(const ev of events) for(const k of Object.keys(ev))
+    if(!nameKeys.has(k.toLowerCase())) extra.add(k);
+  const used=fixedCols.filter(c=>events.some(e=>e[c]!=null&&e[c]!==''));
+  const other=[...extra].filter(c=>!fixedSet.has(c)&&events.some(e=>e[c]!=null&&e[c]!=='')).slice(0,6);
+  const cols=[...used,...other];
+  const lbl=c=>c.replace(/_/g,' ').replace(/\b\w/g,x=>x.toUpperCase());
 
-  const nameCol  = _detectNameCol(events);
-  const nameKeys = new Set([...KNOWN_NAME_KEYS, ...(nameCol ? [nameCol] : [])]);
-
-  // Fixed columns shown in priority order
-  const fixedCols = [
-    'time','event_time','event_datetime_utc',
-    'country',
-    'date','event_date','period',
-    'actual','value',
-    'forecast','consensus','previous',
-    'is_past'
-  ];
-  const fixedSet = new Set(fixedCols);
-
-  const extra = new Set();
-  for (const ev of events)
-    for (const k of Object.keys(ev))
-      if (!nameKeys.has(k)) extra.add(k);
-
-  const used  = fixedCols.filter(c => events.some(e => e[c] != null && e[c] !== ''));
-  const other = [...extra]
-    .filter(c => !fixedSet.has(c) && events.some(e => e[c] != null && e[c] !== ''))
-    .slice(0, 5);
-  const cols = [...used, ...other];
-  const lbl  = c => c.replace(/_/g,' ').replace(/\b\w/g, x => x.toUpperCase());
-
-  function fmtCell(ev, c) {
-    const v = ev[c];
-    if (c === 'is_past') return v === true
+  function fmtCell(ev,c){
+    const v=ev[c];
+    if(c==='is_past') return v===true
       ? `<span class="badge b-past">Past</span>`
       : `<span class="badge b-pend">Pending</span>`;
-    if (v == null || v === '') return `<span class="c-m">—</span>`;
-    const s = esc(String(v));
-    if (c==='actual'||c==='value')       return `<span class="c-g">${s}</span>`;
-    if (c==='forecast'||c==='consensus') return `<span class="c-o">${s}</span>`;
+    if(v==null||v==='') return `<span class="c-m">—</span>`;
+    const s=esc(String(v));
+    if(c==='actual'||c==='value')        return `<span class="c-g">${s}</span>`;
+    if(c==='forecast'||c==='consensus')  return `<span class="c-o">${s}</span>`;
     return s;
   }
-
-  const nameHeader = nameCol ? lbl(nameCol) : 'Indicator / Name';
-
-  area.innerHTML = `
+  const nameHeader=nameCol?lbl(nameCol):'Indicator / Name';
+  area.innerHTML=`
     <table class="dtable">
       <thead><tr>
         <th>${nameHeader}</th>
         ${cols.map(c=>`<th>${lbl(c)}</th>`).join('')}
       </tr></thead>
       <tbody>${events.map(ev=>`<tr>
-        <td class="c-name">${esc(getName(ev, nameCol))}</td>
+        <td class="c-name">${esc(getName(ev,nameCol))}</td>
         ${cols.map(c=>`<td>${fmtCell(ev,c)}</td>`).join('')}
       </tr>`).join('')}</tbody>
     </table>`;
 }
 
-/* ── FILTER ──────────────────────────────────────────────────────────────── */
-function applyFilter() {
-  const q = ($('search-in').value||'').toLowerCase();
-  renderTable(state.events.filter(ev =>
-    !q || Object.values(ev).join(' ').toLowerCase().includes(q)));
+/* ── FILTER ──────────────────────────────────────────────────────────── */
+function applyFilter(){
+  const q=($('search-in').value||'').toLowerCase();
+  renderTable(state.events.filter(ev=>
+    !q||Object.values(ev).join(' ').toLowerCase().includes(q)));
 }
 
-/* ── EXECUTE EXTRACTION ──────────────────────────────────────────────────── */
-async function runExtraction() {
-  const url = ($('url-input').value||'').trim();
-  const key = getKey();
+/* ── EXECUTE EXTRACTION ──────────────────────────────────────────────── */
+async function runExtraction(){
+  const url=($('url-input').value||'').trim();
+  const key=getKey();
+  const extractType=$('extract-type').value;
+  if(!url){log('Target URI required.','error');return;}
+  if(!key){log('API key required.','error');return;}
 
-  if (!url) { log('Target URI is required.', 'error'); return; }
-  if (!key) { log('API key required — enter manually or check server.', 'error'); return; }
+  const btn=$('run-btn');
+  btn.disabled=true;btn.classList.add('running');btn.textContent='Extracting';
+  $('dl-btn').disabled=true;
+  state.events=[];
+  $('stat-vol').textContent='0';
+  $('stat-batch').textContent='—';
+  $('stat-lat').textContent='—';
+  $('stat-kb').textContent='—';
+  $('row-count').textContent='—';
 
-  const btn = $('run-btn');
-  btn.disabled = true; btn.classList.add('running'); btn.textContent = 'Extracting';
-  $('dl-btn').disabled = true;
-  state.events = [];
-  ['stat-vol','stat-pend'].forEach(id => $(id).textContent = '0');
-  $('stat-lat').textContent = '—';
-  $('row-count').textContent = '—';
+  if(state.view!=='data') switchTab('data');
 
-  $('data-area').innerHTML = `
+  $('data-area').innerHTML=`
     <div class="state-c">
       <div class="spinner"></div>
       <div>Targeting ${esc(url)}</div>
     </div>`;
 
-  log(`Initiating request to ${url}…`, 'info');
-  log(`JS context: ${state.jsOn ? 'ON' : 'OFF'}`);
-  const t0 = performance.now();
+  log(`Initiating → ${url}`,'info');
+  log(`Mode: js=${state.jsOn} type=${extractType}`);
+  const t0=performance.now();
 
   try {
-    const res = await fetch(BASE_URL + '/api/scrape', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Api-Key': key },
-      body:    JSON.stringify({ url, js: state.jsOn, adaptive: true }),
+    const res=await fetch(BASE_URL+'/api/scrape',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Api-Key':key},
+      body:JSON.stringify({url,js:state.jsOn,adaptive:true,extract_type:extractType}),
     });
-
-    const clientLat = ((performance.now()-t0)/1000).toFixed(2) + 's';
-
-    if (!res.ok) {
-      // Parse error detail from FastAPI response body — covers 401, 403, 404, 422, 500 etc.
-      let detail = `HTTP ${res.status}`;
-      try {
-        const j = await res.json();
-        detail = j.detail || j.error || detail;
-      } catch {}
-      throw new Error(`${detail}`);
+    const clientLat=((performance.now()-t0)/1000).toFixed(2)+'s';
+    if(!res.ok){
+      let detail=`HTTP ${res.status}`;
+      try{const j=await res.json();detail=j.detail||j.error||detail;}catch{}
+      throw new Error(detail);
     }
+    const data=await res.json();
+    let items=[];
+    if(Array.isArray(data))         items=data;
+    else if(Array.isArray(data.events)) items=data.events;
+    else if(Array.isArray(data.items))  items=data.items;
+    else if(Array.isArray(data.data))   items=data.data;
+    else if(typeof data==='object')     items=[data];
 
-    const data = await res.json();
+    const lat=data.elapsed!=null?`${data.elapsed}s`:clientLat;
+    $('stat-lat').textContent=lat;
+    $('stat-vol').textContent=items.length;
+    if(data.raw_bytes!=null) $('stat-kb').textContent=(data.raw_bytes/1024).toFixed(1);
 
-    // Normalise shape: v7.5.0 → { events:[…], raw_bytes:N, elapsed:N }
-    let items = [];
-    if      (Array.isArray(data))         items = data;
-    else if (Array.isArray(data.events))  items = data.events;
-    else if (Array.isArray(data.items))   items = data.items;
-    else if (Array.isArray(data.data))    items = data.data;
-    else if (typeof data === 'object')    items = [data];
+    state.events=items;
 
-    const lat = data.elapsed != null ? `${data.elapsed}s` : clientLat;
-    $('stat-lat').textContent = lat;
-
-    state.events = items;
-    const pending = items.filter(e => e.is_past === false).length;
-    $('stat-vol').textContent  = items.length;
-    $('stat-pend').textContent = pending;
-
-    if (data.raw_bytes != null)
-      log(`Raw payload: ${(data.raw_bytes/1024).toFixed(1)} KB`);
-
-    if (!items.length) {
-      log('Extraction succeeded — no structured records found.', 'warn');
-      $('data-area').innerHTML = `<div class="state-c"><div>Target returned no extractable records.</div></div>`;
+    if(!items.length){
+      log('Extraction complete — no structured records.','warn');
+      $('data-area').innerHTML=`<div class="state-c"><div>Target returned no extractable records.</div></div>`;
     } else {
-      log(`Complete — ${items.length} records in ${lat}.`, 'success');
-      $('dl-btn').disabled = false;
+      log(`Complete — ${items.length} records in ${lat}.`,'success');
+      $('dl-btn').disabled=false;
       applyFilter();
     }
-
-  } catch (err) {
-    const lat = ((performance.now()-t0)/1000).toFixed(2)+'s';
-    $('stat-lat').textContent = lat;
-    log(`ERROR: ${err.message}`, 'error');
-    $('data-area').innerHTML = `
-      <div class="state-c" style="color:var(--red);text-align:center;padding:0 24px">
-        ${esc(err.message)}
-      </div>`;
+  } catch(err){
+    log(`ERROR: ${err.message}`,'error');
+    $('data-area').innerHTML=`
+      <div class="state-c" style="color:var(--red);text-align:center;padding:0 24px">${esc(err.message)}</div>`;
   } finally {
-    btn.disabled = false; btn.classList.remove('running'); btn.textContent = 'Execute Extraction';
+    btn.disabled=false;btn.classList.remove('running');btn.textContent='Execute Extraction';
   }
 }
 
-/* ── EXPORT ──────────────────────────────────────────────────────────────── */
-function exportPayload() {
-  if (!state.events.length) return;
-  const a = document.createElement('a');
-  a.href  = URL.createObjectURL(
-    new Blob([JSON.stringify(state.events,null,2)], {type:'application/json'}));
-  a.download = `auditor_${Date.now()}.json`;
-  a.click();
-  URL.revokeObjectURL(a.href);
-  log(`Exported ${state.events.length} records.`, 'success');
+/* ── DEBUG FETCH ─────────────────────────────────────────────────────── */
+async function runDebug(){
+  const url=($('url-input').value||'').trim();
+  const key=getKey();
+  if(!url){log('Target URI required for debug.','error');return;}
+  if(!key){log('API key required for debug.','error');return;}
+
+  switchTab('debug');
+  $('debug-output').innerHTML=`
+    <div style="display:flex;align-items:center;gap:12px;color:var(--text-muted);font-family:var(--f-mono);font-size:11px">
+      <div class="spinner"></div><div>Running debug fetch…</div>
+    </div>`;
+
+  log(`Debug fetch → ${url}`,'info');
+  try {
+    const r=await fetch(`${BASE_URL}/api/debug-fetch?url=${encodeURIComponent(url)}&js=${state.jsOn}`,{
+      headers:{'X-Api-Key':key},signal:AbortSignal.timeout(60000),
+    });
+    if(!r.ok){
+      let detail=`HTTP ${r.status}`;
+      try{const j=await r.json();detail=j.detail||detail;}catch{}
+      throw new Error(detail);
+    }
+    const d=await r.json();
+    if(d.error) throw new Error(d.error);
+
+    $('stat-kb').textContent=(d.raw_bytes/1024).toFixed(1);
+    $('stat-batch').textContent=d.num_batches??'—';
+    log(`Debug complete: ${d.num_batches} batch(es), ${d.raw_bytes} bytes`,'success');
+
+    const retPct=d.retention_pct;
+    const isoPct=d.isolation_pct;
+
+    $('debug-output').innerHTML=`
+      <div class="debug-grid" style="padding:0">
+        <div class="dbg-card">
+          <div class="dbg-card-title">Pipeline Sizes</div>
+          <div class="dbg-rows">
+            <div class="dbg-row"><span class="dbg-row-lbl">Raw bytes</span><span class="dbg-row-val">${(d.raw_bytes/1024).toFixed(1)} KB</span></div>
+            <div class="dbg-row"><span class="dbg-row-lbl">After noise removal</span><span class="dbg-row-val ${retPct>20?'ok':'warn'}">${(d.cleaned_chars/1024).toFixed(1)} KB (${retPct}%)</span></div>
+            <div class="dbg-row"><span class="dbg-row-lbl">After table isolation</span><span class="dbg-row-val ok">${(d.isolated_chars/1024).toFixed(1)} KB (${isoPct}%)</span></div>
+            <div class="dbg-row"><span class="dbg-row-lbl">JS renderer</span><span class="dbg-row-val ${d.stealth_available?'ok':'err'}">${d.stealth_available?'AVAILABLE':'UNAVAILABLE'}</span></div>
+          </div>
+        </div>
+        <div class="dbg-card">
+          <div class="dbg-card-title">Batch Plan</div>
+          <div class="dbg-rows">
+            <div class="dbg-row"><span class="dbg-row-lbl">Total batches</span><span class="dbg-row-val">${d.num_batches}</span></div>
+            <div class="dbg-row"><span class="dbg-row-lbl">Largest batch</span><span class="dbg-row-val">${d.batch_sizes?.length?Math.max(...d.batch_sizes).toLocaleString()+' chars':'—'}</span></div>
+            <div class="dbg-row"><span class="dbg-row-lbl">Smallest batch</span><span class="dbg-row-val">${d.batch_sizes?.length?Math.min(...d.batch_sizes).toLocaleString()+' chars':'—'}</span></div>
+          </div>
+          ${d.batch_sizes?.length?`
+          <div class="dbg-batch-list">
+            ${d.batch_sizes.map((s,i)=>`<span class="dbg-batch-pill">#${i+1} ${(s/1024).toFixed(1)}k</span>`).join('')}
+          </div>`:''}
+        </div>
+        <div class="dbg-card">
+          <div class="dbg-card-title">Isolated HTML Preview</div>
+          <div class="dbg-preview">${esc(d.preview||'(empty)')}</div>
+        </div>
+      </div>`;
+  } catch(e){
+    log(`Debug failed: ${e.message}`,'error');
+    $('debug-output').innerHTML=`<div style="color:var(--red);font-family:var(--f-mono);font-size:11px">${esc(e.message)}</div>`;
+  }
 }
 
-/* ── API DOCS ────────────────────────────────────────────────────────────── */
-function renderApiDocs() {
-  const k = getKey()||'<API_KEY>';
-  const b = BASE_URL;
-  $('api-view').innerHTML = `
+/* ── TOKEN STATUS ────────────────────────────────────────────────────── */
+async function loadTokenStatus(){
+  const key=getKey();
+  $('tok-output').innerHTML=`<div style="display:flex;gap:10px;align-items:center"><div class="spinner"></div><div>Loading token status…</div></div>`;
+  try {
+    const r=await fetch(BASE_URL+'/api/token-status',{
+      headers:{'X-Api-Key':key},signal:AbortSignal.timeout(8000),
+    });
+    if(!r.ok){
+      let detail=`HTTP ${r.status}`;
+      try{const j=await r.json();detail=j.detail||detail;}catch{}
+      throw new Error(detail);
+    }
+    const d=await r.json();
+    const tpm=d.tpm||500000;
+    const usedPct=0; // API doesn't track live usage — placeholder
+    $('ai-tpm-val').textContent=(tpm/1000)+'k';
+
+    $('tok-output').innerHTML=`
+      <div class="tok-grid">
+        <div class="tok-card">
+          <div class="tok-card-k">Model</div>
+          <div class="tok-card-v" style="font-size:13px">${esc(d.model||'—')}</div>
+        </div>
+        <div class="tok-card">
+          <div class="tok-card-k">TPM Limit</div>
+          <div class="tok-card-v">${tpm.toLocaleString()}</div>
+        </div>
+        <div class="tok-card">
+          <div class="tok-card-k">Monthly Allocation</div>
+          <div class="tok-card-v ok" style="font-size:14px">${esc(d.limit_per_model||'—')}</div>
+        </div>
+        <div class="tok-card">
+          <div class="tok-card-k">Active Keys</div>
+          <div class="tok-card-v ok">${d.keys?.filter(k=>k.active).length??1}</div>
+        </div>
+      </div>
+      <div style="margin-bottom:16px">
+        <div style="font-family:var(--f-mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-muted);margin-bottom:8px">Keys</div>
+        ${(d.keys||[]).map(k=>`
+          <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--panel);border:1px solid var(--border);margin-bottom:6px">
+            <div class="pip ${k.active?'live':'dead'}"></div>
+            <span style="font-family:var(--f-mono);font-size:11px;color:var(--text)">Key #${k.key_index}</span>
+            <span style="font-family:var(--f-mono);font-size:9px;color:var(--text-muted);margin-left:auto">${k.active?'ACTIVE':'INACTIVE'}</span>
+          </div>`).join('')}
+      </div>`;
+  } catch(e){
+    $('tok-output').innerHTML=`<div style="color:var(--red);font-family:var(--f-mono);font-size:11px">Failed to load: ${esc(e.message)}</div>`;
+  }
+}
+
+/* ── EXPORT ──────────────────────────────────────────────────────────── */
+function exportPayload(){
+  if(!state.events.length) return;
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(
+    new Blob([JSON.stringify(state.events,null,2)],{type:'application/json'}));
+  a.download=`auditor_${Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  log(`Exported ${state.events.length} records.`,'success');
+}
+
+/* ── API DOCS ────────────────────────────────────────────────────────── */
+function renderApiDocs(){
+  const k=getKey()||'<API_KEY>';
+  const b=BASE_URL;
+  $('api-view').innerHTML=`
     <div class="d-sec">
       <div class="d-ttl">Authentication</div>
       <div class="d-txt">Pass the API key via <code>X-Api-Key</code> on every protected request.
-        Set <code>AUDITOR_API_KEY</code> env var — if unset a random key is generated at boot and
-        printed to stdout. <code>GET /api/key</code> returns the active key for auto-population.</div>
-      <div class="cblk">
-        <button class="cpb" onclick="cpBlock('dk',this)">Copy</button>
-        <pre id="dk">X-Api-Key: ${esc(getKey()||'<API_KEY>')}</pre>
-      </div>
+        Set <code>AUDITOR_API_KEY</code> env var — if unset a random key is generated at boot.
+        <code>GET /api/key</code> returns the active key.</div>
+      <div class="cblk"><button class="cpb" onclick="cpBlock('dk',this)">Copy</button>
+        <pre id="dk">X-Api-Key: ${esc(k)}</pre></div>
     </div>
+
     <div class="d-sec">
       <div class="d-ttl">POST /api/scrape</div>
-      <div class="d-txt">Scrapes <code>url</code> with Scrapling and extracts all HTML tables
-        via BeautifulSoup. Schema is inferred from table headers — no mapping required.</div>
+      <div class="d-txt">Scrapes <code>url</code>, preprocesses HTML, isolates the dominant table,
+        batches it, and sends each batch to Mistral for AI extraction. Returns merged JSON records.</div>
       <div class="m-row"><span class="mb mb-post">POST</span><code>/api/scrape</code></div>
       <table class="ptbl">
-        <thead><tr><th>Parameter</th><th>Type</th><th>Description</th></tr></thead>
+        <thead><tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td>url <span class="p-req">REQ</span></td><td>string</td><td>Target URI.</td></tr>
-          <tr><td>adaptive</td><td>boolean</td><td>Scrapling adaptive match — default <code>true</code>.</td></tr>
-          <tr><td>js</td><td>boolean</td><td>StealthyFetcher / Playwright for JS-rendered pages — default <code>false</code>.</td></tr>
+          <tr><td>url<span class="p-req">REQ</span></td><td>string</td><td>—</td><td>Target URI to scrape.</td></tr>
+          <tr><td>js</td><td>boolean</td><td>false</td><td>Use StealthyFetcher / Playwright for JS-rendered pages.</td></tr>
+          <tr><td>adaptive</td><td>boolean</td><td>true</td><td>Scrapling adaptive match.</td></tr>
+          <tr><td>extract_type</td><td>string</td><td>"auto"</td><td>Hint to AI: <code>auto</code> | <code>table</code> | <code>list</code> | <code>card</code>.</td></tr>
         </tbody>
       </table>
       <div class="d-txt">Response: <code>{"events":[{…}], "raw_bytes": N, "elapsed": N}</code></div>
-      <div class="cblk">
-        <button class="cpb" onclick="cpBlock('dc1',this)">Copy</button>
-        <pre id="dc1">curl -X POST ${b}/api/scrape \
-  -H "X-Api-Key: ${esc(k)}" \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://tradingeconomics.com/calendar","js":false}'</pre>
-      </div>
-      <div class="cblk">
-        <button class="cpb" onclick="cpBlock('dc2',this)">Copy</button>
-        <pre id="dc2">curl -X POST ${b}/api/scrape \
-  -H "X-Api-Key: ${esc(k)}" \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://www.coinglass.com/open-interest/BTC","js":true}'</pre>
-      </div>
+      <div class="cblk"><button class="cpb" onclick="cpBlock('dc1',this)">Copy</button>
+        <pre id="dc1">curl -X POST ${b}/api/scrape \\
+  -H "X-Api-Key: ${esc(k)}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"url":"https://tradingeconomics.com/calendar","js":false,"extract_type":"auto"}'</pre></div>
     </div>
+
+    <div class="d-sec">
+      <div class="d-ttl">GET /api/debug-fetch</div>
+      <div class="d-txt">Runs the full pipeline <em>without</em> AI. Returns sizes at each stage
+        (raw → noise-removed → table-isolated), batch plan, and an HTML preview.
+        Useful for diagnosing poor extraction quality.</div>
+      <div class="m-row"><span class="mb mb-get">GET</span><code>/api/debug-fetch?url=…&amp;js=false</code></div>
+      <div class="cblk"><button class="cpb" onclick="cpBlock('ddbg',this)">Copy</button>
+        <pre id="ddbg">curl "${b}/api/debug-fetch?url=https://coinglass.com/open-interest/BTC&js=true" \\
+  -H "X-Api-Key: ${esc(k)}"</pre></div>
+      <div class="d-txt">Returns: <code>raw_bytes</code>, <code>cleaned_chars</code>, <code>isolated_chars</code>,
+        <code>retention_pct</code>, <code>isolation_pct</code>, <code>num_batches</code>,
+        <code>batch_sizes[]</code>, <code>stealth_available</code>, <code>preview</code>.</div>
+    </div>
+
+    <div class="d-sec">
+      <div class="d-ttl">GET /api/token-status</div>
+      <div class="d-txt">Returns Mistral token quota info: model name, TPM limit, monthly allocation, and key list.</div>
+      <div class="m-row"><span class="mb mb-get">GET</span><code>/api/token-status</code></div>
+      <div class="cblk"><button class="cpb" onclick="cpBlock('dtok',this)">Copy</button>
+        <pre id="dtok">curl ${b}/api/token-status \\
+  -H "X-Api-Key: ${esc(k)}"</pre></div>
+    </div>
+
     <div class="d-sec">
       <div class="d-ttl">GET /api/health</div>
-      <div class="d-txt">No auth required. Returns version, Scrapling availability, and UTC timestamp.</div>
+      <div class="d-txt">No auth required. Returns version, feature flags, model name, batch config, and UTC timestamp.</div>
       <div class="m-row"><span class="mb mb-get">GET</span><code>/api/health</code></div>
-      <div class="cblk">
-        <button class="cpb" onclick="cpBlock('dhc',this)">Copy</button>
-        <pre id="dhc">curl ${b}/api/health</pre>
-      </div>
+      <div class="cblk"><button class="cpb" onclick="cpBlock('dhc',this)">Copy</button>
+        <pre id="dhc">curl ${b}/api/health</pre></div>
     </div>
+
     <div class="d-sec">
-      <div class="d-ttl">JS Rendering Setup</div>
-      <div class="d-txt">StealthyFetcher requires Playwright. Run once on the host:</div>
-      <div class="cblk">
-        <button class="cpb" onclick="cpBlock('dsetup',this)">Copy</button>
-        <pre id="dsetup">pip install scrapling[all] --break-system-packages
-scrapling install</pre>
-      </div>
-      <div class="d-txt">Compatibility: <code>tradingeconomics.com</code> (js:false) ·
-        <code>investing.com</code> (js:true) · <code>coinglass.com</code> (js:true) ·
-        <code>MarketWatch</code> ✗ Cloudflare blocked</div>
+      <div class="d-ttl">GET /api/key</div>
+      <div class="d-txt">Returns the active <code>AUDITOR_API_KEY</code> — used by this UI to auto-populate the key field on load.</div>
+      <div class="m-row"><span class="mb mb-get">GET</span><code>/api/key</code></div>
+      <div class="cblk"><button class="cpb" onclick="cpBlock('dkey',this)">Copy</button>
+        <pre id="dkey">curl ${b}/api/key</pre></div>
     </div>
+
+    <div class="d-sec">
+      <div class="d-ttl">AI Backend — Mistral Small 4</div>
+      <div class="d-txt">Extraction uses <code>mistral-small-2603</code> via direct HTTP to
+        <code>api.mistral.ai</code> (no SDK). Auth via <code>Authorization: Bearer …</code>.
+        500k TPM free tier — no batch delays needed at typical usage levels.
+        Set <code>MISTRAL_API_KEY</code> env var on Railway.</div>
+      <div class="cblk"><button class="cpb" onclick="cpBlock('dcurl',this)">Copy</button>
+        <pre id="dcurl">curl https://api.mistral.ai/v1/chat/completions \\
+  -H "Authorization: Bearer $MISTRAL_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"mistral-small-2603","messages":[{"role":"user","content":"test"}]}'</pre></div>
+    </div>
+
     <div class="d-sec">
       <div class="d-ttl">Security Model</div>
-      <div class="d-txt">SSRF protection blocks private / loopback addresses:
+      <div class="d-txt">SSRF protection blocks private / loopback IPs:
         <code>10.x</code>, <code>172.16–31.x</code>, <code>192.168.x</code>,
-        <code>127.x</code>, <code>169.254.x</code>. Max payload: <code>10 MB</code>.
+        <code>127.x</code>, <code>169.254.x</code>.
+        Max payload: <code>10 MB</code>.
         Extraction runs in <code>ProcessPoolExecutor</code> (max 4 workers).</div>
     </div>`;
 }
@@ -625,7 +848,8 @@ function cpBlock(id,btn){
   });
 }
 
-/* ── INIT ────────────────────────────────────────────────────────────────── */
+/* ── INIT ────────────────────────────────────────────────────────────── */
+loadHealth();
 loadKey();
 </script>
 </body>
