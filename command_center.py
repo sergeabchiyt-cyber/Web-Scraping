@@ -225,9 +225,9 @@ _NOISE_ATTR_RE = re.compile(
     re.IGNORECASE,
 )
 
-_STRIP_ATTRS_RE = re.compile(
-    r'^(class|id|style|on\w+|tabindex|role|href|src|srcset|loading|'
-    r'crossorigin|integrity|referrerpolicy|fetchpriority|type|target|rel)$',
+# Attributes to PRESERVE (everything else gets stripped)
+_PRESERVE_ATTRS_RE = re.compile(
+    r'^(data-|aria-label|colspan|rowspan|scope|headers|title|alt)',
     re.IGNORECASE,
 )
 
@@ -374,7 +374,7 @@ def _clean_soup(soup: BeautifulSoup) -> Tuple[BeautifulSoup, str]:
     for tag in soup.find_all(True):
         tag.attrs = {
             k: v for k, v in tag.attrs.items()
-            if not _STRIP_ATTRS_RE.match(k)
+            if _PRESERVE_ATTRS_RE.match(k)
         }
 
     return soup, json_appendix
@@ -420,9 +420,23 @@ def _find_best_table(html: str) -> str:
         return html
 
     scored.sort(key=lambda x: -x[0])
-    best_score, best_idx, best_table = scored[0]
-    print(f"[TABLE] Selected #{best_idx+1} (score={best_score})")
-    return str(best_table)
+    best_score = scored[0][0]
+
+    if best_score == 0:
+        return html
+
+    # Combine all tables scoring ≥30% of best (captures related tables on same page)
+    threshold = best_score * 0.3
+    selected = [(s, i, t) for s, i, t in scored if s >= threshold]
+    selected.sort(key=lambda x: x[1])  # restore original page order
+
+    if len(selected) == 1:
+        print(f"[TABLE] Selected #{selected[0][1]+1} (score={best_score})")
+        return str(selected[0][2])
+
+    names = [f"#{x[1]+1}(s={x[0]})" for x in selected]
+    print(f"[TABLE] Combining {len(selected)} tables: {', '.join(names)} (threshold={threshold:.0f})")
+    return '\n'.join(str(t) for _, _, t in selected)
 
 def _preprocess_html(html_bytes: bytes) -> str:
     try:
@@ -439,6 +453,13 @@ def _preprocess_html(html_bytes: bytes) -> str:
     isolated     = _find_best_table(cleaned)
     isolated_len = len(isolated)
     print(f"[PREPROCESS] {cleaned_len:,} → {isolated_len:,} chars after table isolation")
+
+    # Smart fallback: if isolation was too aggressive relative to input size,
+    # use the full cleaned HTML instead
+    if isolated_len < 500 and original_len > 50_000:
+        print(f"[PREPROCESS] Isolation too aggressive ({isolated_len} chars from "
+              f"{original_len:,}) — falling back to full cleaned HTML ({cleaned_len:,} chars)")
+        return cleaned[:MAX_SAFE_CHARS]
 
     return isolated
 
@@ -978,9 +999,9 @@ async def health():
         "min_quality_ratio": MIN_QUALITY_RATIO,
         "min_schema_overlap": MIN_SCHEMA_OVERLAP,
         "rate_limiter": {
-            "min_interval_s": _MISTRAL_MIN_INTERVAL,
-            "rpm_limit": 2,
-            "strategy": "dynamic pre-call gate",
+            "window_s": _RPM_WINDOW,
+            "rpm_limit": _RPM_LIMIT,
+            "strategy": "sliding window",
         },
         "limits": {
             "rpm": 2,
