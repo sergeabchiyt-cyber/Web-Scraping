@@ -1,15 +1,16 @@
 """
-AUDITOR CORE v9.9.0 - Optimized for 2 RPM Limit
+AUDITOR CORE v9.9.1 - Dynamic Rate Limiter for 2 RPM Limit
 ────────────────────────────────────────────────────────────────────────────────────
-Changes v9.9.0:
-• OPTIMIZED batch sizing for 2 RPM constraint
-- MAX_BATCH_CHARS: 120,000 → 200,000 chars (~50k tokens)
-- BATCH_OVERHEAD: 4,000 → 3,000 chars (optimized prompt)
-- BATCH_USABLE: 116,000 → 197,000 chars
-- Context utilization: ~50k/256k = 19.5% per batch
-• RESULT: 40-50% fewer batches for typical tables = fewer API calls = lower RPM usage
+Changes v9.9.1:
+• ADDED dynamic rate limiter gate for Mistral 2 RPM constraint
+  - _MISTRAL_MIN_INTERVAL: 31s (1s safety margin over 30s)
+  - _mistral_rate_gate(): dynamic cooldown based on elapsed time since last call
+  - Stamps _last_mistral_call_ts AFTER sleeping, BEFORE POST
+  - 429 fallback: respects Retry-After header, then aborts batch
+  - Enhanced logging: token usage, timing, HTTP status
 
-Previous fixes (all retained):
+Previous changes (all retained):
+v9.9.0 — 200k batch sizing for 2 RPM, context utilization optimization.
 v9.8.0 — Mistral Small 4 (mistral-small-2603), 500k TPM, 256k context.
 v9.7.1 — P1 batch delay, P2 retry on 429, P4 semantic column name inference.
 v9.7.0 — dynamic row-boundary batching, batch logging.
@@ -107,6 +108,28 @@ else:
 
 _MISTRAL_MODEL = "mistral-small-2603"
 _MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
+
+# ── Mistral Rate Limiter ───────────────────────────────────────────────────────
+# 2 RPM = 1 call per 30s minimum. Dynamic cooldown: if last call took 32s,
+# we only wait 30-32 = 0s. If it took 5s, we wait 25s.
+_MISTRAL_MIN_INTERVAL: float = 31.0   # 31s to give 1s safety margin over 30s
+_last_mistral_call_ts: float  = 0.0   # epoch timestamp of last Mistral POST
+
+def _mistral_rate_gate() -> None:
+    """Block until it is safe to fire the next Mistral request."""
+    global _last_mistral_call_ts
+    now     = time.time()
+    elapsed = now - _last_mistral_call_ts          # seconds since last call
+    wait    = _MISTRAL_MIN_INTERVAL - elapsed
+
+    if wait > 0:
+        print(f"[RATE] Cooldown {wait:.1f}s "
+              f"(last call {elapsed:.1f}s ago — 2 RPM cap)")
+        time.sleep(wait)
+    else:
+        print(f"[RATE] No wait needed (last call {elapsed:.1f}s ago ≥ {_MISTRAL_MIN_INTERVAL}s)")
+
+    _last_mistral_call_ts = time.time()   # stamp AFTER sleeping, before POST
 
 # ════════════════════════════════════════════════════════════════════════════════
 # API KEY AUTH
@@ -599,7 +622,7 @@ def _sanitize_row_values(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return _clean_row_keys(stripped)
 
 # ════════════════════════════════════════════════════════════════════════════════
-# AI EXTRACTION ENGINE — Mistral Small 4 (OPTIMIZED v9.9.0)
+# AI EXTRACTION ENGINE — Mistral Small 4 (OPTIMIZED v9.9.1 + Rate Limiter)
 # ════════════════════════════════════════════════════════════════════════════════
 def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> List[Dict[str, Any]]:
     """
@@ -607,6 +630,7 @@ def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> 
     per batch, merges results.
     
     v9.9.0: 200k batch limit means fewer batches = fewer API calls = lower RPM usage.
+    v9.9.1: Dynamic rate limiter gate ensures ≤2 RPM across all batches.
     With 2 RPM limit, minimizing batches is critical.
     """
     batches = _split_table_into_batches(html_content)
@@ -632,37 +656,60 @@ def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> 
 
 def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[List[Dict[str, Any]]]:
     if not _MISTRAL_AVAILABLE:
-        print("[AI] httpx not installed. Run: pip install httpx")
+        print("[AI] httpx not installed.")
         return None
     if not _MISTRAL_API_KEY:
-        print("[AI] No Mistral API key provided.")
+        print("[AI] No Mistral API key.")
         return None
 
-    prompt = _build_accuracy_prompt(html, url, extract_type)
+    _mistral_rate_gate()          # ← dynamic cooldown gate
+
+    prompt  = _build_accuracy_prompt(html, url, extract_type)
     payload = {
-        "model": _MISTRAL_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "model":       _MISTRAL_MODEL,
+        "messages":    [{"role": "user", "content": prompt}],
         "temperature": 0.0,
     }
     headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
         "Authorization": f"Bearer {_MISTRAL_API_KEY}",
     }
     try:
-        tokens_estimate = len(html) // CHARS_PER_TOKEN
-        print(f"[AI] Sending to {_MISTRAL_MODEL} ({len(html):,} chars "
-              f"~{tokens_estimate:,} tokens | {tokens_estimate/262144*100:.1f}% context)")
+        t_start          = time.time()
+        tokens_estimate  = len(html) // CHARS_PER_TOKEN
+        print(f"[AI] Sending → {_MISTRAL_MODEL} "
+              f"({len(html):,} chars ~{tokens_estimate:,} tokens "
+              f"| {tokens_estimate / 262144 * 100:.1f}% context)")
+
         with httpx.Client(timeout=120.0) as client:
             response = client.post(_MISTRAL_API_URL, json=payload, headers=headers)
-        print(f"[AI] HTTP {response.status_code}")
+
+        elapsed_ai = time.time() - t_start
+        print(f"[AI] HTTP {response.status_code} in {elapsed_ai:.1f}s")
+
+        if response.status_code == 429:
+            # Shouldn't happen with gate, but handle gracefully
+            retry_after = int(response.headers.get("Retry-After", 60))
+            print(f"[AI] 429 received — sleeping {retry_after}s then aborting batch")
+            time.sleep(retry_after)
+            return None
+
         if response.status_code != 200:
             print(f"[AI] Mistral error: {response.text[:300]}")
             return None
-        data = response.json()
+
+        data    = response.json()
+        usage   = data.get("usage", {})
+        in_tok  = usage.get("prompt_tokens", "?")
+        out_tok = usage.get("completion_tokens", "?")
+        tot_tok = usage.get("total_tokens", "?")
+        print(f"[AI] Tokens: in={in_tok} out={out_tok} total={tot_tok}")
+
         content = data["choices"][0]["message"]["content"]
         print(f"[AI] Response received ({len(content)} chars)")
         return _parse_ai_response(content)
+
     except Exception as e:
         print(f"[AI] Mistral extraction failed: {e}")
         return None
@@ -865,7 +912,7 @@ async def _scrape_url(
 # ════════════════════════════════════════════════════════════════════════════════
 # FASTAPI APPLICATION
 # ════════════════════════════════════════════════════════════════════════════════
-app = FastAPI(title="AUDITOR CORE", version="9.9.0")
+app = FastAPI(title="AUDITOR CORE", version="9.9.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -897,8 +944,8 @@ async def get_api_key():
 async def health():
     return {
         "status": "ok",
-        "version": "9.9.0",
-        "optimization": "200k batch size (50k tokens) for 2 RPM limit",
+        "version": "9.9.1",
+        "optimization": "200k batch + dynamic 2 RPM rate limiter",
         "fetcher": _FETCHER_AVAILABLE,
         "stealth": _STEALTH_AVAILABLE,
         "mistral": _MISTRAL_AVAILABLE,
@@ -911,6 +958,11 @@ async def health():
         "min_fields_per_row": MIN_FIELDS_PER_ROW,
         "min_quality_ratio": MIN_QUALITY_RATIO,
         "min_schema_overlap": MIN_SCHEMA_OVERLAP,
+        "rate_limiter": {
+            "min_interval_s": _MISTRAL_MIN_INTERVAL,
+            "rpm_limit": 2,
+            "strategy": "dynamic pre-call gate",
+        },
         "limits": {
             "rpm": 2,
             "tpm": 500000,
@@ -978,7 +1030,7 @@ async def token_status(_key: str = Depends(verify_key)):
         "tpm": 500_000,
         "rpm": 2,
         "model": _MISTRAL_MODEL,
-        "optimization": "200k batch chars (~50k tokens) — 19.5% context per batch",
+        "optimization": "200k batch chars (~50k tokens) + dynamic 31s rate gate",
         "keys": [
             {"key_index": 1, "active": True}
         ],
