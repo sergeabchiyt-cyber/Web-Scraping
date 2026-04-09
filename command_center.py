@@ -448,7 +448,10 @@ def _get_structural_signature(tag: Tag) -> str:
     """Get a structural fingerprint for an element (tag name + class list)."""
     if not isinstance(tag, Tag):
         return ""
-    classes = sorted(tag.get('class', []))
+    # Ignore dynamic state/structural classes that vary between otherwise identical rows
+    ignore = {'odd', 'even', 'active', 'hover', 'focus', 'first', 'last', 'selected', 'hidden', 'row-alt'}
+    classes = sorted(c for c in tag.get('class', []) 
+                     if c.lower() not in ignore and not c.startswith('ng-') and not re.match(r'^(row|col)-\d+$', c))
     return f"{tag.name}:{'.'.join(classes)}" if classes else tag.name
 
 def _find_repeated_structures(soup: BeautifulSoup) -> Optional[str]:
@@ -458,8 +461,8 @@ def _find_repeated_structures(soup: BeautifulSoup) -> Optional[str]:
     """
     candidates: List[Tuple[int, float, str, list]] = []  # (count, density, sig, elements)
 
-    # Scan all container elements for children with repeated structure
-    for container in soup.find_all(['div', 'section', 'main', 'article', 'ul', 'ol']):
+    # Scan all container elements (including custom SPA tags like <bc-datatable>)
+    for container in soup.find_all(True):
         children = [c for c in container.children if isinstance(c, Tag)]
         if len(children) < 3:  # need at least 3 siblings to be "repeated"
             continue
