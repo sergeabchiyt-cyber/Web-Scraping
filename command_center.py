@@ -204,10 +204,13 @@ def _is_safe_url(url: str) -> bool:
 # ════════════════════════════════════════════════════════════════════════════════
 _ZW_CHARS = re.compile(r'[\u200b\u200c\u200d\u2060\uFEFF\u00ad]')
 
-_NOISE_TAGS = [
-    'style', 'noscript', 'iframe', 'svg',
-    'nav', 'footer', 'aside', 'header',
-    'link', 'meta', 'base',
+_ALWAYS_REMOVE_TAGS = [
+    'script', 'style', 'noscript', 'iframe', 'svg',
+    'link', 'meta', 'base', 'template', 'br', 'hr'
+]
+
+_SMART_NOISE_TAGS = [
+    'nav', 'footer', 'aside', 'header', 'dialog'
 ]
 
 _INLINE_UNWRAP_TAGS = [
@@ -376,14 +379,14 @@ def _clean_soup(soup: BeautifulSoup) -> Tuple[BeautifulSoup, str]:
     _replace_img_with_alt(soup)
     json_appendix = _extract_json_scripts(soup)
 
-    # Remove scripts (always safe)
-    for script in soup.find_all('script'):
-        script.decompose()
+    # Unconditionally remove scripts, styles, and hidden/header metadata tags
+    for tag in soup(_ALWAYS_REMOVE_TAGS):
+        tag.decompose()
 
     # Smart noise tag removal — check content before decomposing
     kept_noise = 0
     removed_noise = 0
-    for tag in soup(_NOISE_TAGS):
+    for tag in soup(_SMART_NOISE_TAGS):
         if _has_substantial_content(tag):
             kept_noise += 1
         else:
