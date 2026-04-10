@@ -847,30 +847,54 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
         "Accept":        "application/json",
         "Authorization": f"Bearer {_MISTRAL_API_KEY}",
     }
+    t_start          = time.time()
+    tokens_estimate  = len(html) // CHARS_PER_TOKEN
+    print(f"[AI] Sending → {_MISTRAL_MODEL} "
+          f"({len(html):,} chars ~{tokens_estimate:,} tokens "
+          f"| {tokens_estimate / 262144 * 100:.1f}% context)")
+
+    MAX_RETRIES = 3
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                response = client.post(_MISTRAL_API_URL, json=payload, headers=headers)
+
+            elapsed_ai = time.time() - t_start
+            print(f"[AI] HTTP {response.status_code} in {elapsed_ai:.1f}s")
+
+            if response.status_code in [500, 502, 503, 504]:
+                if attempt < MAX_RETRIES:
+                    wait = 2 ** attempt
+                    print(f"[AI] Server error {response.status_code} — waiting {wait}s (Attempt {attempt}/{MAX_RETRIES})")
+                    time.sleep(wait)
+                    continue
+                print(f"[AI] Mistral error: {response.text[:300]}")
+                return None
+
+            if response.status_code == 429:
+                # Shouldn't happen with gate, but handle gracefully
+                retry_after = int(response.headers.get("Retry-After", 60))
+                print(f"[AI] 429 received — sleeping {retry_after}s then aborting batch")
+                time.sleep(retry_after)
+                return None
+
+            if response.status_code != 200:
+                print(f"[AI] Mistral HTTP {response.status_code}: {response.text[:300]}")
+                return None
+
+            break  # Success
+
+        except Exception as e:
+            elapsed_ai = time.time() - t_start
+            if attempt < MAX_RETRIES:
+                wait = 2 ** attempt
+                print(f"[AI] Connection error ({type(e).__name__}) in {elapsed_ai:.1f}s — waiting {wait}s (Attempt {attempt}/{MAX_RETRIES})")
+                time.sleep(wait)
+                continue
+            print(f"[AI] Mistral extraction failed after {MAX_RETRIES} attempts: {e}")
+            return None
+
     try:
-        t_start          = time.time()
-        tokens_estimate  = len(html) // CHARS_PER_TOKEN
-        print(f"[AI] Sending → {_MISTRAL_MODEL} "
-              f"({len(html):,} chars ~{tokens_estimate:,} tokens "
-              f"| {tokens_estimate / 262144 * 100:.1f}% context)")
-
-        with httpx.Client(timeout=120.0) as client:
-            response = client.post(_MISTRAL_API_URL, json=payload, headers=headers)
-
-        elapsed_ai = time.time() - t_start
-        print(f"[AI] HTTP {response.status_code} in {elapsed_ai:.1f}s")
-
-        if response.status_code == 429:
-            # Shouldn't happen with gate, but handle gracefully
-            retry_after = int(response.headers.get("Retry-After", 60))
-            print(f"[AI] 429 received — sleeping {retry_after}s then aborting batch")
-            time.sleep(retry_after)
-            return None
-
-        if response.status_code != 200:
-            print(f"[AI] Mistral error: {response.text[:300]}")
-            return None
-
         data    = response.json()
         usage   = data.get("usage", {})
         in_tok  = usage.get("prompt_tokens", "?")
@@ -883,7 +907,7 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
         return _parse_ai_response(content)
 
     except Exception as e:
-        print(f"[AI] Mistral extraction failed: {e}")
+        print(f"[AI] Failed to parse JSON response: {e}")
         return None
 
 def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
