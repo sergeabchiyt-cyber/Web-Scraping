@@ -558,9 +558,11 @@ def _find_best_table(html: str) -> str:
         return html
 
     # Combine all tables scoring ≥30% of best (captures related tables on same page)
+    # 30% threshold includes crucial secondary context (e.g. date mappings for contracts)
     threshold = best_score * 0.3
     selected = [(s, i, t) for s, i, t in scored if s >= threshold]
-    selected.sort(key=lambda x: x[1])  # restore original page order
+    # Sort by score DESCENDING so the biggest, densest table is the first one the AI sees.
+    selected.sort(key=lambda x: -x[0])
 
     if len(selected) == 1:
         print(f"[TABLE] Selected #{selected[0][1]+1} (score={best_score})")
@@ -927,10 +929,8 @@ def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
     }.get(
         extract_type,
         (
-            "Identify the single dominant repeated data structure "
-            "(table rows, list items, cards, or repeated div elements). "
-            "Div-based grids: repeated sibling divs with the same class = data rows. "
-            "Extract from that ONE structure only."
+            "Identify the densest mathematical/financial data grid. "
+            "MERGE related data from any secondary tables/structures by cross-referencing shared keys (like symbols or contract IDs)."
         ),
     )
 
@@ -938,9 +938,9 @@ def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
     return f"""Extract all structured data from the HTML below.
 RULES:
 - Use actual column headers/field labels as JSON keys (exact text, no translation)
+- Cross-reference multiple tables if present! If Table A gives a Symbol's Price and Table B gives that Symbol's Dates, MERGE them into ONE unified JSON object for that symbol.
 - Extract EVERY column/field found. Copy values as plain text (preserve signs, units: BTC, ETH, $, %, K, M, B, T)
-- Empty cells = null. Do NOT add fields not in source
-- ONE table/structure only. No merging from different tables
+- Target the main data items (prices, volumes, symbols) and map any contextual dates to them. Ignore useless calendar structures.
 - Return ONLY valid JSON array: [{{...}}, ...] or [] if no data
 
 IMAGE-TEXT: Plain text converted from <img alt="..."> is the cell value
