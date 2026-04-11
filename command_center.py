@@ -1,41 +1,11 @@
 """
-AUDITOR CORE v9.9.1 - Dynamic Rate Limiter for 2 RPM Limit
-────────────────────────────────────────────────────────────────────────────────────
-Changes v9.9.1:
-• ADDED dynamic rate limiter gate for Mistral 2 RPM constraint
-  - _MISTRAL_MIN_INTERVAL: 31s (1s safety margin over 30s)
-  - _mistral_rate_gate(): dynamic cooldown based on elapsed time since last call
-  - Stamps _last_mistral_call_ts AFTER sleeping, BEFORE POST
-  - 429 fallback: respects Retry-After header, then aborts batch
-  - Enhanced logging: token usage, timing, HTTP status
-
-Previous changes (all retained):
-v9.9.0 — 200k batch sizing for 2 RPM, context utilization optimization.
-v9.8.0 — Mistral Small 4 (mistral-small-2603), 500k TPM, 256k context.
-v9.7.1 — P1 batch delay, P2 retry on 429, P4 semantic column name inference.
-v9.7.0 — dynamic row-boundary batching, batch logging.
-v9.6.0 — log spam fix (score > 2 only).
-v9.5.4 — F11 empty-key promotion, F12 image-only name cells.
-v9.5.3 — F9 honest [] on JS pages, F10 JSON script preservation.
-v9.5.2 — F7 table isolation, F8 schema consistency.
-v9.5.1 — F6 inline tag unwrapping, HTML tag sanitisation.
-v9.5.0 — F1–F5 quality gate, JS retry, data-* attrs, empty-key fallback.
-v9.4.0 — surgical noise removal (blacklist, not readability).
-────────────────────────────────────────────────────────────────────────────────────
+AUDITOR CORE v9.9.2 — /api/raw endpoint added
 """
 
 from dotenv import load_dotenv
 load_dotenv()
 
-import os
-import re
-import time
-import math
-import secrets
-import asyncio
-import socket
-import unicodedata
-import json
+import os, re, time, math, secrets, asyncio, socket, unicodedata, json
 import concurrent.futures
 from collections import Counter
 from datetime import datetime, timezone
@@ -54,7 +24,6 @@ _READABILITY_AVAILABLE = False
 Document = None
 print("[BOOT] readability-lxml disabled — using surgical noise removal + table isolation")
 
-# ─ Mistral AI ─────────────────────────────────────────────────────────────────
 try:
     import httpx
     _MISTRAL_AVAILABLE = True
@@ -62,7 +31,6 @@ except ImportError:
     httpx = None
     _MISTRAL_AVAILABLE = False
 
-# ─ Scrapling ──────────────────────────────────────────────────────────────────
 try:
     from scrapling.fetchers import Fetcher, StealthyFetcher
     _STEALTH_AVAILABLE = True
@@ -83,78 +51,56 @@ print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE} Stealth={_STEALTH_AVAILABLE} Mistral
 # CONFIGURATION
 # ════════════════════════════════════════════════════════════════════════════════
 cpu_executor = concurrent.futures.ProcessPoolExecutor(max_workers=4)
-MAX_PAYLOAD_SIZE = 10_485_760
-MAX_SAFE_CHARS = 500_000
-MAX_RECORDS = 1000
+MAX_PAYLOAD_SIZE   = 10_485_760
+MAX_SAFE_CHARS     = 500_000
+MAX_RECORDS        = 1000
 MIN_FIELDS_PER_ROW = 2
-MIN_QUALITY_RATIO = 0.5
+MIN_QUALITY_RATIO  = 0.5
 MIN_SCHEMA_OVERLAP = 0.5
 
-# ── Batching OPTIMIZATION v9.9.0 ────────────────────────────────────────────────
-# 256k context, ~3k prompt overhead = 253k for content
-# Conservative target: 200k chars (~50k tokens) = 19.5% of context
-# This maximizes data per batch → minimizes RPM usage
-MAX_BATCH_CHARS = 200_000   # v9.9.0: 120k → 200k (+67%)
-BATCH_OVERHEAD = 3_000       # v9.9.0: 4k → 3k (optimized prompt)
-BATCH_USABLE = MAX_BATCH_CHARS - BATCH_OVERHEAD  # 197,000 usable chars
+MAX_BATCH_CHARS = 200_000
+BATCH_OVERHEAD  = 3_000
+BATCH_USABLE    = MAX_BATCH_CHARS - BATCH_OVERHEAD
 CHARS_PER_TOKEN = 4
 
-# ── Mistral config ─────────────────────────────────────────────────────────────
 _MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip().lstrip("=")
 if not _MISTRAL_API_KEY:
     print("[ERROR] MISTRAL_API_KEY not set — AI extraction will fail.")
 else:
     print(f"[BOOT] MISTRAL_API_KEY loaded: prefix={_MISTRAL_API_KEY[:8]}... length={len(_MISTRAL_API_KEY)}")
 
-_MISTRAL_MODEL = "mistral-small-2603"
+_MISTRAL_MODEL   = "mistral-small-2603"
 _MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
 
-# ── Mistral Rate Limiter (Sliding Window) ──────────────────────────────────────
-# 2 RPM = max 2 calls per rolling 60-second window.
-# Logic: track timestamps of recent calls. Before each call, purge timestamps
-# older than 60s. If 2 calls remain in the window, sleep until the oldest
-# one expires (falls outside the 60s window), then proceed.
-_RPM_LIMIT: int = 2
-_RPM_WINDOW: float = 60.0              # 60 seconds = 1 minute
-_RPM_SAFETY: float = 1.0               # 1s safety buffer
-_mistral_call_log: list = []            # list of epoch timestamps
+_RPM_LIMIT      = 2
+_RPM_WINDOW     = 60.0
+_RPM_SAFETY     = 1.0
+_mistral_call_log: list = []
 
 def _mistral_rate_gate() -> None:
-    """Block until it is safe to fire the next Mistral request (2 RPM sliding window)."""
     global _mistral_call_log
     now = time.time()
-
-    # Purge timestamps older than the window
     _mistral_call_log = [ts for ts in _mistral_call_log if now - ts < _RPM_WINDOW]
-
-    calls_in_window = len(_mistral_call_log)
-    remaining_slots = _RPM_LIMIT - calls_in_window
-
+    calls_in_window  = len(_mistral_call_log)
+    remaining_slots  = _RPM_LIMIT - calls_in_window
     if remaining_slots > 0:
-        # Safe to call — we have room in this minute
-        print(f"[RATE] {calls_in_window}/{_RPM_LIMIT} calls in last 60s — "
-              f"{remaining_slots} slot(s) free, proceeding immediately")
+        print(f"[RATE] {calls_in_window}/{_RPM_LIMIT} calls in last 60s — {remaining_slots} slot(s) free")
     else:
-        # Window is full — wait until the oldest call expires out of the window
         oldest_ts = _mistral_call_log[0]
         wait = (oldest_ts + _RPM_WINDOW + _RPM_SAFETY) - now
         if wait > 0:
-            print(f"[RATE] {calls_in_window}/{_RPM_LIMIT} calls in last 60s — "
-                  f"window full, waiting {wait:.1f}s for next minute")
+            print(f"[RATE] Window full — waiting {wait:.1f}s")
             time.sleep(wait)
-        # After sleeping, purge again
         now = time.time()
         _mistral_call_log = [ts for ts in _mistral_call_log if now - ts < _RPM_WINDOW]
-        print(f"[RATE] Window cleared — now {len(_mistral_call_log)}/{_RPM_LIMIT}, proceeding")
-
-    # Stamp this call
+        print(f"[RATE] Window cleared — now {len(_mistral_call_log)}/{_RPM_LIMIT}")
     _mistral_call_log.append(time.time())
 
 # ════════════════════════════════════════════════════════════════════════════════
 # API KEY AUTH
 # ════════════════════════════════════════════════════════════════════════════════
 _ENV_KEY = os.environ.get("AUDITOR_API_KEY", "").strip()
-API_KEY = _ENV_KEY if _ENV_KEY else secrets.token_hex(32)
+API_KEY  = _ENV_KEY if _ENV_KEY else secrets.token_hex(32)
 if not _ENV_KEY:
     print(f"[BOOT] No AUDITOR_API_KEY — generated: {API_KEY}")
 
@@ -167,15 +113,27 @@ def verify_key(x_api_key: str = Header(..., alias="X-Api-Key")) -> str:
 # MODELS
 # ════════════════════════════════════════════════════════════════════════════════
 class ScrapeRequest(BaseModel):
-    url: str
-    adaptive: bool = True
-    js: bool = False
-    extract_type: str = "auto"
+    url:          str
+    adaptive:     bool = True
+    js:           bool = False
+    extract_type: str  = "auto"
 
 class ScrapeResponse(BaseModel):
-    events: List[Dict[str, Any]]
+    events:    List[Dict[str, Any]]
     raw_bytes: int
-    elapsed: float
+    elapsed:   float
+
+class RawResponse(BaseModel):
+    url:           str
+    raw_bytes:     int
+    cleaned_chars: int
+    isolated_chars: int
+    retention_pct: float
+    isolation_pct: float
+    num_batches:   int
+    batch_sizes:   List[int]
+    content:       str
+    elapsed:       float
 
 # ════════════════════════════════════════════════════════════════════════════════
 # SSRF PROTECTION
@@ -188,7 +146,7 @@ def _is_safe_url(url: str) -> bool:
         hostname = parsed.hostname
         if not hostname:
             return False
-        ip = socket.gethostbyname(hostname)
+        ip     = socket.gethostbyname(hostname)
         ip_int = int.from_bytes(socket.inet_aton(ip), 'big')
         private_blocks = [
             (0x0A000000, 0xFF000000), (0xAC100000, 0xFFF00000),
@@ -203,749 +161,378 @@ def _is_safe_url(url: str) -> bool:
 # PREPROCESSING
 # ════════════════════════════════════════════════════════════════════════════════
 _ZW_CHARS = re.compile(r'[\u200b\u200c\u200d\u2060\uFEFF\u00ad]')
-
-_ALWAYS_REMOVE_TAGS = [
-    'script', 'style', 'noscript', 'iframe', 'svg',
-    'link', 'meta', 'base', 'template', 'br', 'hr'
-]
-
-_SMART_NOISE_TAGS = [
-    'nav', 'footer', 'aside', 'header', 'dialog'
-]
-
-_INLINE_UNWRAP_TAGS = [
-    'a', 'button', 'span', 'em', 'strong', 'b', 'i', 'u',
-    'label', 'small', 'sup', 'sub', 'abbr', 'cite', 'mark',
-    'bdi', 'bdo', 'time', 'ins', 'del', 's',
-]
-
-_NOISE_ATTR_RE = re.compile(
-    r'\b(ad|ads|advert|advertisement|banner|cookie|popup|modal|overlay|'
-    r'sidebar|widget|promo|sponsor|social|share|comment|newsletter|'
-    r'breadcrumb|menu|navbar|toolbar|toast|notification|announcement|'
-    r'header|footer|nav|navigation|flyout|dropdown|offcanvas|drawer|'
-    r'skip-link|back-to-top|scroll-top|lightbox|carousel__control)\b',
-    re.IGNORECASE,
-)
-
-# Attributes to PRESERVE (everything else gets stripped)
-_PRESERVE_ATTRS_RE = re.compile(
-    r'^(data-|aria-label|colspan|rowspan|scope|headers|title|alt|class)',
-    re.IGNORECASE,
-)
-
-_HTML_TAG_RE = re.compile(r'<[^>]+>')
-
-_JSON_DATA_SCRIPT_IDS = re.compile(
-    r'(NEXT_DATA|NUXT|INITIAL_STATE|app-state|initial-data|'
-    r'data-layer|redux-state|apollo-state|relay-store)',
-    re.IGNORECASE,
-)
-
-# Semantic column name inference patterns
-_TIME_PATTERN = re.compile(r'^\d{1,2}:\d{2}(:\d{2})?(\s*(AM|PM))?', re.IGNORECASE)
-_DATE_PATTERN = re.compile(
-    r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|'
-    r'january|february|march|april|may|june|july|august|september|'
-    r'october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b',
-    re.IGNORECASE,
-)
-_COUNTRY_PATTERN = re.compile(r'^[A-Z]{2,3}$', re.IGNORECASE)
-_NUMBER_PATTERN = re.compile(r'^[+-]?\d+\.?\d*%?$')
+_ALWAYS_REMOVE_TAGS  = ['script','style','noscript','iframe','svg','link','meta','base','template','br','hr']
+_SMART_NOISE_TAGS    = ['nav','footer','aside','header','dialog']
+_INLINE_UNWRAP_TAGS  = ['a','button','span','em','strong','b','i','u','label','small','sup','sub','abbr','cite','mark','bdi','bdo','time','ins','del','s']
+_NOISE_ATTR_RE       = re.compile(r'\b(ad|ads|advert|advertisement|banner|cookie|popup|modal|overlay|sidebar|widget|promo|sponsor|social|share|comment|newsletter|breadcrumb|menu|navbar|toolbar|toast|notification|announcement|header|footer|nav|navigation|flyout|dropdown|offcanvas|drawer|skip-link|back-to-top|scroll-top|lightbox|carousel__control)\b', re.IGNORECASE)
+_PRESERVE_ATTRS_RE   = re.compile(r'^(data-|aria-label|colspan|rowspan|scope|headers|title|alt|class)', re.IGNORECASE)
+_HTML_TAG_RE         = re.compile(r'<[^>]+>')
+_JSON_DATA_SCRIPT_IDS= re.compile(r'(NEXT_DATA|NUXT|INITIAL_STATE|app-state|initial-data|data-layer|redux-state|apollo-state|relay-store)', re.IGNORECASE)
+_TIME_PATTERN        = re.compile(r'^\d{1,2}:\d{2}(:\d{2})?(\s*(AM|PM))?', re.IGNORECASE)
+_DATE_PATTERN        = re.compile(r'\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b', re.IGNORECASE)
+_COUNTRY_PATTERN     = re.compile(r'^[A-Z]{2,3}$', re.IGNORECASE)
+_NUMBER_PATTERN      = re.compile(r'^[+-]?\d+\.?\d*%?$')
+_DATA_CONTENT_THRESHOLD = 200
 
 def _normalize(text: str) -> str:
-    if not text:
-        return ""
+    if not text: return ""
     text = unicodedata.normalize('NFKC', text)
     text = _ZW_CHARS.sub('', text)
     return text.strip()
 
 def _replace_img_with_alt(soup: BeautifulSoup) -> None:
     for img in soup.find_all('img'):
-        if img.parent is None:
-            continue
-        text = (
-            img.get('alt', '').strip()
-            or img.get('title', '').strip()
-            or img.get('aria-label', '').strip()
-        )
-        if text:
-            img.replace_with(text)
-        else:
-            img.decompose()
+        if img.parent is None: continue
+        text = img.get('alt','').strip() or img.get('title','').strip() or img.get('aria-label','').strip()
+        if text: img.replace_with(text)
+        else:    img.decompose()
 
 def _extract_json_scripts(soup: BeautifulSoup) -> str:
     json_blocks = []
     for script in soup.find_all('script'):
-        script_type = script.get('type', '').lower()
-        script_id = script.get('id', '')
-        is_json = (
-            script_type in ('application/json', 'application/ld+json')
-            or bool(_JSON_DATA_SCRIPT_IDS.search(script_id))
-        )
-        if not is_json:
-            continue
+        script_type = script.get('type','').lower()
+        script_id   = script.get('id','')
+        is_json = (script_type in ('application/json','application/ld+json') or bool(_JSON_DATA_SCRIPT_IDS.search(script_id)))
+        if not is_json: continue
         raw_text = script.get_text(strip=True)
-        if not raw_text or len(raw_text) > 50_000:
-            continue
+        if not raw_text or len(raw_text) > 50_000: continue
         try:
-            parsed = json.loads(raw_text)
+            parsed    = json.loads(raw_text)
             formatted = json.dumps(parsed, indent=2)
-            label = script_id or script_type or 'json-data'
-            json_blocks.append(
-                f"\n<!-- JSON DATA BLOCK: {label} -->\n<pre>{formatted}</pre>"
-            )
-            print(f"[JSON-SCRIPT] Preserved {len(raw_text):,} chars from script[id={label!r}]")
-        except Exception:
-            pass
+            label     = script_id or script_type or 'json-data'
+            json_blocks.append(f"\n<!-- JSON DATA BLOCK: {label} -->\n<pre>{formatted}</pre>")
+        except Exception: pass
     return '\n'.join(json_blocks)
 
 def _infer_column_names(soup: BeautifulSoup) -> None:
-    """Assign semantic names to empty <th> cells based on data patterns."""
     for table in soup.find_all('table'):
         rows = table.find_all('tr')
-        if not rows:
-            continue
+        if not rows: continue
         header_row = None
         for row in rows:
-            if row.find('th'):
-                header_row = row
-                break
-        if not header_row:
-            continue
-        headers = header_row.find_all(['th', 'td'])
+            if row.find('th'): header_row = row; break
+        if not header_row: continue
+        headers   = header_row.find_all(['th','td'])
         data_rows = [r for r in rows if r != header_row and r.find('td')]
-        if not data_rows:
-            continue
+        if not data_rows: continue
         inferred = 0
         for col_idx, th in enumerate(headers):
-            if th.get_text(strip=True):
-                continue
+            if th.get_text(strip=True): continue
             samples = []
             for dr in data_rows[:10]:
-                cells = dr.find_all(['td', 'th'])
+                cells = dr.find_all(['td','th'])
                 if col_idx < len(cells):
                     val = cells[col_idx].get_text(strip=True)
-                    if val:
-                        samples.append(val)
-            if not samples:
-                continue
-            threshold = len(samples) * 0.5
-            time_hits = sum(1 for s in samples if _TIME_PATTERN.match(s))
-            date_hits = sum(1 for s in samples if _DATE_PATTERN.search(s))
-            country_hits = sum(1 for s in samples if _COUNTRY_PATTERN.match(s))
+                    if val: samples.append(val)
+            if not samples: continue
+            threshold   = len(samples) * 0.5
+            time_hits   = sum(1 for s in samples if _TIME_PATTERN.match(s))
+            date_hits   = sum(1 for s in samples if _DATE_PATTERN.search(s))
+            country_hits= sum(1 for s in samples if _COUNTRY_PATTERN.match(s))
             number_hits = sum(1 for s in samples if _NUMBER_PATTERN.match(s))
-            if time_hits >= threshold:
-                name = "Time"
-            elif date_hits >= threshold:
-                name = "Date"
-            elif country_hits >= threshold:
-                name = "Country"
-            elif number_hits >= threshold:
-                name = "Value"
-            else:
-                continue
+            if   time_hits    >= threshold: name = "Time"
+            elif date_hits    >= threshold: name = "Date"
+            elif country_hits >= threshold: name = "Country"
+            elif number_hits  >= threshold: name = "Value"
+            else: continue
             th.string = name
             inferred += 1
-            print(f"[INFER] col {col_idx+1} → '{name}' (samples: {samples[:3]})")
         if inferred:
             print(f"[INFER] {inferred} column name(s) inferred from data patterns")
 
-_DATA_CONTENT_THRESHOLD = 200  # chars — elements with more text content are kept even if noisy
-
 def _calc_data_density(text: str) -> float:
-    """Calculate the proportion of text that consists of numbers or data symbols ($%+-.,)."""
-    if not text:
-        return 0.0
+    if not text: return 0.0
     data_chars = sum(1 for c in text if c.isdigit() or c in '$%+-.,')
     return data_chars / len(text)
 
 def _has_substantial_content(tag: Tag) -> bool:
-    """Check if an element contains enough real data to be worth keeping."""
-    # Contains tables or data structures → definitely keep
-    if tag.find(['table', 'dl', 'pre']):
-        return True
-    
-    # Check text volume and data-likeness
+    if tag.find(['table','dl','pre']): return True
     text = tag.get_text(separator=' ', strip=True)
-    if len(text) > _DATA_CONTENT_THRESHOLD:
-        # Require at least 5% of text to be data-like (numbers, symbols)
-        # to distinguish data grids from heavy text nav menus/paragraphs
-        if _calc_data_density(text) > 0.05:
-            return True
+    if len(text) > _DATA_CONTENT_THRESHOLD and _calc_data_density(text) > 0.05: return True
     return False
 
 def _clean_soup(soup: BeautifulSoup) -> Tuple[BeautifulSoup, str]:
     _replace_img_with_alt(soup)
     json_appendix = _extract_json_scripts(soup)
-
-    # Unconditionally remove scripts, styles, and hidden/header metadata tags
-    for tag in soup(_ALWAYS_REMOVE_TAGS):
-        tag.decompose()
-
-    # Smart noise tag removal — check content before decomposing
-    kept_noise = 0
-    removed_noise = 0
+    for tag in soup(_ALWAYS_REMOVE_TAGS): tag.decompose()
     for tag in soup(_SMART_NOISE_TAGS):
-        if _has_substantial_content(tag):
-            kept_noise += 1
-        else:
-            tag.decompose()
-            removed_noise += 1
-
-    # Smart class/id noise removal — check content before decomposing
-    kept_attr = 0
-    removed_attr = 0
+        if not _has_substantial_content(tag): tag.decompose()
     for tag in soup.find_all(True):
-        if tag.parent is None:
-            continue
-        classes = ' '.join(tag.get('class', []))
-        tag_id  = tag.get('id', '')
+        if tag.parent is None: continue
+        classes = ' '.join(tag.get('class',[]))
+        tag_id  = tag.get('id','')
         if _NOISE_ATTR_RE.search(classes) or _NOISE_ATTR_RE.search(tag_id):
-            if _has_substantial_content(tag):
-                kept_attr += 1
-            else:
-                tag.decompose()
-                removed_attr += 1
-
-    if kept_noise or kept_attr:
-        print(f"[NOISE] Smart filter: kept {kept_noise + kept_attr} data-rich elements "
-              f"(noise_tags={kept_noise} attr_match={kept_attr}), "
-              f"removed {removed_noise + removed_attr}")
-
+            if not _has_substantial_content(tag): tag.decompose()
     for tag in soup.find_all(_INLINE_UNWRAP_TAGS):
-        if tag.parent is None:
-            continue
+        if tag.parent is None: continue
         tag.unwrap()
-
     _infer_column_names(soup)
-
     for tag in soup.find_all(True):
-        tag.attrs = {
-            k: v for k, v in tag.attrs.items()
-            if _PRESERVE_ATTRS_RE.match(k)
-        }
-
+        tag.attrs = {k: v for k, v in tag.attrs.items() if _PRESERVE_ATTRS_RE.match(k)}
     return soup, json_appendix
 
 def _extract_main_content(html: str) -> str:
     soup = BeautifulSoup(html, 'html.parser')
     soup, json_appendix = _clean_soup(soup)
-    body = str(soup)
-    if json_appendix:
-        print(f"[PREPROCESS] Appending {len(json_appendix):,} chars of JSON initial-state data")
-    return body + json_appendix
+    return str(soup) + json_appendix
 
-# ════════════════════════════════════════════════════════════════════════════════
-# TABLE ISOLATION
-# ════════════════════════════════════════════════════════════════════════════════
 def _score_table(table_tag: Tag) -> int:
-    rows = table_tag.find_all('tr')
-    if not rows:
-        return 0
-    max_cols = max((len(r.find_all(['td', 'th'])) for r in rows), default=0)
-    data_rows = sum(1 for r in rows if r.find('td'))
+    rows     = table_tag.find_all('tr')
+    if not rows: return 0
+    max_cols = max((len(r.find_all(['td','th'])) for r in rows), default=0)
+    data_rows= sum(1 for r in rows if r.find('td'))
     return data_rows * max_cols
 
 def _get_structural_signature(tag: Tag) -> str:
-    """Get a structural fingerprint for an element (tag name + class list)."""
-    if not isinstance(tag, Tag):
-        return ""
-    # Ignore dynamic state/structural classes that vary between otherwise identical rows
-    ignore = {'odd', 'even', 'active', 'hover', 'focus', 'first', 'last', 'selected', 'hidden', 'row-alt'}
-    classes = sorted(c for c in tag.get('class', []) 
-                     if c.lower() not in ignore and not c.startswith('ng-') and not re.match(r'^(row|col)-\d+$', c))
+    if not isinstance(tag, Tag): return ""
+    ignore  = {'odd','even','active','hover','focus','first','last','selected','hidden','row-alt'}
+    classes = sorted(c for c in tag.get('class',[]) if c.lower() not in ignore and not c.startswith('ng-') and not re.match(r'^(row|col)-\d+$', c))
     return f"{tag.name}:{'.'.join(classes)}" if classes else tag.name
 
 def _find_repeated_structures(soup: BeautifulSoup) -> Optional[str]:
-    """
-    Find data regions in div-based SPAs by detecting groups of sibling elements
-    with identical structural signatures. Repeated structure = data rows.
-    """
-    candidates: List[Tuple[int, float, str, list]] = []  # (count, density, sig, elements)
-
-    # Scan all container elements (including custom SPA tags like <bc-datatable>)
+    candidates = []
     for container in soup.find_all(True):
         children = [c for c in container.children if isinstance(c, Tag)]
-        if len(children) < 3:  # need at least 3 siblings to be "repeated"
-            continue
-
-        # Count structural signatures among direct children
+        if len(children) < 3: continue
         sig_groups: Dict[str, list] = {}
         for child in children:
             sig = _get_structural_signature(child)
-            if sig:
-                sig_groups.setdefault(sig, []).append(child)
-
+            if sig: sig_groups.setdefault(sig, []).append(child)
         for sig, elements in sig_groups.items():
             count = len(elements)
-            if count < 3:
-                continue
-
-            text_blocks = [el.get_text(separator=' ', strip=True) for el in elements]
-            full_text = ' '.join(text_blocks)
-            total_text = len(full_text)
-            
-            total_html = sum(len(str(el)) for el in elements)
+            if count < 3: continue
+            text_blocks  = [el.get_text(separator=' ', strip=True) for el in elements]
+            full_text    = ' '.join(text_blocks)
+            total_text   = len(full_text)
+            total_html   = sum(len(str(el)) for el in elements)
             html_density = total_text / max(total_html, 1)
-
-            if total_text < 50:
-                continue
-
-            # Calculate data-likeness to distinguish data from nav menus
+            if total_text < 50: continue
             data_density = _calc_data_density(full_text)
-            
-            # Require at least SOME numbers/symbols (filters out pure text navs)
-            if data_density < 0.05:
-                continue
-                
-            # Score favors elements with high repetition AND high data density
+            if data_density < 0.05: continue
             score = count * (data_density + 0.1) * html_density
-
             candidates.append((score, count, data_density, sig, elements))
-
-    if not candidates:
-        return None
-
-    # Sort by score desc
+    if not candidates: return None
     candidates.sort(key=lambda x: x[0], reverse=True)
-
     best_score, best_count, best_data_density, best_sig, best_elements = candidates[0]
-    total_chars = sum(len(str(el)) for el in best_elements)
-
-    print(f"[DENSITY] Found {len(candidates)} valid data structures")
-    for score, count, data_density, sig, elements in candidates[:5]:
-        chars = sum(len(str(el)) for el in elements)
-        preview = elements[0].get_text(separator=' ', strip=True)[:60]
-        print(f"[DENSITY]   {count}× '{sig}' data_density={data_density:.2f} score={score:.2f} "
-              f"chars={chars:,} | {preview!r}")
-
-    print(f"[DENSITY] Selected: {best_count}× '{best_sig}' "
-          f"({total_chars:,} chars, data_density={best_data_density:.2f}, score={best_score:.2f})")
-
+    print(f"[DENSITY] Selected: {best_count}× '{best_sig}' score={best_score:.2f}")
     return '\n'.join(str(el) for el in best_elements)
 
 def _find_best_table(html: str) -> str:
-    soup = BeautifulSoup(html, 'html.parser')
+    soup   = BeautifulSoup(html, 'html.parser')
     tables = soup.find_all('table')
-
     if not tables:
-        # No HTML tables — try to find repeated div structures (SPA data grids)
-        print("[TABLE] No <table> elements found — scanning for repeated structures")
         region = _find_repeated_structures(soup)
-        if region:
-            return region
-        print("[TABLE] No repeated structures found — using full cleaned HTML")
-        return html
-
-    scored = []
-    for i, t in enumerate(tables):
-        score = _score_table(t)
-        if score > 2:
-            rows    = len(t.find_all('tr'))
-            cols    = max((len(r.find_all(['td', 'th'])) for r in t.find_all('tr')), default=0)
-            preview = t.get_text(separator=' ', strip=True)[:80].replace('\n', ' ')
-            print(f"[TABLE] candidate #{i+1}: score={score} rows={rows} cols={cols} | {preview!r}")
-        scored.append((score, i, t))
-
-    if not scored:
-        return html
-
+        return region if region else html
+    scored = [((_score_table(t)), i, t) for i, t in enumerate(tables)]
     scored.sort(key=lambda x: -x[0])
     best_score = scored[0][0]
-
-    if best_score == 0:
-        return html
-
-    # Combine all tables scoring ≥30% of best (captures related tables on same page)
-    # 30% threshold includes crucial secondary context (e.g. date mappings for contracts)
-    threshold = best_score * 0.3
-    selected = [(s, i, t) for s, i, t in scored if s >= threshold]
-    # Sort by score DESCENDING so the biggest, densest table is the first one the AI sees.
+    if best_score == 0: return html
+    threshold  = best_score * 0.3
+    selected   = [(s, i, t) for s, i, t in scored if s >= threshold]
     selected.sort(key=lambda x: -x[0])
-
-    if len(selected) == 1:
-        print(f"[TABLE] Selected #{selected[0][1]+1} (score={best_score})")
-        return str(selected[0][2])
-
-    names = [f"#{x[1]+1}(s={x[0]})" for x in selected]
-    print(f"[TABLE] Combining {len(selected)} tables: {', '.join(names)} (threshold={threshold:.0f})")
+    if len(selected) == 1: return str(selected[0][2])
     return '\n'.join(str(t) for _, _, t in selected)
 
 def _preprocess_html(html_bytes: bytes) -> str:
-    try:
-        text = html_bytes.decode('utf-8', errors='replace')
-    except Exception:
-        text = html_bytes.decode('latin-1', errors='replace')
-
+    try:    text = html_bytes.decode('utf-8', errors='replace')
+    except: text = html_bytes.decode('latin-1', errors='replace')
     original_len = len(text)
     cleaned      = _extract_main_content(text)
     cleaned_len  = len(cleaned)
-    print(f"[PREPROCESS] {original_len:,} → {cleaned_len:,} chars after noise removal "
-          f"({100 * cleaned_len / max(original_len, 1):.1f}% retained)")
-
+    print(f"[PREPROCESS] {original_len:,} → {cleaned_len:,} chars ({100*cleaned_len/max(original_len,1):.1f}% retained)")
     isolated     = _find_best_table(cleaned)
     isolated_len = len(isolated)
     print(f"[PREPROCESS] {cleaned_len:,} → {isolated_len:,} chars after table isolation")
-
-    # Smart fallback: if isolation was too aggressive relative to input size,
-    # use the full cleaned HTML instead
     if isolated_len < 500 and original_len > 50_000:
-        print(f"[PREPROCESS] Isolation too aggressive ({isolated_len} chars from "
-              f"{original_len:,}) — falling back to full cleaned HTML ({cleaned_len:,} chars)")
+        print(f"[PREPROCESS] Isolation too aggressive — falling back to full cleaned HTML")
         return cleaned[:MAX_SAFE_CHARS]
-
     return isolated
 
 # ════════════════════════════════════════════════════════════════════════════════
-# DYNAMIC ROW-BOUNDARY BATCHING (OPTIMIZED for 200k chars)
+# DYNAMIC ROW-BOUNDARY BATCHING
 # ════════════════════════════════════════════════════════════════════════════════
 def _split_table_into_batches(html: str) -> List[Tuple[str, int, int]]:
-    soup = BeautifulSoup(html, 'html.parser')
+    soup     = BeautifulSoup(html, 'html.parser')
     all_rows = soup.find_all('tr')
-
-    if not all_rows:
-        print("[BATCH] No <tr> elements — treating as single non-table batch")
-        return [(html, 0, 0)]
-
+    if not all_rows: return [(html, 0, 0)]
     header_row = None
     data_rows  = []
     for row in all_rows:
-        if header_row is None and row.find('th'):
-            header_row = row
-        else:
-            data_rows.append(row)
-
+        if header_row is None and row.find('th'): header_row = row
+        else: data_rows.append(row)
     header_html  = str(header_row) if header_row else ""
     header_chars = len(header_html)
     total_rows   = len(data_rows)
-
-    if total_rows == 0:
-        print("[BATCH] No data rows — sending header only")
-        return [(html, 0, 0)]
-
-    sample        = data_rows[:min(10, total_rows)]
-    sample_chars  = sum(len(str(r)) for r in sample)
-    avg_row_chars = max(sample_chars / len(sample), 1)
-
+    if total_rows == 0: return [(html, 0, 0)]
+    sample       = data_rows[:min(10, total_rows)]
+    sample_chars = sum(len(str(r)) for r in sample)
+    avg_row_chars= max(sample_chars / len(sample), 1)
     usable_per_batch = BATCH_USABLE - header_chars
-    batch_size       = max(int(usable_per_batch / avg_row_chars), 1)
-    num_batches      = math.ceil(total_rows / batch_size)
-    est_tokens       = int(avg_row_chars / CHARS_PER_TOKEN)
-
-    print(f"[BATCH] Plan: {total_rows} rows | avg row={avg_row_chars:.0f} chars "
-          f"({est_tokens} tokens) | batch_size={batch_size} rows | "
-          f"batches={num_batches} | header={header_chars} chars | "
-          f"BATCH_USABLE={BATCH_USABLE:,} chars")
-
+    batch_size   = max(int(usable_per_batch / avg_row_chars), 1)
+    num_batches  = math.ceil(total_rows / batch_size)
+    print(f"[BATCH] Plan: {total_rows} rows | avg={avg_row_chars:.0f} chars | batches={num_batches}")
     total_data_chars = sum(len(str(r)) for r in data_rows)
-    # v9.9.0: Check against new 200k limit
     if total_data_chars + header_chars <= BATCH_USABLE:
-        print(f"[BATCH] All {total_rows} rows fit in one batch "
-              f"({total_data_chars + header_chars:,} chars) — no splitting")
         return [(html, 0, total_rows - 1)]
-
     batches: List[Tuple[str, int, int]] = []
-    current_rows: List[Tag] = []
-    current_chars: int      = header_chars
-    batch_start_idx: int    = 0
-
+    current_rows:  List[Tag] = []
+    current_chars: int       = header_chars
+    batch_start_idx: int     = 0
     for i, row in enumerate(data_rows):
         row_html  = str(row)
         row_chars = len(row_html)
-
         if row_chars > BATCH_USABLE:
             if current_rows:
                 batch_html = _assemble_batch_html(header_html, current_rows)
                 batches.append((batch_html, batch_start_idx, i - 1))
-                _log_batch_plan(len(batches), num_batches, batch_start_idx, i - 1, batch_html)
                 current_rows  = []
                 current_chars = header_chars
-            batch_html = _assemble_batch_html(header_html, [row])
-            batches.append((batch_html, i, i))
-            print(f"[BATCH] #{len(batches)}/{num_batches}: "
-                  f"row {i+1} (OVERSIZED: {row_chars:,} chars)")
+            batches.append((_assemble_batch_html(header_html, [row]), i, i))
             batch_start_idx = i + 1
             continue
-
         if current_chars + row_chars > BATCH_USABLE and current_rows:
-            batch_html = _assemble_batch_html(header_html, current_rows)
-            batches.append((batch_html, batch_start_idx, i - 1))
-            _log_batch_plan(len(batches), num_batches, batch_start_idx, i - 1, batch_html)
+            batches.append((_assemble_batch_html(header_html, current_rows), batch_start_idx, i - 1))
             current_rows    = []
             current_chars   = header_chars
             batch_start_idx = i
-
         current_rows.append(row)
         current_chars += row_chars
-
     if current_rows:
-        batch_html = _assemble_batch_html(header_html, current_rows)
-        batches.append((batch_html, batch_start_idx, total_rows - 1))
-        _log_batch_plan(len(batches), num_batches, batch_start_idx, total_rows - 1, batch_html)
-
-    print(f"[BATCH] Split complete: {len(batches)} batches for {total_rows} rows")
+        batches.append((_assemble_batch_html(header_html, current_rows), batch_start_idx, total_rows - 1))
+    print(f"[BATCH] Split complete: {len(batches)} batches")
     return batches
 
-def _log_batch_plan(batch_num: int, total: int, start: int, end: int, html: str) -> None:
-    chars = len(html)
-    tokens = chars // CHARS_PER_TOKEN
-    context_pct = (tokens * CHARS_PER_TOKEN) / 262144 * 100  # % of 256k context
-    print(f"[BATCH] #{batch_num}/{total}: rows {start+1}–{end+1} | "
-          f"{chars:,} chars | ~{tokens:,} tokens | context={context_pct:.1f}%")
-
 def _assemble_batch_html(header_html: str, rows: List[Tag]) -> str:
-    rows_html = ''.join(str(r) for r in rows)
-    return f"<table>{header_html}{rows_html}</table>"
+    return f"<table>{header_html}{''.join(str(r) for r in rows)}</table>"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # EXTRACTION QUALITY GATE
 # ════════════════════════════════════════════════════════════════════════════════
 def _count_populated(row: Dict[str, Any]) -> int:
-    return sum(
-        1 for v in row.values()
-        if v is not None and str(v).strip() not in ("", "null", "N/A", "-")
-    )
+    return sum(1 for v in row.values() if v is not None and str(v).strip() not in ("","null","N/A","-"))
 
 def _majority_schema(rows: List[Dict[str, Any]]) -> set:
-    if not rows:
-        return set()
+    if not rows: return set()
     key_counter: Counter = Counter()
     for row in rows:
-        for k in row.keys():
-            key_counter[k] += 1
+        for k in row.keys(): key_counter[k] += 1
     threshold = len(rows) * MIN_SCHEMA_OVERLAP
     return {k for k, c in key_counter.items() if c >= threshold}
 
 def _rows_have_data(rows: List[Dict[str, Any]]) -> bool:
-    if not rows:
-        return False
-
+    if not rows: return False
     good_rows = sum(1 for r in rows if _count_populated(r) >= MIN_FIELDS_PER_ROW)
     quality   = good_rows / len(rows)
-    print(f"[QUALITY] {good_rows}/{len(rows)} rows have ≥{MIN_FIELDS_PER_ROW} fields "
-          f"(quality={quality:.0%})")
-
-    if quality < MIN_QUALITY_RATIO:
-        return False
-
+    print(f"[QUALITY] {good_rows}/{len(rows)} rows quality={quality:.0%}")
+    if quality < MIN_QUALITY_RATIO: return False
     majority = _majority_schema(rows)
     if majority:
-        consistent     = sum(
-            1 for r in rows
-            if len(set(r.keys()) & majority) / len(majority) >= MIN_SCHEMA_OVERLAP
-        )
+        consistent     = sum(1 for r in rows if len(set(r.keys()) & majority) / len(majority) >= MIN_SCHEMA_OVERLAP)
         schema_quality = consistent / len(rows)
-        print(f"[QUALITY] Schema consistency: {consistent}/{len(rows)} ({schema_quality:.0%})")
-        if schema_quality < MIN_QUALITY_RATIO:
-            print(f"[QUALITY] Mixed-table contamination — triggering retry")
-            return False
-
+        if schema_quality < MIN_QUALITY_RATIO: return False
     return True
 
 def _log_extraction_stats(rows: List[Dict[str, Any]], label: str = "") -> None:
-    if not rows:
-        print(f"[STATS{' ' + label if label else ''}] No rows extracted.")
-        return
+    if not rows: print(f"[STATS] No rows extracted."); return
     all_keys: Dict[str, int] = {}
     for row in rows:
         for k, v in row.items():
             all_keys.setdefault(k, 0)
-            if v is not None and str(v).strip() not in ("", "null", "N/A", "-"):
-                all_keys[k] += 1
+            if v is not None and str(v).strip() not in ("","null","N/A","-"): all_keys[k] += 1
     total = len(rows)
-    print(f"[STATS{' ' + label if label else ''}] {total} rows · field coverage:")
+    print(f"[STATS {label}] {total} rows")
     for key, count in sorted(all_keys.items(), key=lambda x: -x[1]):
         bar = "█" * int(10 * count / total) + "░" * (10 - int(10 * count / total))
-        empty = " ← EMPTY KEY" if str(key).strip() == "" else ""
-        print(f" {bar} {count:>3}/{total} '{key}'{empty}")
+        print(f" {bar} {count:>3}/{total} '{key}'")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # POST-PROCESSING
 # ════════════════════════════════════════════════════════════════════════════════
 def _sanitize_value(v: Any) -> Any:
-    if not isinstance(v, str):
-        return v
+    if not isinstance(v, str): return v
     cleaned = _HTML_TAG_RE.sub('', v).strip()
     cleaned = re.sub(r'\s+', ' ', cleaned)
     return cleaned if cleaned else None
 
 def _clean_row_keys(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    cleaned = []
+    cleaned  = []
     promoted = 0
-    dropped = 0
+    dropped  = 0
     for row in rows:
         new_row: Dict[str, Any] = {}
         for k, v in row.items():
             if k is None or str(k).strip() == "":
                 if v is not None and str(v).strip() and "label" not in row:
-                    new_row["label"] = _sanitize_value(v)
-                    promoted += 1
-                else:
-                    dropped += 1
+                    new_row["label"] = _sanitize_value(v); promoted += 1
+                else: dropped += 1
             else:
                 new_row[k] = _sanitize_value(v)
         cleaned.append(new_row)
     if promoted or dropped:
-        print(f"[POSTPROCESS] Empty-key cleanup: {promoted} promoted to 'label', "
-              f"{dropped} dropped")
+        print(f"[POSTPROCESS] Empty-key: {promoted} promoted, {dropped} dropped")
     return cleaned
 
 def _sanitize_row_values(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    stripped = [{k: _sanitize_value(v) for k, v in row.items()} for row in rows]
-    return _clean_row_keys(stripped)
+    return _clean_row_keys([{k: _sanitize_value(v) for k, v in row.items()} for row in rows])
 
 # ════════════════════════════════════════════════════════════════════════════════
-# AI EXTRACTION ENGINE — Mistral Small 4 (OPTIMIZED v9.9.1 + Rate Limiter)
+# AI EXTRACTION ENGINE
 # ════════════════════════════════════════════════════════════════════════════════
 def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> List[Dict[str, Any]]:
-    """
-    Entry point. Splits large tables into row-boundary batches, calls Mistral
-    per batch, merges results.
-    
-    v9.9.0: 200k batch limit means fewer batches = fewer API calls = lower RPM usage.
-    v9.9.1: Dynamic rate limiter gate ensures ≤2 RPM across all batches.
-    With 2 RPM limit, minimizing batches is critical.
-    """
     batches = _split_table_into_batches(html_content)
-
     if len(batches) == 1:
         result = _extract_with_mistral(html_content, url, extract_type)
         return result if result is not None else []
-
     all_rows: List[Dict[str, Any]] = []
     for idx, (batch_html, start, end) in enumerate(batches):
-        batch_num = idx + 1
-        print(f"[BATCH] Sending batch {batch_num}/{len(batches)} to AI "
-              f"(rows {start+1}–{end+1})")
         result = _extract_with_mistral(batch_html, url, extract_type)
-        if result:
-            print(f"[BATCH] #{batch_num} result: {len(result)} records extracted")
-            all_rows.extend(result)
-        else:
-            print(f"[BATCH] #{batch_num} result: 0 records — batch may have failed")
-
-    print(f"[BATCH] Merge complete: {len(all_rows)} total records from {len(batches)} batches")
+        if result: all_rows.extend(result)
     return all_rows[:MAX_RECORDS]
 
 def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[List[Dict[str, Any]]]:
-    if not _MISTRAL_AVAILABLE:
-        print("[AI] httpx not installed.")
-        return None
-    if not _MISTRAL_API_KEY:
-        print("[AI] No Mistral API key.")
-        return None
-
-    _mistral_rate_gate()          # ← dynamic cooldown gate
-
+    if not _MISTRAL_AVAILABLE: return None
+    if not _MISTRAL_API_KEY:   return None
+    _mistral_rate_gate()
     prompt  = _build_accuracy_prompt(html, url, extract_type)
-    payload = {
-        "model":       _MISTRAL_MODEL,
-        "messages":    [{"role": "user", "content": prompt}],
-        "temperature": 0.0,
-    }
-    headers = {
-        "Content-Type":  "application/json",
-        "Accept":        "application/json",
-        "Authorization": f"Bearer {_MISTRAL_API_KEY}",
-    }
-    t_start          = time.time()
-    tokens_estimate  = len(html) // CHARS_PER_TOKEN
-    print(f"[AI] Sending → {_MISTRAL_MODEL} "
-          f"({len(html):,} chars ~{tokens_estimate:,} tokens "
-          f"| {tokens_estimate / 262144 * 100:.1f}% context)")
-
+    payload = {"model": _MISTRAL_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.0}
+    headers = {"Content-Type": "application/json", "Accept": "application/json", "Authorization": f"Bearer {_MISTRAL_API_KEY}"}
+    t_start = time.time()
+    print(f"[AI] Sending → {_MISTRAL_MODEL} ({len(html):,} chars)")
     MAX_RETRIES = 3
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             with httpx.Client(timeout=120.0) as client:
                 response = client.post(_MISTRAL_API_URL, json=payload, headers=headers)
-
             elapsed_ai = time.time() - t_start
             print(f"[AI] HTTP {response.status_code} in {elapsed_ai:.1f}s")
-
-            if response.status_code in [500, 502, 503, 504]:
+            if response.status_code in [500,502,503,504]:
                 if attempt < MAX_RETRIES:
-                    wait = 2 ** attempt
-                    print(f"[AI] Server error {response.status_code} — waiting {wait}s (Attempt {attempt}/{MAX_RETRIES})")
-                    time.sleep(wait)
-                    continue
-                print(f"[AI] Mistral error: {response.text[:300]}")
+                    time.sleep(2 ** attempt); continue
                 return None
-
             if response.status_code == 429:
-                # Shouldn't happen with gate, but handle gracefully
                 retry_after = int(response.headers.get("Retry-After", 60))
-                print(f"[AI] 429 received — sleeping {retry_after}s then aborting batch")
-                time.sleep(retry_after)
-                return None
-
-            if response.status_code != 200:
-                print(f"[AI] Mistral HTTP {response.status_code}: {response.text[:300]}")
-                return None
-
-            break  # Success
-
+                print(f"[AI] 429 — sleeping {retry_after}s")
+                time.sleep(retry_after); return None
+            if response.status_code != 200: return None
+            break
         except Exception as e:
-            elapsed_ai = time.time() - t_start
-            if attempt < MAX_RETRIES:
-                wait = 2 ** attempt
-                print(f"[AI] Connection error ({type(e).__name__}) in {elapsed_ai:.1f}s — waiting {wait}s (Attempt {attempt}/{MAX_RETRIES})")
-                time.sleep(wait)
-                continue
-            print(f"[AI] Mistral extraction failed after {MAX_RETRIES} attempts: {e}")
-            return None
-
+            if attempt < MAX_RETRIES: time.sleep(2 ** attempt); continue
+            print(f"[AI] Failed: {e}"); return None
     try:
         data    = response.json()
-        usage   = data.get("usage", {})
-        in_tok  = usage.get("prompt_tokens", "?")
-        out_tok = usage.get("completion_tokens", "?")
-        tot_tok = usage.get("total_tokens", "?")
-        print(f"[AI] Tokens: in={in_tok} out={out_tok} total={tot_tok}")
-
         content = data["choices"][0]["message"]["content"]
-        print(f"[AI] Response received ({len(content)} chars)")
         return _parse_ai_response(content)
-
     except Exception as e:
-        print(f"[AI] Failed to parse JSON response: {e}")
-        return None
+        print(f"[AI] Parse error: {e}"); return None
 
 def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
-    structure_hint = {
-        "table": (
-            "Extract each <tr> data row as one object. "
-            "Use the <th> or header row text as JSON keys."
-        ),
-        "list": (
-            "Extract each list item as one object. "
-            "Use any visible label or title text as the key."
-        ),
-        "card": (
-            "Extract each card or repeated block as one object. "
-            "Use visible field labels as keys."
-        ),
-    }.get(
-        extract_type,
-        (
-            "Identify the densest mathematical/financial data grid. "
-            "MERGE related data from any secondary tables/structures by cross-referencing shared keys (like symbols or contract IDs)."
-        ),
-    )
-
-    # v9.9.0: Streamlined prompt (~500 chars) to maximize content per batch
+    structure_hint = {"table": "Extract each <tr> data row as one object. Use <th> text as JSON keys.", "list": "Extract each list item as one object.", "card": "Extract each card as one object."}.get(extract_type, "Identify the densest data grid. MERGE related tables by shared keys.")
     return f"""Extract all structured data from the HTML below.
 RULES:
-- Use actual column headers/field labels as JSON keys (exact text, no translation)
-- Cross-reference multiple tables if present! If Table A gives a Symbol's Price and Table B gives that Symbol's Dates, MERGE them into ONE unified JSON object for that symbol.
-- Extract EVERY column/field found. Copy values as plain text (preserve signs, units: BTC, ETH, $, %, K, M, B, T)
-- Target the main data items (prices, volumes, symbols) and map any contextual dates to them. Ignore useless calendar structures.
-- Return ONLY valid JSON array: [{{...}}, ...] or [] if no data
-
-IMAGE-TEXT: Plain text converted from <img alt="..."> is the cell value
-DATA-ATTR: Use data-sort-value/data-raw/data-num/data-usd if visible text is empty
-JSON BLOCKS: <!-- JSON DATA BLOCK: ... --> sections may have complete data — prefer them
+- Use actual column headers as JSON keys (exact text)
+- Cross-reference multiple tables if present
+- Extract EVERY column/field. Copy values as plain text
+- Return ONLY valid JSON array: [{{...}}, ...] or []
 
 {structure_hint}
 
@@ -957,20 +544,14 @@ HTML:
 JSON:"""
 
 def _parse_ai_response(content: str) -> Optional[List[Dict[str, Any]]]:
-    if not content:
-        return None
+    if not content: return None
     content = content.strip()
-    # Remove markdown fences if present
     if content.startswith('```'):
-        lines = content.split('\n')
-        content = '\n'.join(
-            line for line in lines
-            if not line.startswith('```') and '```' not in line
-        )
+        lines   = content.split('\n')
+        content = '\n'.join(line for line in lines if not line.startswith('```') and '```' not in line)
     start = content.find('[')
-    end = content.rfind(']') + 1
-    if start == -1 or end == 0:
-        return None
+    end   = content.rfind(']') + 1
+    if start == -1 or end == 0: return None
     try:
         data = json.loads(content[start:end])
         if isinstance(data, list):
@@ -985,152 +566,91 @@ def _parse_ai_response(content: str) -> Optional[List[Dict[str, Any]]]:
 # FETCHING LAYER
 # ════════════════════════════════════════════════════════════════════════════════
 def _fetch_static(url: str):
-    if Fetcher is None:
-        raise RuntimeError("Scrapling Fetcher not installed.")
-    try:
-        response = Fetcher().get(url)
-    except Exception as e:
-        raise RuntimeError(f"Fetcher.get() failed: {e}") from e
-    if response is None:
-        raise RuntimeError("Fetcher.get() returned None.")
+    if Fetcher is None: raise RuntimeError("Scrapling Fetcher not installed.")
+    response = Fetcher().get(url)
+    if response is None: raise RuntimeError("Fetcher.get() returned None.")
     return response
 
 def _fetch_js(url: str):
-    if not _STEALTH_AVAILABLE or StealthyFetcher is None:
-        raise RuntimeError("StealthyFetcher unavailable.")
-    try:
-        response = StealthyFetcher.fetch(url, headless=True)
-    except Exception as e:
-        raise RuntimeError(f"StealthyFetcher.fetch() failed: {e}") from e
-    if response is None:
-        raise RuntimeError("StealthyFetcher.fetch() returned None.")
+    if not _STEALTH_AVAILABLE or StealthyFetcher is None: raise RuntimeError("StealthyFetcher unavailable.")
+    response = StealthyFetcher.fetch(url, headless=True)
+    if response is None: raise RuntimeError("StealthyFetcher.fetch() returned None.")
     return response
 
 def _get_raw_bytes(response) -> bytes:
-    for attr in ('html', 'text'):
+    for attr in ('html','text'):
         val = getattr(response, attr, None)
-        if val and isinstance(val, str) and val.strip():
-            return val.encode('utf-8', errors='replace')
-    for attr in ('content', 'body'):
+        if val and isinstance(val, str) and val.strip(): return val.encode('utf-8', errors='replace')
+    for attr in ('content','body'):
         val = getattr(response, attr, None)
         if val:
-            if isinstance(val, bytes) and val:
-                return val
-            if isinstance(val, str) and val.strip():
-                return val.encode('utf-8', errors='replace')
+            if isinstance(val, bytes) and val: return val
+            if isinstance(val, str) and val.strip(): return val.encode('utf-8', errors='replace')
     raise ValueError("Scrapling response has no usable content.")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # MAIN SCRAPE PIPELINE
 # ════════════════════════════════════════════════════════════════════════════════
-async def _scrape_url(
-    url: str,
-    js: bool = False,
-    extract_type: str = "auto",
-) -> Tuple[List[Dict[str, Any]], int]:
-
+async def _scrape_url(url: str, js: bool = False, extract_type: str = "auto") -> Tuple[List[Dict[str, Any]], int]:
     if not _is_safe_url(url):
         raise HTTPException(status_code=403, detail="Forbidden: private/local IP blocked.")
-
     loop = asyncio.get_running_loop()
 
     async def _do_fetch(use_js: bool):
         try:
-            return await loop.run_in_executor(
-                None, _fetch_js if use_js else _fetch_static, url
-            )
+            return await loop.run_in_executor(None, _fetch_js if use_js else _fetch_static, url)
         except RuntimeError as e:
             raise HTTPException(status_code=502, detail=str(e))
 
-    response = await _do_fetch(js)
-    used_js  = js
-
-    try:
-        raw = _get_raw_bytes(response)
-    except ValueError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
+    response  = await _do_fetch(js)
+    used_js   = js
+    try:    raw = _get_raw_bytes(response)
+    except ValueError as e: raise HTTPException(status_code=502, detail=str(e))
     raw_bytes = len(raw)
-    print(f"[SCRAPE] {url} → {raw_bytes:,} bytes (js={used_js})")
-
-    if raw_bytes == 0:
-        raise HTTPException(status_code=502, detail="Empty body.")
-    if raw_bytes > MAX_PAYLOAD_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Payload too large ({raw_bytes / 1_048_576:.1f} MB).",
-        )
-
+    if raw_bytes == 0:             raise HTTPException(status_code=502, detail="Empty body.")
+    if raw_bytes > MAX_PAYLOAD_SIZE: raise HTTPException(status_code=413, detail=f"Payload too large.")
     html_clean = _preprocess_html(raw)
-
     try:
-        rows = await loop.run_in_executor(
-            cpu_executor, extract_with_ai, html_clean, url, extract_type
-        )
+        rows = await loop.run_in_executor(cpu_executor, extract_with_ai, html_clean, url, extract_type)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI extraction failed: {e}")
-
     _log_extraction_stats(rows, label="attempt=1")
-
     needs_better = not used_js and not _rows_have_data(rows) and raw_bytes >= 51_200
-
     if needs_better:
         if _STEALTH_AVAILABLE:
-            print(f"[SCRAPE] Low-quality extraction — retrying with JS renderer")
             try:
                 response2   = await _do_fetch(True)
                 raw2        = _get_raw_bytes(response2)
                 if raw2:
                     html_clean2 = _preprocess_html(raw2)
-                    rows2 = await loop.run_in_executor(
-                        cpu_executor, extract_with_ai, html_clean2, url, extract_type
-                    )
-                    _log_extraction_stats(rows2, label="attempt=2 js=True")
+                    rows2 = await loop.run_in_executor(cpu_executor, extract_with_ai, html_clean2, url, extract_type)
                     if _rows_have_data(rows2):
-                        rows      = rows2
-                        raw_bytes = len(raw2)
-                        used_js   = True
-                        print(f"[SCRAPE] JS retry succeeded")
+                        rows = rows2; raw_bytes = len(raw2); used_js = True
                     else:
-                        print(f"[SCRAPE] JS retry also low quality — returning []")
                         rows = []
             except Exception as e:
                 print(f"[SCRAPE] JS retry failed: {e}")
         else:
-            print(
-                f"[SCRAPE] Page appears JS-rendered (ghost rows) but StealthyFetcher "
-                f"unavailable — returning [] to avoid ghost rows."
-            )
             rows = []
-
     print(f"[SCRAPE] Final: {len(rows)} records (js={used_js})")
     return rows, raw_bytes
 
 # ════════════════════════════════════════════════════════════════════════════════
 # FASTAPI APPLICATION
 # ════════════════════════════════════════════════════════════════════════════════
-app = FastAPI(title="AUDITOR CORE", version="9.9.1")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="AUDITOR CORE", version="9.9.2")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    errors = "; ".join(
-        f"{' → '.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors()
-    )
+    errors = "; ".join(f"{' → '.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors())
     return JSONResponse(status_code=422, content={"detail": f"Validation error — {errors}"})
 
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir  = os.path.dirname(os.path.abspath(__file__))
     html_path = os.path.join(base_dir, "index.html")
-    if os.path.exists(html_path):
-        return FileResponse(html_path)
+    if os.path.exists(html_path): return FileResponse(html_path)
     return HTMLResponse(content="<h2>404 — index.html not found</h2>", status_code=404)
 
 @app.get("/api/key")
@@ -1140,98 +660,82 @@ async def get_api_key():
 @app.get("/api/health")
 async def health():
     return {
-        "status": "ok",
-        "version": "9.9.1",
-        "optimization": "200k batch + dynamic 2 RPM rate limiter",
-        "fetcher": _FETCHER_AVAILABLE,
-        "stealth": _STEALTH_AVAILABLE,
-        "mistral": _MISTRAL_AVAILABLE,
-        "readability": False,
+        "status": "ok", "version": "9.9.2",
+        "fetcher": _FETCHER_AVAILABLE, "stealth": _STEALTH_AVAILABLE,
+        "mistral": _MISTRAL_AVAILABLE, "readability": False,
         "ai_model": _MISTRAL_MODEL if _MISTRAL_AVAILABLE else None,
-        "max_safe_chars": MAX_SAFE_CHARS,
-        "max_batch_chars": MAX_BATCH_CHARS,
-        "batch_usable": BATCH_USABLE,
-        "batch_overhead": BATCH_OVERHEAD,
-        "min_fields_per_row": MIN_FIELDS_PER_ROW,
-        "min_quality_ratio": MIN_QUALITY_RATIO,
-        "min_schema_overlap": MIN_SCHEMA_OVERLAP,
-        "rate_limiter": {
-            "window_s": _RPM_WINDOW,
-            "rpm_limit": _RPM_LIMIT,
-            "strategy": "sliding window",
-        },
-        "limits": {
-            "rpm": 2,
-            "tpm": 500000,
-            "context": 262144,
-            "rpd_calculated": 2880,
-            "tpd_calculated": 33333333
-        },
+        "max_batch_chars": MAX_BATCH_CHARS, "batch_usable": BATCH_USABLE,
+        "rate_limiter": {"window_s": _RPM_WINDOW, "rpm_limit": _RPM_LIMIT, "strategy": "sliding window"},
         "utc": datetime.now(timezone.utc).isoformat(),
     }
 
 @app.get("/api/debug-fetch")
 async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key)):
-    """Debug without AI: sizes at each processing stage + batch plan + preview."""
-    if not _is_safe_url(url):
-        raise HTTPException(status_code=403, detail="Forbidden domain")
+    if not _is_safe_url(url): raise HTTPException(status_code=403, detail="Forbidden domain")
     loop = asyncio.get_running_loop()
     try:
-        response = await loop.run_in_executor(
-            None, _fetch_js if js else _fetch_static, url
-        )
-        raw = _get_raw_bytes(response)
-        text = raw.decode('utf-8', errors='replace')
-        cleaned = _extract_main_content(text)
+        response = await loop.run_in_executor(None, _fetch_js if js else _fetch_static, url)
+        raw      = _get_raw_bytes(response)
+        text     = raw.decode('utf-8', errors='replace')
+        cleaned  = _extract_main_content(text)
         isolated = _find_best_table(cleaned)
-        batches = _split_table_into_batches(isolated)
-        
-        # Calculate RPM efficiency
-        batch_sizes = [len(b[0]) for b in batches]
-        total_tokens = sum(s // 4 for s in batch_sizes)
-        
+        batches  = _split_table_into_batches(isolated)
         return {
-            "url": url,
-            "js": js,
-            "raw_bytes": len(raw),
-            "cleaned_chars": len(cleaned),
-            "isolated_chars": len(isolated),
-            "retention_pct": round(100 * len(cleaned) / max(len(raw), 1), 1),
-            "isolation_pct": round(100 * len(isolated) / max(len(cleaned), 1), 1),
-            "num_batches": len(batches),
-            "batch_sizes": batch_sizes,
-            "total_tokens_estimate": total_tokens,
-            "rpm_calls_saved": "40-50%" if len(batches) < 4 else f"{len(batches)} batches",
-            "stealth_available": _STEALTH_AVAILABLE,
-            "preview": isolated[:3000],
+            "url": url, "js": js,
+            "raw_bytes": len(raw), "cleaned_chars": len(cleaned), "isolated_chars": len(isolated),
+            "retention_pct": round(100*len(cleaned)/max(len(raw),1),1),
+            "isolation_pct": round(100*len(isolated)/max(len(cleaned),1),1),
+            "num_batches": len(batches), "batch_sizes": [len(b[0]) for b in batches],
+            "stealth_available": _STEALTH_AVAILABLE, "preview": isolated[:3000],
         }
     except Exception as e:
         return {"url": url, "error": str(e)}
 
 @app.post("/api/scrape", response_model=ScrapeResponse)
 async def scrape(body: ScrapeRequest, _key: str = Depends(verify_key)):
-    t0 = time.perf_counter()
-    rows, raw_bytes = await _scrape_url(
-        body.url, js=body.js, extract_type=body.extract_type
-    )
-    return ScrapeResponse(
-        events=rows,
-        raw_bytes=raw_bytes,
-        elapsed=round(time.perf_counter() - t0, 3),
+    t0           = time.perf_counter()
+    rows, raw_bytes = await _scrape_url(body.url, js=body.js, extract_type=body.extract_type)
+    return ScrapeResponse(events=rows, raw_bytes=raw_bytes, elapsed=round(time.perf_counter()-t0,3))
+
+@app.post("/api/raw", response_model=RawResponse)
+async def raw_fetch(body: ScrapeRequest, _key: str = Depends(verify_key)):
+    """
+    Fetch + preprocess (noise removal → table isolation → batch plan).
+    Skips AI entirely. Returns isolated HTML in `content` field.
+    Parse with BeautifulSoup on the client side.
+    """
+    if not _is_safe_url(body.url):
+        raise HTTPException(status_code=403, detail="Forbidden: private/local IP blocked.")
+    t0   = time.perf_counter()
+    loop = asyncio.get_running_loop()
+    try:
+        response = await loop.run_in_executor(None, _fetch_js if body.js else _fetch_static, body.url)
+        raw      = _get_raw_bytes(response)
+    except (RuntimeError, ValueError) as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    raw_bytes = len(raw)
+    if raw_bytes == 0:               raise HTTPException(status_code=502, detail="Empty body.")
+    if raw_bytes > MAX_PAYLOAD_SIZE: raise HTTPException(status_code=413, detail="Payload too large.")
+    text     = raw.decode("utf-8", errors="replace")
+    cleaned  = _extract_main_content(text)
+    isolated = _find_best_table(cleaned)
+    batches  = _split_table_into_batches(isolated)
+    return RawResponse(
+        url            = body.url,
+        raw_bytes      = raw_bytes,
+        cleaned_chars  = len(cleaned),
+        isolated_chars = len(isolated),
+        retention_pct  = round(100 * len(cleaned) / max(raw_bytes, 1), 1),
+        isolation_pct  = round(100 * len(isolated) / max(len(cleaned), 1), 1),
+        num_batches    = len(batches),
+        batch_sizes    = [len(b[0]) for b in batches],
+        content        = isolated,
+        elapsed        = round(time.perf_counter() - t0, 3),
     )
 
 @app.get("/api/token-status")
 async def token_status(_key: str = Depends(verify_key)):
-    return {
-        "limit_per_model": "1B tokens/month",
-        "tpm": 500_000,
-        "rpm": 2,
-        "model": _MISTRAL_MODEL,
-        "optimization": "200k batch chars (~50k tokens) + dynamic 31s rate gate",
-        "keys": [
-            {"key_index": 1, "active": True}
-        ],
-    }
+    return {"limit_per_model": "1B tokens/month", "tpm": 500_000, "rpm": 2, "model": _MISTRAL_MODEL, "keys": [{"key_index": 1, "active": True}]}
 
 @app.on_event("startup")
 async def startup():
@@ -1249,8 +753,7 @@ async def shutdown():
     try:
         from telegram_bot import stop_bot
         stop_bot()
-    except Exception:
-        pass
+    except Exception: pass
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
