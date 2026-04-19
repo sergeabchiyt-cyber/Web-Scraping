@@ -1,11 +1,12 @@
 services:
   - type: web
     name: auditor-core
-    runtime: docker
+    runtime: python
     plan: free
     region: oregon
     healthCheckPath: /health
-    dockerfilePath: ./Dockerfile
+    buildCommand: pip install -r requirements.txt && scrapling install
+    startCommand: python command_center.py
     envVars:
       - key: MISTRAL_API_KEY
         sync: false
