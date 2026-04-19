@@ -1,5 +1,5 @@
 """
-AUDITOR CORE v9.9.2 — /api/raw endpoint added
+AUDITOR CORE v9.9.2 — Google AI Studio (Gemma 4 26B A4B)
 """
 
 from dotenv import load_dotenv
@@ -26,10 +26,10 @@ print("[BOOT] readability-lxml disabled — using surgical noise removal + table
 
 try:
     import httpx
-    _MISTRAL_AVAILABLE = True
+    _AI_AVAILABLE = True
 except ImportError:
     httpx = None
-    _MISTRAL_AVAILABLE = False
+    _AI_AVAILABLE = False
 
 try:
     from scrapling.fetchers import Fetcher, StealthyFetcher
@@ -45,7 +45,7 @@ except ImportError:
     StealthyFetcher = None
     _STEALTH_AVAILABLE = False
 
-print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE} Stealth={_STEALTH_AVAILABLE} Mistral={_MISTRAL_AVAILABLE}")
+print(f"[BOOT] Fetcher={_FETCHER_AVAILABLE} Stealth={_STEALTH_AVAILABLE} AI={_AI_AVAILABLE}")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -63,16 +63,16 @@ BATCH_OVERHEAD  = 3_000
 BATCH_USABLE    = MAX_BATCH_CHARS - BATCH_OVERHEAD
 CHARS_PER_TOKEN = 4
 
-_MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip().lstrip("=")
-if not _MISTRAL_API_KEY:
-    print("[ERROR] MISTRAL_API_KEY not set — AI extraction will fail.")
+_GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip().lstrip("=")
+if not _GOOGLE_API_KEY:
+    print("[ERROR] GOOGLE_API_KEY not set — AI extraction will fail.")
 else:
-    print(f"[BOOT] MISTRAL_API_KEY loaded: prefix={_MISTRAL_API_KEY[:8]}... length={len(_MISTRAL_API_KEY)}")
+    print(f"[BOOT] GOOGLE_API_KEY loaded: prefix={_GOOGLE_API_KEY[:8]}... length={len(_GOOGLE_API_KEY)}")
 
-_MISTRAL_MODEL   = "mistral-small-2603"
-_MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
+_GOOGLE_MODEL   = "gemma-4-26b-a4b-it"
+_GOOGLE_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
-_RPM_LIMIT      = 2
+_RPM_LIMIT      = 15
 _RPM_WINDOW     = 60.0
 _RPM_SAFETY     = 1.0
 _mistral_call_log: list = []
@@ -481,39 +481,48 @@ def _sanitize_row_values(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def extract_with_ai(html_content: str, url: str, extract_type: str = "auto") -> List[Dict[str, Any]]:
     batches = _split_table_into_batches(html_content)
     if len(batches) == 1:
-        result = _extract_with_mistral(html_content, url, extract_type)
+        result = _extract_with_ai(html_content, url, extract_type)
         return result if result is not None else []
     all_rows: List[Dict[str, Any]] = []
     for idx, (batch_html, start, end) in enumerate(batches):
-        result = _extract_with_mistral(batch_html, url, extract_type)
+        result = _extract_with_ai(batch_html, url, extract_type)
         if result: all_rows.extend(result)
     return all_rows[:MAX_RECORDS]
 
-def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[List[Dict[str, Any]]]:
-    if not _MISTRAL_AVAILABLE: return None
-    if not _MISTRAL_API_KEY:   return None
+def _extract_with_ai(html: str, url: str, extract_type: str) -> Optional[List[Dict[str, Any]]]:
+    if not _AI_AVAILABLE:    return None
+    if not _GOOGLE_API_KEY:  return None
     _mistral_rate_gate()
     prompt  = _build_accuracy_prompt(html, url, extract_type)
-    payload = {"model": _MISTRAL_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.0}
-    headers = {"Content-Type": "application/json", "Accept": "application/json", "Authorization": f"Bearer {_MISTRAL_API_KEY}"}
+    payload = {
+        "model":       _GOOGLE_MODEL,
+        "messages":    [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+    }
+    headers = {
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+        "Authorization": f"Bearer {_GOOGLE_API_KEY}",
+    }
     t_start = time.time()
-    print(f"[AI] Sending → {_MISTRAL_MODEL} ({len(html):,} chars)")
+    print(f"[AI] Sending → {_GOOGLE_MODEL} ({len(html):,} chars)")
     MAX_RETRIES = 3
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             with httpx.Client(timeout=120.0) as client:
-                response = client.post(_MISTRAL_API_URL, json=payload, headers=headers)
+                response = client.post(_GOOGLE_API_URL, json=payload, headers=headers)
             elapsed_ai = time.time() - t_start
             print(f"[AI] HTTP {response.status_code} in {elapsed_ai:.1f}s")
-            if response.status_code in [500,502,503,504]:
-                if attempt < MAX_RETRIES:
-                    time.sleep(2 ** attempt); continue
+            if response.status_code in [500, 502, 503, 504]:
+                if attempt < MAX_RETRIES: time.sleep(2 ** attempt); continue
                 return None
             if response.status_code == 429:
                 retry_after = int(response.headers.get("Retry-After", 60))
                 print(f"[AI] 429 — sleeping {retry_after}s")
                 time.sleep(retry_after); return None
-            if response.status_code != 200: return None
+            if response.status_code != 200:
+                print(f"[AI] Error body: {response.text[:300]}")
+                return None
             break
         except Exception as e:
             if attempt < MAX_RETRIES: time.sleep(2 ** attempt); continue
@@ -526,7 +535,11 @@ def _extract_with_mistral(html: str, url: str, extract_type: str) -> Optional[Li
         print(f"[AI] Parse error: {e}"); return None
 
 def _build_accuracy_prompt(html: str, url: str, extract_type: str) -> str:
-    structure_hint = {"table": "Extract each <tr> data row as one object. Use <th> text as JSON keys.", "list": "Extract each list item as one object.", "card": "Extract each card as one object."}.get(extract_type, "Identify the densest data grid. MERGE related tables by shared keys.")
+    structure_hint = {
+        "table": "Extract each <tr> data row as one object. Use <th> text as JSON keys.",
+        "list":  "Extract each list item as one object.",
+        "card":  "Extract each card as one object.",
+    }.get(extract_type, "Identify the densest data grid. MERGE related tables by shared keys.")
     return f"""Extract all structured data from the HTML below.
 RULES:
 - Use actual column headers as JSON keys (exact text)
@@ -607,7 +620,7 @@ async def _scrape_url(url: str, js: bool = False, extract_type: str = "auto") ->
     try:    raw = _get_raw_bytes(response)
     except ValueError as e: raise HTTPException(status_code=502, detail=str(e))
     raw_bytes = len(raw)
-    if raw_bytes == 0:             raise HTTPException(status_code=502, detail="Empty body.")
+    if raw_bytes == 0:               raise HTTPException(status_code=502, detail="Empty body.")
     if raw_bytes > MAX_PAYLOAD_SIZE: raise HTTPException(status_code=413, detail=f"Payload too large.")
     html_clean = _preprocess_html(raw)
     try:
@@ -660,11 +673,16 @@ async def get_api_key():
 @app.get("/api/health")
 async def health():
     return {
-        "status": "ok", "version": "9.9.2",
-        "fetcher": _FETCHER_AVAILABLE, "stealth": _STEALTH_AVAILABLE,
-        "mistral": _MISTRAL_AVAILABLE, "readability": False,
-        "ai_model": _MISTRAL_MODEL if _MISTRAL_AVAILABLE else None,
-        "max_batch_chars": MAX_BATCH_CHARS, "batch_usable": BATCH_USABLE,
+        "status":       "ok",
+        "version":      "9.9.2",
+        "fetcher":      _FETCHER_AVAILABLE,
+        "stealth":      _STEALTH_AVAILABLE,
+        "ai":           _AI_AVAILABLE,
+        "readability":  False,
+        "ai_model":     _GOOGLE_MODEL if _AI_AVAILABLE else None,
+        "ai_provider":  "Google AI Studio",
+        "max_batch_chars": MAX_BATCH_CHARS,
+        "batch_usable":    BATCH_USABLE,
         "rate_limiter": {"window_s": _RPM_WINDOW, "rpm_limit": _RPM_LIMIT, "strategy": "sliding window"},
         "utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -693,7 +711,7 @@ async def debug_fetch(url: str, js: bool = False, _key: str = Depends(verify_key
 
 @app.post("/api/scrape", response_model=ScrapeResponse)
 async def scrape(body: ScrapeRequest, _key: str = Depends(verify_key)):
-    t0           = time.perf_counter()
+    t0              = time.perf_counter()
     rows, raw_bytes = await _scrape_url(body.url, js=body.js, extract_type=body.extract_type)
     return ScrapeResponse(events=rows, raw_bytes=raw_bytes, elapsed=round(time.perf_counter()-t0,3))
 
@@ -702,7 +720,6 @@ async def raw_fetch(body: ScrapeRequest, _key: str = Depends(verify_key)):
     """
     Fetch + preprocess (noise removal → table isolation → batch plan).
     Skips AI entirely. Returns isolated HTML in `content` field.
-    Parse with BeautifulSoup on the client side.
     """
     if not _is_safe_url(body.url):
         raise HTTPException(status_code=403, detail="Forbidden: private/local IP blocked.")
@@ -721,21 +738,27 @@ async def raw_fetch(body: ScrapeRequest, _key: str = Depends(verify_key)):
     isolated = _find_best_table(cleaned)
     batches  = _split_table_into_batches(isolated)
     return RawResponse(
-        url            = body.url,
-        raw_bytes      = raw_bytes,
-        cleaned_chars  = len(cleaned),
-        isolated_chars = len(isolated),
-        retention_pct  = round(100 * len(cleaned) / max(raw_bytes, 1), 1),
-        isolation_pct  = round(100 * len(isolated) / max(len(cleaned), 1), 1),
-        num_batches    = len(batches),
-        batch_sizes    = [len(b[0]) for b in batches],
-        content        = isolated,
-        elapsed        = round(time.perf_counter() - t0, 3),
+        url             = body.url,
+        raw_bytes       = raw_bytes,
+        cleaned_chars   = len(cleaned),
+        isolated_chars  = len(isolated),
+        retention_pct   = round(100 * len(cleaned) / max(raw_bytes, 1), 1),
+        isolation_pct   = round(100 * len(isolated) / max(len(cleaned), 1), 1),
+        num_batches     = len(batches),
+        batch_sizes     = [len(b[0]) for b in batches],
+        content         = isolated,
+        elapsed         = round(time.perf_counter() - t0, 3),
     )
 
 @app.get("/api/token-status")
 async def token_status(_key: str = Depends(verify_key)):
-    return {"limit_per_model": "1B tokens/month", "tpm": 500_000, "rpm": 2, "model": _MISTRAL_MODEL, "keys": [{"key_index": 1, "active": True}]}
+    return {
+        "provider":  "Google AI Studio",
+        "model":     _GOOGLE_MODEL,
+        "rpm":       _RPM_LIMIT,
+        "rpd":       1500,
+        "keys":      [{"key_index": 1, "active": True}],
+    }
 
 @app.on_event("startup")
 async def startup():
